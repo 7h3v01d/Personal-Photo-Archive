@@ -1,0 +1,25 @@
+[project]
+name = "personal-photo-archive"
+version = "0.0.1"
+description = "Local-first personal photographic memory archive."
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.6",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
