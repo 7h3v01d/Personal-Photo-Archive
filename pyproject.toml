@@ -12,6 +12,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+heic = [
+    "pillow-heif>=0.15",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
