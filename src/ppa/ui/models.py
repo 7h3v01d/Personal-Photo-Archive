@@ -14,8 +14,9 @@ from PySide6.QtGui import QColor, QPixmap
 from ppa.catalogue import GridItem
 from ppa.ui import theme
 
-FILE_ID_ROLE = Qt.UserRole + 1
-STATUS_ROLE = Qt.UserRole + 2
+FILE_ID_ROLE = Qt.ItemDataRole.UserRole + 1
+STATUS_ROLE = Qt.ItemDataRole.UserRole + 2
+COPY_COUNT_ROLE = Qt.ItemDataRole.UserRole + 3
 
 _THUMB = 256
 
@@ -27,7 +28,7 @@ def _placeholder(status: str) -> QPixmap:
 
 
 class PhotoGridModel(QAbstractListModel):
-    request_thumbnail = Signal(str, str, object)  # file_id, path, sha256
+    request_thumbnail = Signal(str, str, str)  # file_id, path, sha256 ("" if none)
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,7 +73,7 @@ class PhotoGridModel(QAbstractListModel):
                 return pm
             if item.file_id not in self._requested and item.status != "missing":
                 self._requested.add(item.file_id)
-                self.request_thumbnail.emit(item.file_id, item.path, item.sha256)
+                self.request_thumbnail.emit(item.file_id, item.path, item.sha256 or "")
             return _placeholder(item.status)
 
         if role == Qt.DisplayRole:
@@ -83,4 +84,6 @@ class PhotoGridModel(QAbstractListModel):
             return item.file_id
         if role == STATUS_ROLE:
             return item.status
+        if role == COPY_COUNT_ROLE:
+            return item.copy_count
         return None

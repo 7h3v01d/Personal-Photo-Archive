@@ -1,24 +1,28 @@
-"""Database connection and initialisation.
+"""Database connection and migration runner.
 
-Responsible for opening the catalogue database and applying schema.sql on
-first run. Deliberately does nothing clever: no ORM, no migration framework
-yet (Phase 0 requires schema changes be "migratable", not that a migration
-framework exists on day one — sqlite's schema_version table is enough for
-now and a real migration runner can be added when there's a second schema
-version to migrate to).
+Opens the catalogue database and brings its schema up to date by applying
+any pending migrations from ``migrations/`` in order. Each migration is a
+numbered ``NNN_name.sql`` file; the runner records which versions have been
+applied in the ``schema_version`` table and never re-applies one.
+
+This replaces the earlier "apply schema.sql every time" approach. It is
+forward-only (no down-migrations): an archive's schema should accrete, not
+roll back, so historical evidence is never dropped by a migration.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
-SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_MIGRATION_RE = re.compile(r"^(\d+)_.*\.sql$")
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open a connection to the catalogue database, creating/initialising it
-    if necessary. Safe to call repeatedly.
+    """Open a connection to the catalogue database, creating/initialising and
+    migrating it if necessary. Safe to call repeatedly.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -36,14 +40,57 @@ def connect(db_path: Path) -> sqlite3.Connection:
     # "database is locked".
     conn.execute("PRAGMA busy_timeout = 5000;")
 
-    _apply_schema(conn)
+    _run_migrations(conn)
     return conn
 
 
-def _apply_schema(conn: sqlite3.Connection) -> None:
-    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    conn.executescript(schema_sql)
+def _ensure_version_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version     INTEGER PRIMARY KEY,
+            applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """
+    )
     conn.commit()
+
+
+def discover_migrations() -> list[tuple[int, Path]]:
+    """Return (version, path) for every migration file, ordered by version."""
+    found: list[tuple[int, Path]] = []
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        m = _MIGRATION_RE.match(path.name)
+        if m:
+            found.append((int(m.group(1)), path))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _applied_versions(conn: sqlite3.Connection) -> set[int]:
+    rows = conn.execute("SELECT version FROM schema_version").fetchall()
+    return {r["version"] for r in rows}
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    _ensure_version_table(conn)
+    applied = _applied_versions(conn)
+
+    for version, path in discover_migrations():
+        if version in applied:
+            continue
+        sql = path.read_text(encoding="utf-8")
+        # Each migration is applied atomically: either the whole file and its
+        # version record commit together, or nothing does.
+        try:
+            conn.executescript(sql)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (version,)
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def current_schema_version(conn: sqlite3.Connection) -> int:

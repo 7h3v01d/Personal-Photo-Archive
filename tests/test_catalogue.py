@@ -74,3 +74,43 @@ def test_unknown_view_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         catalogue.grid_items(conn, "nonsense")
+
+
+# --- Phase 3: observed metadata curation ------------------------------------
+
+
+def _jpeg_with_exif(path: Path, color="red") -> None:
+    from PIL import ExifTags
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGB", (120, 90), color)
+    exif = img.getexif()
+    exif[0x010F] = "Canon"
+    exif[0x0110] = "PowerShot A70"
+    sub = exif.get_ifd(ExifTags.IFD.Exif)
+    sub[0x9003] = "2004:12:25 09:14:32"
+    sub[0x8827] = 200
+    sub[0x829D] = 2.8
+    g = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    g[1] = "S"; g[2] = (27.0, 28.0, 12.0)
+    g[3] = "E"; g[4] = (153.0, 1.0, 30.0)
+    img.save(path, format="JPEG", exif=exif)
+
+
+def test_curated_metadata_labels_and_formats(tmp_path: Path) -> None:
+    from ppa import metadata
+    library = tmp_path / "lib"
+    _jpeg_with_exif(library / "IMG_0001.jpg")
+    conn = connect(tmp_path / "cat.sqlite3")
+    scan_library(conn, library)
+    metadata.extract_stale(conn)
+
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+    curated = dict(catalogue.curated_metadata(conn, fid))
+    assert curated["capture date (observed)"] == "2004:12:25 09:14:32"
+    assert curated["aperture"] == "f/2.8"
+    assert curated["ISO"] == "200"
+    assert "GPS" in curated
+
+    detail = catalogue.file_detail(conn, fid)
+    assert detail.camera == "Canon PowerShot A70"
+    assert len(detail.observed_metadata) >= 4

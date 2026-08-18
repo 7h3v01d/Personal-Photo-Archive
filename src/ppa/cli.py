@@ -19,6 +19,7 @@ from ppa.config import Config
 from ppa.db import connect
 from ppa.integrity import verify_library
 from ppa.logging_setup import configure_logging, get_logger
+from ppa.metadata import extract_stale
 from ppa.scanner import scan_library
 
 
@@ -32,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser(
         "verify",
         help="Re-hash catalogued files to detect silent corruption",
+    )
+
+    subparsers.add_parser(
+        "extract",
+        help="Read EXIF/metadata into the catalogue as observations",
     )
 
     args = parser.parse_args(argv)
@@ -55,6 +61,13 @@ def main(argv: list[str] | None = None) -> int:
             print("\nInaccessible files:")
             for path, reason in report.inaccessible_files:
                 print(f"  {path}: {reason}")
+        print("\nRun 'ppa extract' to read EXIF metadata into the catalogue.")
+        return 0
+
+    if args.command == "extract":
+        log.info("Extracting metadata")
+        count = extract_stale(conn, progress_cb=lambda m: print(m, end="\r"))
+        print(f"\nMetadata read for {count} file(s).")
         return 0
 
     if args.command == "verify":

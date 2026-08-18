@@ -4,8 +4,23 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Current status: **Desktop UI (Phase 4/5 vertical slice) on the Phase 2 engine.**
-(Phases 0-2 complete. Phase 3 — Metadata Extraction — is the next backend gap.)
+Status: **FEATURE FREEZE — Archive Core Hardening (Schema v2) in progress.**
+
+- Phase 3 (Metadata Extraction): functional vertical slice — works, but its
+  provenance semantics need hardening before it can be trusted.
+- Phase 2.1 / 3.1 (Archival Hardening): **in progress** — see
+  `tests/test_hardening_regressions.py` for the acceptance criteria.
+- Phase 6 (Date Reliability Engine): **BLOCKED** pending hardening. Building
+  timestamp inference on stale/destroyed evidence would be the most
+  expensive place to unwind it, so it waits.
+
+An adversarial review reproduced several provenance defects (multi-library
+reconciliation, byte-identical cross-library collapse, a stale hash-index
+bug, present-but-corrupt marked missing, full-SHA discarded on in-place
+change, stale filesystem/camera metadata, transient extraction failures
+recorded as success). Each is captured as a strict-xfail regression test
+and will be closed by the Library -> File -> FileRevision -> Observation
+model. Source-file safety was NOT implicated: no path writes to originals.
 
 ## Setup
 
@@ -24,10 +39,14 @@ python -m ppa.main
 On first run this will:
 - create `~/.config/personal-photo-archive/config.toml` if it doesn't exist
 - create the catalogue database at the path in that config
-- open the desktop window: **Add Library…**, **Scan**, **Verify**, a
-  thumbnail grid (All / Recently Added / Duplicates / Missing), and an
-  inspector showing each file's identity, dimensions, SHA-256, copy count,
-  and integrity-event history
+- open the desktop window: **Add Library…**, **Scan**, **Verify**,
+  **Extract Metadata**, and a grid-size control; a thumbnail grid
+  (All / Recently Added / Duplicates / Missing) with status-tinted tiles —
+  a red MISSING ribbon on absent files, an amber ×N badge on duplicate
+  copies, a teal selection ring; and an inspector showing each file's
+  identity, dimensions, SHA-256, copy count, observed EXIF metadata, an
+  offline GPS mini-map, integrity-event history, and Open-folder /
+  Copy-path actions
 
 Scans and verifies run on background threads, so a large library never
 freezes the UI. Thumbnails are cached on disk, keyed by SHA-256, so
@@ -43,6 +62,21 @@ This is the fastest way to run the scanner against a real slice of your
 collection and see what it reports before any UI exists. It only ever
 reads from the directory you point it at — see
 `docs/ARCHIVE_SAFETY_CONTRACT.md`.
+
+## Read metadata
+
+```bash
+python -m ppa.cli extract
+```
+
+Reads embedded EXIF (camera make/model/serial, DateTimeOriginal, ISO,
+aperture, focal length, lens, GPS) plus a filesystem date into the
+catalogue as **observations** — (source, key, value) rows in
+`metadata_observations`, never written back into the file, and never
+treated as the photo's true capture date. Extraction is idempotent and
+hash-aware: a file is only re-read when its content changes, and stale
+observations are replaced rather than accumulated. The desktop app runs
+this automatically after each scan.
 
 ## Verify integrity (detect silent corruption)
 
@@ -86,11 +120,14 @@ src/ppa/
     scanner.py            Safe library scanner (Phase 1 + hash-aware Phase 2)
     integrity.py          Re-verification / corruption detection (Phase 2)
     catalogue.py          Read model: DB -> typed dataclasses (no Qt)
+    metadata.py           EXIF/GPS/filesystem observation extractor (Phase 3)
     thumbnails.py         SHA-256-keyed thumbnail cache (no Qt)
     ui/
         theme.py         Dark industrial palette + QSS
-        workers.py       Scan/verify/thumbnail workers (QObject on QThread)
+        workers.py       Scan/verify/metadata/thumbnail workers
         models.py        Thumbnail grid model (lazy loading)
+        delegate.py      Grid tile painting: status tint, badges, selection
+        gpsmap.py        Offline schematic GPS mini-map
         main_window.py   Nav / grid / inspector window
     db/
         schema.sql       SQLite schema v1
@@ -126,12 +163,27 @@ hashes; Pass 2 reconciles. Every path change is written to
 `file_path_history` and every notable transition to `integrity_events`,
 so nothing is silently overwritten.
 
-## Next up (per the roadmap)
+## Next up — Archive Core Hardening (Schema v2)
 
-Phase 3 — Metadata Extraction: read EXIF/filesystem/filename metadata into
-`metadata_observations` as **observations** (source + value + timestamp),
-never as unattributed truth. The table already exists and is key/value, so
-no migration is needed. This is what fills in the currently-empty camera,
-capture-date, GPS, and exposure fields the inspector is ready to display.
-Interpreted dates and the confidence/evidence model stay out until Phase
-6/7, so they aren't designed against guesses.
+Ordered so each step rests on the last:
+
+1. `libraries` table + `library_id`; scope all reconciliation to the
+   scanned library (closes the multi-library blockers).
+2. `file_revisions` (immutable: full SHA-256, size, dimensions, mtime,
+   observed-at, is_current) so a content change supersedes rather than
+   erases — the old full hash is never discarded.
+3. Attach `metadata_observations` to `file_revision_id`; stop deleting
+   historical machine metadata (revisions supersede).
+4. Decompose `status` into presence (present/missing/unknown) and health
+   (ok/unreadable/hash_mismatch/unknown).
+5. Fail-closed traversal: an incomplete scan never marks files missing.
+6. Fix the live SHA index on in-place content change; canonicalise compare
+   paths (Windows) while preserving the display path.
+7. Metadata: `extraction_status`; only success stamps the SHA marker;
+   refresh the filesystem mtime observation; clear `camera_id` when the
+   current revision no longer supports it.
+8. Turn every strict-xfail in `test_hardening_regressions.py` green.
+
+Already landed in this slice: migration runner (`db/migrations/`), a
+Qt-free `geometry` module (test collection no longer needs PySide6), and a
+genuine queued cross-thread thumbnail dispatch.

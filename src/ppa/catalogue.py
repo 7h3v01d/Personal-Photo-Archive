@@ -46,6 +46,7 @@ class GridItem:
     width_px: int | None
     height_px: int | None
     size_bytes: int
+    copy_count: int  # files sharing this Photo (1 == unique)
 
 
 @dataclass(frozen=True)
@@ -79,8 +80,81 @@ class FileDetail:
     last_seen_at: str
     camera: str | None
     copy_count: int  # how many files share this Photo (1 == unique)
+    gps: tuple[float, float] | None
+    observed_metadata: tuple[tuple[str, str], ...]  # curated (label, value) pairs
     integrity_events: tuple[IntegrityEvent, ...]
     path_history: tuple[PathHistoryEntry, ...]
+
+
+def observations(conn: Connection, file_id: str) -> dict[str, str]:
+    """Return this file's metadata observations as a flat key -> value map.
+
+    Machine extraction stores at most one row per key, so flattening is safe.
+    Marker rows (source 'meta') are excluded — they're bookkeeping, not
+    metadata about the photograph.
+    """
+    rows = conn.execute(
+        "SELECT source, key, value FROM metadata_observations "
+        "WHERE file_id = ? AND source != 'meta'",
+        (file_id,),
+    ).fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+# Curated view of the raw observations for the inspector: (raw key, label,
+# formatter). Only keys actually present are shown. Everything here is an
+# OBSERVED value — the interpreted capture date is a later phase.
+def _fmt_fnumber(v: str) -> str:
+    return f"f/{v}"
+
+
+def _fmt_focal(v: str) -> str:
+    return f"{v} mm"
+
+
+def _fmt_exposure(v: str) -> str:
+    return f"{v} s"
+
+
+_CURATED: tuple[tuple[str, str, object], ...] = (
+    ("DateTimeOriginal", "capture date (observed)", None),
+    ("DateTimeDigitized", "digitised", None),
+    ("DateTime", "modified (exif)", None),
+    ("Make", "camera make", None),
+    ("Model", "camera model", None),
+    ("LensModel", "lens", None),
+    ("BodySerialNumber", "body serial", None),
+    ("FNumber", "aperture", _fmt_fnumber),
+    ("ExposureTime", "shutter", _fmt_exposure),
+    ("ISOSpeedRatings", "ISO", None),
+    ("PhotographicSensitivity", "ISO", None),
+    ("FocalLength", "focal length", _fmt_focal),
+    ("Software", "software", None),
+    ("Orientation", "orientation", None),
+)
+
+
+def curated_metadata(conn: Connection, file_id: str) -> list[tuple[str, str]]:
+    """Human-facing (label, value) pairs of observed metadata, ordered and
+    formatted for display. GPS is folded into a single lat/lon line.
+    """
+    obs = observations(conn, file_id)
+    out: list[tuple[str, str]] = []
+    seen_labels: set[str] = set()
+    for key, label, fmt in _CURATED:
+        if key in obs and label not in seen_labels:
+            value = obs[key]
+            out.append((label, fmt(value) if callable(fmt) else value))
+            seen_labels.add(label)
+
+    lat = obs.get("GPSLatitudeDecimal")
+    lon = obs.get("GPSLongitudeDecimal")
+    if lat and lon:
+        out.append(("GPS", f"{lat}, {lon}"))
+
+    if "mtime" in obs:
+        out.append(("file mtime", obs["mtime"]))
+    return out
 
 
 def library_stats(conn: Connection) -> LibraryStats:
@@ -135,6 +209,7 @@ def _grid_item(row) -> GridItem:
         width_px=row["width_px"],
         height_px=row["height_px"],
         size_bytes=row["size_bytes"],
+        copy_count=row["copy_count"],
     )
 
 
@@ -142,29 +217,30 @@ def grid_items(conn: Connection, view: str = VIEW_ALL, limit: int | None = None)
     """Return the files to show for a given named view.
 
     Read-only. Ordering is deterministic so the grid is stable between runs.
+    Each item carries ``copy_count`` (files sharing its Photo) so the grid can
+    badge duplicates without a second query.
     """
     if view not in VIEWS:
         raise ValueError(f"Unknown view: {view!r}")
 
-    if view == VIEW_MISSING:
-        sql = "SELECT * FROM files WHERE status = 'missing' ORDER BY filename, id"
-    elif view == VIEW_RECENT:
-        sql = (
-            "SELECT * FROM files WHERE status = 'active' "
-            "ORDER BY first_seen_at DESC, filename"
-        )
-    elif view == VIEW_DUPLICATES:
-        # Files whose Photo has more than one file, grouped so copies sit
-        # together. Missing copies included — the point of the view is to see
-        # the whole cluster before any cleanup.
-        sql = (
-            "SELECT * FROM files WHERE photo_id IN ("
-            "  SELECT photo_id FROM files GROUP BY photo_id HAVING COUNT(*) > 1"
-            ") ORDER BY photo_id, filename, id"
-        )
-    else:  # VIEW_ALL
-        sql = "SELECT * FROM files WHERE status = 'active' ORDER BY filename, id"
+    cte = "WITH counts AS (SELECT photo_id, COUNT(*) AS c FROM files GROUP BY photo_id) "
+    select = (
+        "SELECT f.*, counts.c AS copy_count FROM files f "
+        "JOIN counts ON counts.photo_id = f.photo_id "
+    )
 
+    if view == VIEW_MISSING:
+        where, order = "WHERE f.status = 'missing' ", "ORDER BY f.filename, f.id"
+    elif view == VIEW_RECENT:
+        where, order = "WHERE f.status = 'active' ", "ORDER BY f.first_seen_at DESC, f.filename"
+    elif view == VIEW_DUPLICATES:
+        # Every file whose Photo has more than one file, grouped so copies sit
+        # together. Missing copies included — the point is to see the cluster.
+        where, order = "WHERE counts.c > 1 ", "ORDER BY f.photo_id, f.filename, f.id"
+    else:  # VIEW_ALL
+        where, order = "WHERE f.status = 'active' ", "ORDER BY f.filename, f.id"
+
+    sql = cte + select + where + order
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
 
@@ -210,6 +286,15 @@ def file_detail(conn: Connection, file_id: str) -> FileDetail | None:
         ).fetchall()
     )
 
+    obs = observations(conn, file_id)
+    gps: tuple[float, float] | None = None
+    lat_s, lon_s = obs.get("GPSLatitudeDecimal"), obs.get("GPSLongitudeDecimal")
+    if lat_s and lon_s:
+        try:
+            gps = (float(lat_s), float(lon_s))
+        except ValueError:
+            gps = None
+
     return FileDetail(
         file_id=row["id"],
         photo_id=row["photo_id"],
@@ -227,6 +312,8 @@ def file_detail(conn: Connection, file_id: str) -> FileDetail | None:
         last_seen_at=row["last_seen_at"],
         camera=camera,
         copy_count=copy_count,
+        gps=gps,
+        observed_metadata=tuple(curated_metadata(conn, file_id)),
         integrity_events=events,
         path_history=history,
     )

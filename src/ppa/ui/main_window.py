@@ -10,19 +10,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QSize, Qt
-from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
+    QApplication,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -33,8 +39,11 @@ from ppa.config import Config
 from ppa.db import connect
 from ppa.logging_setup import get_logger
 from ppa.ui import theme
+from ppa.ui.delegate import PhotoTileDelegate
+from ppa.ui.gpsmap import GpsMiniMap
 from ppa.ui.models import FILE_ID_ROLE, PhotoGridModel
 from ppa.ui.workers import (
+    MetadataWorker,
     ScanWorker,
     ThumbnailWorker,
     VerifyWorker,
@@ -72,7 +81,18 @@ class InspectorPanel(QScrollArea):
         self._layout.setContentsMargins(14, 14, 14, 14)
         self._layout.setSpacing(6)
         self.setWidget(self._body)
+        self._path: str | None = None
         self.show_empty()
+
+    def _open_folder(self) -> None:
+        if not self._path:
+            return
+        folder = Path(self._path).parent
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _copy_path(self) -> None:
+        if self._path:
+            QApplication.clipboard().setText(self._path)
 
     def _clear(self) -> None:
         while self._layout.count():
@@ -111,6 +131,7 @@ class InspectorPanel(QScrollArea):
 
     def show_empty(self) -> None:
         self._clear()
+        self._path = None
         title = QLabel("No selection")
         title.setObjectName("InspectorTitle")
         self._layout.addWidget(title)
@@ -122,15 +143,31 @@ class InspectorPanel(QScrollArea):
 
     def show_detail(self, d: catalogue.FileDetail, thumb: QPixmap | None) -> None:
         self._clear()
+        self._path = d.path
 
         title = QLabel(d.filename)
         title.setObjectName("InspectorTitle")
         title.setWordWrap(True)
         self._layout.addWidget(title)
 
+        # Quick actions: open the containing folder / copy the full path.
+        actions = QWidget()
+        arow = QHBoxLayout(actions)
+        arow.setContentsMargins(0, 0, 0, 0)
+        arow.setSpacing(6)
+        open_btn = QPushButton("Open folder")
+        open_btn.clicked.connect(self._open_folder)
+        copy_btn = QPushButton("Copy path")
+        copy_btn.clicked.connect(self._copy_path)
+        arow.addWidget(open_btn)
+        arow.addWidget(copy_btn)
+        arow.addStretch(1)
+        self._layout.addWidget(actions)
+
         if thumb is not None and not thumb.isNull():
             pic = QLabel()
-            pic.setPixmap(thumb.scaled(220, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            pic.setPixmap(thumb.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation))
             self._layout.addWidget(pic)
 
         self._field("status", d.status, theme.status_colour(d.status))
@@ -152,6 +189,19 @@ class InspectorPanel(QScrollArea):
             self._field("camera", d.camera)
         self._field("first seen", d.first_seen_at)
         self._field("last seen", d.last_seen_at)
+
+        if d.observed_metadata:
+            self._header("METADATA (OBSERVED)")
+            for label, value in d.observed_metadata:
+                if label == "GPS":
+                    continue  # shown on the mini-map instead of as text
+                self._field(label, value)
+
+        if d.gps is not None:
+            self._header("LOCATION (OBSERVED)")
+            mini = GpsMiniMap()
+            mini.set_coords(d.gps[0], d.gps[1])
+            self._layout.addWidget(mini)
 
         if d.integrity_events:
             self._header(f"INTEGRITY EVENTS ({len(d.integrity_events)})")
@@ -211,9 +261,23 @@ class MainWindow(QMainWindow):
         self._act_verify.triggered.connect(self._on_verify)
         tb.addAction(self._act_verify)
 
+        self._act_extract = QAction("Extract Metadata", self)
+        self._act_extract.triggered.connect(lambda: self._start_metadata(auto=False))
+        tb.addAction(self._act_extract)
+
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
         tb.addAction(self._act_refresh)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addWidget(QLabel("Size "))
+        self._density = QComboBox()
+        self._density.addItems(["Small", "Medium", "Large"])
+        self._density.setCurrentIndex(1)
+        self._density.currentIndexChanged.connect(self._on_density_changed)
+        tb.addWidget(self._density)
 
     def _build_body(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -229,19 +293,28 @@ class MainWindow(QMainWindow):
 
         # Grid
         self._model = PhotoGridModel()
-        self._model.request_thumbnail.connect(self._on_thumbnail_requested)
         self._grid = QListView()
         self._grid.setModel(self._model)
-        self._grid.setViewMode(QListView.IconMode)
-        self._grid.setResizeMode(QListView.Adjust)
-        self._grid.setMovement(QListView.Static)
-        self._grid.setIconSize(QSize(180, 180))
-        self._grid.setGridSize(QSize(210, 230))
+        self._grid.setViewMode(QListView.ViewMode.IconMode)
+        self._grid.setResizeMode(QListView.ResizeMode.Adjust)
+        self._grid.setMovement(QListView.Movement.Static)
+        self._grid.setItemDelegate(PhotoTileDelegate())
         self._grid.setSpacing(8)
         self._grid.setUniformItemSizes(True)
-        self._grid.setSelectionMode(QListView.SingleSelection)
+        self._grid.setSelectionMode(QListView.SelectionMode.SingleSelection)
         self._grid.selectionModel().currentChanged.connect(self._on_selection)
-        splitter.addWidget(self._grid)
+        self._apply_density(1)  # Medium
+
+        # Empty-state page, shown when the current view has no photos.
+        self._empty = QLabel()
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setObjectName("FieldKey")
+        self._empty.setWordWrap(True)
+
+        self._center = QStackedWidget()
+        self._center.addWidget(self._grid)   # index 0
+        self._center.addWidget(self._empty)  # index 1
+        splitter.addWidget(self._center)
 
         # Inspector
         self._inspector = InspectorPanel()
@@ -262,8 +335,25 @@ class MainWindow(QMainWindow):
         self._thumb_worker = ThumbnailWorker(self._cache_dir, size=256)
         self._thumb_worker.ready.connect(self._on_thumbnail_ready)
         self._registry.start_persistent(self._thumb_worker)
+        # Genuine cross-thread dispatch: the model's request signal is
+        # delivered to the worker's slot on the worker thread (queued), so the
+        # Pillow decode never runs on the GUI thread.
+        self._model.request_thumbnail.connect(
+            self._thumb_worker.request, Qt.ConnectionType.QueuedConnection
+        )
 
     # --- data / refresh -----------------------------------------------------
+    _DENSITY = {0: (120, 150), 1: (180, 210), 2: (250, 280)}  # icon, cell
+
+    def _apply_density(self, index: int) -> None:
+        icon, cell = self._DENSITY.get(index, self._DENSITY[1])
+        self._grid.setIconSize(QSize(icon, icon))
+        self._grid.setGridSize(QSize(cell, cell + 20))
+
+    def _on_density_changed(self, index: int) -> None:
+        self._apply_density(index)
+        self._grid.doItemsLayout()
+
     def _resolve_initial_library(self) -> None:
         if self._config.library_directories:
             self._current_library = self._config.library_directories[0]
@@ -276,7 +366,23 @@ class MainWindow(QMainWindow):
         items = catalogue.grid_items(self._conn, self._current_view)
         self._model.set_items(items)
         self._inspector.show_empty()
+        if items:
+            self._center.setCurrentIndex(0)
+        else:
+            self._empty.setText(self._empty_message())
+            self._center.setCurrentIndex(1)
         self._update_status_summary()
+
+    def _empty_message(self) -> str:
+        if self._current_library is None:
+            return "No library yet.\n\nUse “Add Library…” to point the archive at a\nfolder of photos, then Scan."
+        messages = {
+            catalogue.VIEW_ALL: "No photos catalogued yet.\n\nPress Scan to index the current library.",
+            catalogue.VIEW_RECENT: "Nothing recently added.",
+            catalogue.VIEW_DUPLICATES: "No duplicates found. Every photo is unique.",
+            catalogue.VIEW_MISSING: "No missing files. Every catalogued photo is present.",
+        }
+        return messages.get(self._current_view, "Nothing to show.")
 
     def _update_status_summary(self) -> None:
         s = catalogue.library_stats(self._conn)
@@ -313,17 +419,14 @@ class MainWindow(QMainWindow):
         self._inspector.show_detail(detail, thumb)
 
     # --- thumbnails ---------------------------------------------------------
-    def _on_thumbnail_requested(self, file_id: str, path: str, sha256: object) -> None:
-        # Forward the model's request to the persistent worker thread.
-        self._thumb_worker.request(file_id, path, sha256)
-
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
 
     # --- scan / verify ------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        for act in (self._act_add, self._act_scan, self._act_verify, self._act_refresh):
+        for act in (self._act_add, self._act_scan, self._act_verify,
+                    self._act_extract, self._act_refresh):
             act.setEnabled(not busy)
 
     def _on_add_library(self) -> None:
@@ -354,11 +457,39 @@ class MainWindow(QMainWindow):
         self._registry.start(worker)
 
     def _on_scan_done(self, report) -> None:
-        self._set_busy(False)
         self.refresh()
         self._status.showMessage(
             f"Scan complete — {report.new_files} new, {report.moved_files} moved, "
-            f"{report.duplicate_files} duplicates, {report.missing_files} missing."
+            f"{report.duplicate_files} duplicates, {report.missing_files} missing. "
+            "Reading metadata…"
+        )
+        # Chain straight into metadata extraction so camera/date fields fill in.
+        self._start_metadata(auto=True)
+
+    def _start_metadata(self, *, auto: bool) -> None:
+        if self._busy and not auto:
+            return
+        self._set_busy(True)
+        if not auto:
+            self._status.showMessage("Reading metadata…")
+        worker = MetadataWorker(self._config.db_path)
+        worker.progress.connect(self._status.showMessage)
+        worker.finished.connect(self._on_metadata_done)
+        worker.failed.connect(self._on_worker_failed)
+        self._registry.start(worker)
+
+    def _on_metadata_done(self, count: int) -> None:
+        self._set_busy(False)
+        # Metadata doesn't change which files are in the grid, so don't rebuild
+        # it (that would drop the selection). Just refresh the status summary
+        # and re-show the selected file so its new metadata appears.
+        self._update_status_summary()
+        current = self._grid.currentIndex()
+        if current.isValid():
+            self._on_selection(current, current)
+        self._status.showMessage(
+            f"Metadata read for {count} file(s)." if count
+            else "Metadata up to date."
         )
 
     def _on_verify(self) -> None:

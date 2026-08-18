@@ -22,6 +22,7 @@ from PySide6.QtGui import QImage
 
 from ppa.db import connect
 from ppa.integrity import verify_library
+from ppa.metadata import extract_stale
 from ppa.scanner import scan_library
 from ppa.thumbnails import ThumbnailCache
 
@@ -67,6 +68,26 @@ class VerifyWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class MetadataWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(int)  # number of files processed
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__()
+        self._db_path = db_path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            conn = connect(self._db_path)
+            count = extract_stale(conn, progress_cb=self.progress.emit)
+            conn.close()
+            self.finished.emit(count)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ThumbnailWorker(QObject):
     """Long-lived worker that services thumbnail requests off a queue.
 
@@ -82,9 +103,9 @@ class ThumbnailWorker(QObject):
         super().__init__()
         self._cache = ThumbnailCache(cache_dir, size=size)
 
-    @Slot(str, str, object)
-    def request(self, file_id: str, path: str, sha256: object) -> None:
-        sha = sha256 if isinstance(sha256, str) else None
+    @Slot(str, str, str)
+    def request(self, file_id: str, path: str, sha256: str) -> None:
+        sha = sha256 or None
         out = self._cache.get_or_create(Path(path), sha)
         if out is None:
             return
