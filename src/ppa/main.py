@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
 
 from ppa.config import Config
 from ppa.db import connect, current_schema_version

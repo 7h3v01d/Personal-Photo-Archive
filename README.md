@@ -37,7 +37,7 @@ pytest
 src/ppa/
     config.py          Config loading (TOML)
     logging_setup.py    Logging (console + rotating file)
-    main.py             App entry point (PyQt6)
+    main.py             App entry point (PySide6)
     db/
         schema.sql       SQLite schema v1
         connection.py    DB open/init
