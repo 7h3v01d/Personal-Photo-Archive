@@ -33,9 +33,10 @@ log = get_logger("metadata")
 
 EXTRACTOR_VERSION = "pillow-exif/1"
 
-# Sources this module owns. Re-extraction replaces exactly these and never
-# touches anything else (e.g. future user-entered observations).
-MACHINE_SOURCES = ("exif", "exif-gps", "exif-derived", "filesystem", "meta")
+# Sources this module owns and replaces on (re-)extraction of a revision. The
+# filesystem/mtime observation is owned by the scanner (it directly observes
+# the filesystem), so it is deliberately NOT in this set.
+MACHINE_SOURCES = ("exif", "exif-gps", "exif-derived")
 
 # EXIF tags that are large/binary/noise — recorded nowhere, so the catalogue
 # stays readable and small.
@@ -190,66 +191,90 @@ def _resolve_camera(conn: Connection, make, model, serial) -> int | None:
 def store_metadata(
     conn: Connection,
     file_id: str,
+    revision_id: str,
     result: ExtractionResult,
-    sha256: str | None,
-    fs_mtime: str | None,
     session_id: str | None = None,
 ) -> None:
-    """Replace the machine-derived observations for ``file_id`` with a fresh
-    set, link its camera, and stamp the extractor/hash markers.
+    """Replace THIS revision's machine observations with a fresh set and set
+    the file's camera to whatever the current revision supports.
+
+    Observations are attached to ``revision_id`` and only this revision's are
+    replaced — historical revisions keep their observations, so the archive
+    never forgets what an earlier version of the file claimed.
     """
     placeholders = ", ".join("?" for _ in MACHINE_SOURCES)
     conn.execute(
-        f"DELETE FROM metadata_observations WHERE file_id = ? AND source IN ({placeholders})",
-        (file_id, *MACHINE_SOURCES),
+        f"DELETE FROM metadata_observations WHERE file_revision_id = ? "
+        f"AND source IN ({placeholders})",
+        (revision_id, *MACHINE_SOURCES),
     )
-
-    rows = list(result.observations)
-    if fs_mtime:
-        rows.append(Observation("filesystem", "mtime", fs_mtime))
-    # Reproducibility markers — what read this, and from which content.
-    rows.append(Observation("meta", "_extractor", EXTRACTOR_VERSION))
-    rows.append(Observation("meta", "_extracted_from_sha", sha256 or ""))
-
     conn.executemany(
-        "INSERT INTO metadata_observations (file_id, source, key, value, session_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [(file_id, o.source, o.key, o.value, session_id) for o in rows],
+        "INSERT INTO metadata_observations "
+        "(file_id, file_revision_id, source, key, value, session_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(file_id, revision_id, o.source, o.key, o.value, session_id)
+         for o in result.observations],
     )
-
-    camera_id = _resolve_camera(conn, result.make, result.model, result.serial)
-    if camera_id is not None:
-        conn.execute("UPDATE files SET camera_id = ? WHERE id = ?", (camera_id, file_id))
+    _set_camera_for_current_revision(conn, file_id, revision_id, result)
 
 
-def extract_for_file(conn: Connection, file_id: str, session_id: str | None = None) -> bool:
-    """Extract and store metadata for one file. Returns True if it ran."""
+def _set_camera_for_current_revision(
+    conn: Connection, file_id: str, revision_id: str, result: ExtractionResult
+) -> None:
+    """Set files.camera_id from this revision's camera — but only if this
+    revision is the file's current one, and clear it when the current content
+    supports no camera (so a stale camera never outlives the bytes that named it).
+    """
     row = conn.execute(
-        "SELECT path, sha256, fs_mtime, status FROM files WHERE id = ?", (file_id,)
+        "SELECT current_revision_id FROM files WHERE id = ?", (file_id,)
     ).fetchone()
-    if row is None or row["status"] != "active":
-        return False
+    if row is None or row["current_revision_id"] != revision_id:
+        return  # extracting a non-current revision must not touch the file's camera
+    camera_id = _resolve_camera(conn, result.make, result.model, result.serial)
+    conn.execute("UPDATE files SET camera_id = ? WHERE id = ?", (camera_id, file_id))
 
-    path = Path(row["path"])
+
+def extract_for_revision(conn: Connection, file_id: str, revision_id: str) -> str:
+    """Extract metadata for one revision's content. Returns the resulting
+    extraction_status. Reads the file at the file's current path (the bytes on
+    disk are the current revision's content).
+    """
+    frow = conn.execute(
+        "SELECT path FROM files WHERE id = ?", (file_id,)
+    ).fetchone()
+    if frow is None:
+        return "failed_unreadable"
+    path = Path(frow["path"])
+
     try:
         result = extract_observations(path)
-    except OSError as exc:
-        log.warning("Could not read %s for metadata (%s)", path, exc)
-        # Still stamp markers so we don't retry a genuinely unreadable file
-        # every scan; a content change (new sha) will trigger a fresh attempt.
-        store_metadata(conn, file_id, ExtractionResult(), row["sha256"], row["fs_mtime"], session_id)
-        return True
+    except UnidentifiedImageError:
+        status = "failed_unreadable"  # not a decodable image; don't keep retrying
+        result = None
+    except OSError:
+        # Transient (lock, USB hiccup, permission transition): leave PENDING-ish
+        # so the next run retries rather than falsely recording success.
+        conn.execute(
+            "UPDATE file_revisions SET extraction_status = 'failed_transient' WHERE id = ?",
+            (revision_id,),
+        )
+        return "failed_transient"
 
-    store_metadata(conn, file_id, result, row["sha256"], row["fs_mtime"], session_id)
-    return True
+    if result is not None:
+        store_metadata(conn, file_id, revision_id, result)
+        status = "success"
+
+    conn.execute(
+        "UPDATE file_revisions SET extraction_status = ?, extracted_at = ? WHERE id = ?",
+        (status, _iso_now(), revision_id),
+    )
+    return status
 
 
 def extract_stale(conn: Connection, progress_cb=None) -> int:
-    """Extract metadata for every active file whose stored metadata doesn't
-    match its current content hash (new files, or files whose bytes changed).
-
-    Idempotent: running it twice in a row does no work the second time.
-    Returns the number of files (re)processed.
+    """Extract metadata for every current revision that still needs it —
+    either never attempted (pending) or a transient failure worth retrying.
+    Idempotent: a second run does nothing. Returns the number processed.
     """
     def _progress(msg: str) -> None:
         if progress_cb is not None:
@@ -257,15 +282,12 @@ def extract_stale(conn: Connection, progress_cb=None) -> int:
 
     targets = conn.execute(
         """
-        SELECT f.id FROM files f
-        WHERE f.status = 'active' AND f.sha256 IS NOT NULL
-          AND NOT EXISTS (
-              SELECT 1 FROM metadata_observations o
-              WHERE o.file_id = f.id
-                AND o.source = 'meta'
-                AND o.key = '_extracted_from_sha'
-                AND o.value = f.sha256
-          )
+        SELECT f.id AS file_id, r.id AS revision_id
+        FROM files f
+        JOIN file_revisions r ON r.id = f.current_revision_id
+        WHERE f.presence_status = 'present'
+          AND r.sha256 IS NOT NULL
+          AND r.extraction_status IN ('pending', 'failed_transient')
         ORDER BY f.filename, f.id
         """
     ).fetchall()
@@ -274,9 +296,15 @@ def extract_stale(conn: Connection, progress_cb=None) -> int:
     if total:
         _progress(f"Reading metadata… 0/{total}")
     for i, row in enumerate(targets, start=1):
-        extract_for_file(conn, row["id"])
+        extract_for_revision(conn, row["file_id"], row["revision_id"])
         if i % 25 == 0 or i == total:
             _progress(f"Reading metadata… {i}/{total}")
     conn.commit()
-    log.info("Metadata extraction: %d file(s) processed", total)
+    log.info("Metadata extraction: %d revision(s) processed", total)
     return total
+
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")

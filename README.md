@@ -4,23 +4,25 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **FEATURE FREEZE — Archive Core Hardening (Schema v2) in progress.**
+Status: **Archive Core Hardening complete (Schema v3). All 10 adversarial acceptance tests green.**
 
-- Phase 3 (Metadata Extraction): functional vertical slice — works, but its
-  provenance semantics need hardening before it can be trusted.
-- Phase 2.1 / 3.1 (Archival Hardening): **in progress** — see
-  `tests/test_hardening_regressions.py` for the acceptance criteria.
-- Phase 6 (Date Reliability Engine): **BLOCKED** pending hardening. Building
-  timestamp inference on stale/destroyed evidence would be the most
-  expensive place to unwind it, so it waits.
+- Phases 0-3 functional; the archive-core provenance model is now in place:
+  **Library -> File -> FileRevision -> Observation**, with a
+  `current_revision_id` pointer and genuinely immutable revisions.
+- `status` is decomposed into presence (present/missing/unknown) and health
+  (ok/unreadable/hash_mismatch/unknown): a present-but-corrupt file is
+  present+unreadable, never "missing".
+- Scans carry an explicit completion state; an INCOMPLETE traversal is
+  forbidden from marking anything missing (fail closed).
+- Metadata attaches to the revision it describes, is never deleted as
+  history, tracks a transient-vs-permanent extraction lifecycle, keeps the
+  filesystem-date evidence current, and clears a stale camera when the
+  current content no longer names one.
+- Phase 6 (Date Reliability Engine) can unblock once a confirming
+  adversarial review of this hardening comes back clean.
 
-An adversarial review reproduced several provenance defects (multi-library
-reconciliation, byte-identical cross-library collapse, a stale hash-index
-bug, present-but-corrupt marked missing, full-SHA discarded on in-place
-change, stale filesystem/camera metadata, transient extraction failures
-recorded as success). Each is captured as a strict-xfail regression test
-and will be closed by the Library -> File -> FileRevision -> Observation
-model. Source-file safety was NOT implicated: no path writes to originals.
+The 10 defects from adversarial review are all closed and kept as permanent
+regression tests (`tests/test_hardening_regressions.py`). Source-file safety was never implicated: no path writes to originals.
 
 ## Setup
 
@@ -130,7 +132,11 @@ src/ppa/
         gpsmap.py        Offline schematic GPS mini-map
         main_window.py   Nav / grid / inspector window
     db/
-        schema.sql       SQLite schema v1
+        migrations/
+            001_initial.sql
+            002_libraries.sql
+            003_revisions.sql
+        migrations/001_initial.sql       SQLite schema v1
         connection.py    DB open/init
 tests/                  pytest suite
 docs/
@@ -184,6 +190,13 @@ Ordered so each step rests on the last:
    current revision no longer supports it.
 8. Turn every strict-xfail in `test_hardening_regressions.py` green.
 
-Already landed in this slice: migration runner (`db/migrations/`), a
-Qt-free `geometry` module (test collection no longer needs PySide6), and a
-genuine queued cross-thread thumbnail dispatch.
+Landed so far: **atomic** migration runner with duplicate/gap rejection
+(`db/migrations/`), a Qt-free `geometry` module, genuine queued cross-thread
+thumbnail dispatch, and the **libraries** layer (migration 002) — scans are
+now scoped per library, and the reconciliation/index bugs are fixed.
+
+Remaining strict-xfails (next slice): present-but-corrupt vs missing
+(status decomposition), fail-closed traversal, stale filesystem-mtime and
+camera observations, transient-extraction-as-success, and metadata history
+across revisions — all closed by `file_revisions` + `current_revision_id` +
+observations-per-revision + the metadata rework.

@@ -14,7 +14,9 @@
 --   4. Every row that represents a fact has a recorded source and timestamp,
 --      so provenance survives even at the raw-observation layer.
 
-PRAGMA foreign_keys = ON;
+-- Connection-level pragmas (foreign_keys, journal_mode, busy_timeout) are set
+-- in ppa.db.connection.connect(), not here: PRAGMAs are no-ops inside the
+-- transaction each migration now runs in.
 
 -- ---------------------------------------------------------------------------
 -- Schema bookkeeping / migrations

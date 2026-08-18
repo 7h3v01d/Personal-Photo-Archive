@@ -171,6 +171,8 @@ class InspectorPanel(QScrollArea):
             self._layout.addWidget(pic)
 
         self._field("status", d.status, theme.status_colour(d.status))
+        if d.health_status and d.health_status != "ok":
+            self._field("health", d.health_status, theme.RED)
 
         self._header("FILE")
         self._field("path", d.path)

@@ -23,7 +23,11 @@ from ppa import metadata
 from ppa.db import connect
 from ppa.scanner import scan_library
 
-strict_xfail = pytest.mark.xfail(strict=True, reason="pending Schema-v2 hardening")
+strict_xfail = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="pending Schema-v2 hardening",
+)
 
 
 def _img(path: Path, color="red", size=(40, 30)) -> None:
@@ -46,7 +50,6 @@ def _jpeg_with_exif(path: Path, *, model="PowerShot A70", dto="2004:12:25 09:14:
 # --- Scanner / multi-library ------------------------------------------------
 
 
-@strict_xfail
 def test_two_libraries_keep_both_active(tmp_path: Path) -> None:
     a, b = tmp_path / "A", tmp_path / "B"
     _img(a / "a.jpg", "red")
@@ -58,7 +61,6 @@ def test_two_libraries_keep_both_active(tmp_path: Path) -> None:
     assert status == "active"  # a.jpg still exists in library A
 
 
-@strict_xfail
 def test_identical_content_across_libraries_kept_separate(tmp_path: Path) -> None:
     a, b = tmp_path / "A", tmp_path / "B"
     _img(a / "a.jpg", "green")
@@ -74,7 +76,6 @@ def test_identical_content_across_libraries_kept_separate(tmp_path: Path) -> Non
     assert names == {"a.jpg", "b.jpg"}  # two real archive copies, not one
 
 
-@strict_xfail
 def test_present_but_corrupt_is_not_missing(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     img = lib / "a.jpg"
@@ -87,7 +88,6 @@ def test_present_but_corrupt_is_not_missing(tmp_path: Path) -> None:
     assert status != "missing"  # it is present-but-unreadable, not gone
 
 
-@strict_xfail
 def test_full_previous_sha_is_preserved_on_content_change(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     img = lib / "a.jpg"
@@ -117,7 +117,6 @@ def test_full_previous_sha_is_preserved_on_content_change(tmp_path: Path) -> Non
     assert preserved(old_sha)  # the archive must not forget what those bytes were
 
 
-@strict_xfail
 def test_stale_hash_index_keeps_distinct_content_distinct(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     _img(lib / "a.jpg", "red")
@@ -136,7 +135,6 @@ def test_stale_hash_index_keeps_distinct_content_distinct(tmp_path: Path) -> Non
     assert len(photo_ids) == 2      # therefore genuinely different Photos
 
 
-@strict_xfail
 def test_incomplete_traversal_does_not_mark_missing(tmp_path: Path, monkeypatch) -> None:
     lib = tmp_path / "lib"
     _img(lib / "top.jpg", "red")
@@ -144,29 +142,32 @@ def test_incomplete_traversal_does_not_mark_missing(tmp_path: Path, monkeypatch)
     conn = connect(tmp_path / "cat.sqlite3")
     scan_library(conn, lib)
 
-    # Simulate an incomplete walk: the 'sub' directory is not returned this
-    # time (as if unreadable). A fail-closed scanner must not conclude the
-    # file vanished from an incomplete view of the filesystem.
+    # Simulate an unreadable subdirectory: os.walk invokes its onerror callback
+    # and yields nothing for 'sub'. A fail-closed scanner must treat the scan
+    # as incomplete and refuse to conclude the file there vanished.
     import ppa.scanner as scanner_mod
     real_walk = os.walk
 
-    def truncated_walk(top, *args, **kwargs):
-        for root, dirs, files in real_walk(top, *args, **kwargs):
+    def failing_walk(top, *args, **kwargs):
+        onerror = kwargs.get("onerror")
+        for root, dirs, files in real_walk(top):
             if os.path.basename(root) == "sub":
+                if onerror is not None:
+                    onerror(OSError("Permission denied: sub"))
                 continue
-            files = [f for f in files if os.path.basename(root) != "sub"]
             yield root, [d for d in dirs if d != "sub"], files
 
-    monkeypatch.setattr(scanner_mod.os, "walk", truncated_walk)
+    monkeypatch.setattr(scanner_mod.os, "walk", failing_walk)
     scan_library(conn, lib)
-    status = conn.execute("SELECT status FROM files WHERE filename='deep.jpg'").fetchone()["status"]
+    status = conn.execute(
+        "SELECT status FROM files WHERE filename='deep.jpg'"
+    ).fetchone()["status"]
     assert status != "missing"
 
 
 # --- Metadata provenance ----------------------------------------------------
 
 
-@strict_xfail
 def test_filesystem_mtime_observation_tracks_file(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     img = lib / "a.jpg"
@@ -187,7 +188,6 @@ def test_filesystem_mtime_observation_tracks_file(tmp_path: Path) -> None:
     assert obs_mtime == file_mtime  # evidence input must not go stale
 
 
-@strict_xfail
 def test_transient_metadata_failure_is_retried(tmp_path: Path, monkeypatch) -> None:
     lib = tmp_path / "lib"
     _jpeg_with_exif(lib / "a.jpg")
@@ -214,7 +214,6 @@ def test_transient_metadata_failure_is_retried(tmp_path: Path, monkeypatch) -> N
     assert dto is not None
 
 
-@strict_xfail
 def test_camera_id_cleared_when_content_loses_exif(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     img = lib / "a.jpg"
@@ -231,7 +230,6 @@ def test_camera_id_cleared_when_content_loses_exif(tmp_path: Path) -> None:
     assert cam is None  # bytes have no camera metadata -> no camera claim
 
 
-@strict_xfail
 def test_metadata_history_preserved_across_revisions(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     img = lib / "a.jpg"

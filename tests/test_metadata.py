@@ -101,22 +101,30 @@ def test_reextraction_on_content_change(tmp_path: Path) -> None:
     scan_library(conn, library)
     metadata.extract_stale(conn)
 
-    date1 = conn.execute(
-        "SELECT value FROM metadata_observations WHERE key='DateTimeOriginal'"
-    ).fetchone()["value"]
-    assert date1 == "2004:12:25 09:14:32"
+    from ppa import catalogue
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+    assert dict(catalogue.curated_metadata(conn, fid))["capture date (observed)"] == "2004:12:25 09:14:32"
 
     # Change the file's content AND its embedded date, rescan, re-extract.
     _jpeg_with_exif(img, dto="2005:01:01 10:00:00")
     scan_library(conn, library)
     n = metadata.extract_stale(conn)
-    assert n == 1  # content hash changed -> re-read
+    assert n == 1  # a new revision needs reading
 
-    dates = conn.execute(
-        "SELECT value FROM metadata_observations WHERE key='DateTimeOriginal'"
-    ).fetchall()
-    assert len(dates) == 1  # stale observation replaced, not accumulated
-    assert dates[0]["value"] == "2005:01:01 10:00:00"
+    # The CURRENT view shows the new date...
+    assert dict(catalogue.curated_metadata(conn, fid))["capture date (observed)"] == "2005:01:01 10:00:00"
+    # ...but the historical observation is preserved (attached to the old
+    # revision), not overwritten. Both dates survive in the ledger.
+    dates = {
+        r["value"]
+        for r in conn.execute(
+            "SELECT DISTINCT value FROM metadata_observations WHERE key='DateTimeOriginal'"
+        ).fetchall()
+    }
+    assert dates == {"2004:12:25 09:14:32", "2005:01:01 10:00:00"}
+    # Two revisions exist; one superseded, one current.
+    revs = conn.execute("SELECT COUNT(*) AS n FROM file_revisions").fetchone()["n"]
+    assert revs == 2
 
 
 def test_originals_untouched_by_extraction(tmp_path: Path) -> None:

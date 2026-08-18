@@ -70,6 +70,7 @@ class FileDetail:
     path: str
     extension: str | None
     status: str
+    health_status: str
     size_bytes: int
     width_px: int | None
     height_px: int | None
@@ -87,16 +88,15 @@ class FileDetail:
 
 
 def observations(conn: Connection, file_id: str) -> dict[str, str]:
-    """Return this file's metadata observations as a flat key -> value map.
-
-    Machine extraction stores at most one row per key, so flattening is safe.
-    Marker rows (source 'meta') are excluded — they're bookkeeping, not
-    metadata about the photograph.
+    """Return this file's CURRENT-revision metadata observations as a flat
+    key -> value map. Observations from superseded revisions are history and
+    are not shown here. Marker rows (source 'meta') are excluded.
     """
     rows = conn.execute(
         "SELECT source, key, value FROM metadata_observations "
-        "WHERE file_id = ? AND source != 'meta'",
-        (file_id,),
+        "WHERE file_id = ? AND source != 'meta' "
+        "AND file_revision_id = (SELECT current_revision_id FROM files WHERE id = ?)",
+        (file_id, file_id),
     ).fetchall()
     return {r["key"]: r["value"] for r in rows}
 
@@ -302,6 +302,7 @@ def file_detail(conn: Connection, file_id: str) -> FileDetail | None:
         path=row["path"],
         extension=row["extension"],
         status=row["status"],
+        health_status=row["health_status"],
         size_bytes=row["size_bytes"],
         width_px=row["width_px"],
         height_px=row["height_px"],

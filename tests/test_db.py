@@ -2,6 +2,7 @@ import uuid
 from pathlib import Path
 
 from ppa.db import connect, current_schema_version
+from ppa.db.connection import discover_migrations
 
 
 def test_connect_initialises_schema(tmp_path: Path) -> None:
@@ -9,7 +10,8 @@ def test_connect_initialises_schema(tmp_path: Path) -> None:
     conn = connect(db_path)
 
     assert db_path.exists()
-    assert current_schema_version(conn) == 1
+    # The catalogue is migrated to the latest available migration.
+    assert current_schema_version(conn) == len(discover_migrations())
 
     tables = {
         row["name"]
@@ -26,6 +28,7 @@ def test_connect_initialises_schema(tmp_path: Path) -> None:
         "cameras",
         "integrity_events",
         "schema_version",
+        "libraries",
     }
     assert expected.issubset(tables)
 
