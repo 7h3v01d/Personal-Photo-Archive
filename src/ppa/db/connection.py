@@ -30,6 +30,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = FULL;")
+    # The GUI reads on one connection while a background worker writes on
+    # another (WAL allows one writer + many readers). A short busy timeout
+    # makes a reader wait briefly for the writer rather than raising
+    # "database is locked".
+    conn.execute("PRAGMA busy_timeout = 5000;")
 
     _apply_schema(conn)
     return conn

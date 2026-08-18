@@ -1,32 +1,22 @@
 """Application entry point.
 
-Phase 0 exit criteria this satisfies: project launches, database
-initialises, configuration loads, logging works.
-
-Deliberately just a blank window for now — Phase 4/5 add the real UI
-(grid view, folder browser, inspector). This exists so the plumbing
-(config -> logging -> db -> Qt event loop) can be verified end to end.
+Boots the desktop application: config -> logging -> catalogue database ->
+themed Qt window. The window (ppa.ui.main_window.MainWindow) is the real
+Phase 4/5 UI — navigation, thumbnail grid, inspector — driving the Phase 1/2
+scanner and integrity engine on background threads.
 """
 
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
+from PySide6.QtWidgets import QApplication
 
 from ppa.config import Config
 from ppa.db import connect, current_schema_version
 from ppa.logging_setup import configure_logging, get_logger
-
-
-class MainWindow(QMainWindow):
-    def __init__(self, schema_version: int) -> None:
-        super().__init__()
-        self.setWindowTitle("Personal Photo Archive")
-        self.resize(1000, 700)
-        self.setCentralWidget(
-            QLabel(f"  Catalogue schema v{schema_version} — foundation online.")
-        )
+from ppa.ui.main_window import MainWindow
+from ppa.ui.theme import apply_theme
 
 
 def main() -> int:
@@ -35,12 +25,15 @@ def main() -> int:
     log = get_logger("main")
     log.info("Starting Personal Photo Archive")
 
+    # Confirm the catalogue is reachable and initialised before the UI opens.
     conn = connect(config.db_path)
     schema_version = current_schema_version(conn)
-    log.info("Catalogue database ready at %s (schema v%s)", config.db_path, schema_version)
+    conn.close()
+    log.info("Catalogue ready at %s (schema v%s)", config.db_path, schema_version)
 
     app = QApplication(sys.argv)
-    window = MainWindow(schema_version)
+    apply_theme(app)
+    window = MainWindow(config)
     window.show()
     return app.exec()
 
