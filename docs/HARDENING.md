@@ -39,3 +39,23 @@ Adversarial-review defects and where each is closed + regression-tested.
 - **Flagged hash_mismatch is held**, not auto-accepted, until explicit
   reconciliation. There is not yet a reconciliation UI, so a flagged file stays
   flagged until resolved manually — intentional (preserves forensic value).
+
+## Hardening 3.2 (Schema v5) — transaction & identity closure — all closed
+
+| Finding | Fix | Test |
+|---------|-----|------|
+| Failed scan committed partial reconciliation | `conn.rollback()` before committing only the FAILED audit | `test_hardening_32::test_failed_scan_rolls_back_partial_reconciliation` |
+| Failed scan left a new revision behind | same rollback; asserted no rev/sha/session/event drift | `…::test_failed_scan_does_not_commit_new_revision` |
+| Within-library identity used raw absolute path (respelled root → phantom move) | identity = `library_id` + `relative_path_key` = normcase(normpath(relative_path)) | `…::test_respelled_library_root_is_not_a_move` |
+| Overlapping library roots catalogued one file twice | fail closed on nested/containing roots (`commonpath`) | `…::test_overlapping_library_root_rejected` |
+| Extractor version not recorded; version bump didn't invalidate | store `extractor_name`/`extractor_version` on the revision; stale when version differs | `…::test_extractor_version_bump_makes_extraction_stale` |
+| catalogue reads used legacy `status` | converted to `presence_status` (authoritative); `status`/`files.sha256` remain maintained compat mirrors | (covered by existing catalogue/grid tests) |
+
+## Additional recorded design decision
+
+- **Content continuity ≠ photographic-identity continuity.** Same path +
+  different bytes is treated as a new revision of the same Photo. This is
+  usually right (an external edit), but an in-place *replacement* with an
+  unrelated image would also be modelled as the same Photo. The revision ledger
+  loses nothing, so this is deferred: later perceptual-similarity / user review
+  can split a Photo when an in-place replacement is not the same subject.

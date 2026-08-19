@@ -274,6 +274,12 @@ def extract_for_revision(conn: Connection, file_id: str, revision_id: str) -> st
     if result is not None:
         store_metadata(conn, file_id, revision_id, result)
         status = "success"
+        conn.execute(
+            "UPDATE file_revisions SET extraction_status = ?, extracted_at = ?, "
+            "extractor_name = ?, extractor_version = ? WHERE id = ?",
+            (status, _iso_now(), "pillow-exif", EXTRACTOR_VERSION, revision_id),
+        )
+        return status
 
     conn.execute(
         "UPDATE file_revisions SET extraction_status = ?, extracted_at = ? WHERE id = ?",
@@ -298,9 +304,14 @@ def extract_stale(conn: Connection, progress_cb=None) -> int:
         JOIN file_revisions r ON r.id = f.current_revision_id
         WHERE f.presence_status = 'present'
           AND r.sha256 IS NOT NULL
-          AND r.extraction_status IN ('pending', 'failed_transient')
+          AND (
+                r.extraction_status IN ('pending', 'failed_transient')
+                OR (r.extraction_status = 'success'
+                    AND (r.extractor_version IS NULL OR r.extractor_version != ?))
+          )
         ORDER BY f.filename, f.id
-        """
+        """,
+        (EXTRACTOR_VERSION,),
     ).fetchall()
 
     total = len(targets)

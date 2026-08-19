@@ -40,15 +40,22 @@ def _config_with_library(tmp_path: Path) -> Config:
     conn.close()
 
     cfg_path = tmp_path / "config.toml"
+    # Use POSIX-style (forward-slash) paths: backslashes in a double-quoted TOML
+    # string are escape sequences (a Windows path like C:\Users\... breaks on the
+    # \U). Forward slashes are valid TOML and are accepted by pathlib/SQLite on
+    # Windows too.
+    db_path = (tmp_path / "catalogue.sqlite3").as_posix()
+    log_path = (tmp_path / "ppa.log").as_posix()
+    lib_path = library.as_posix()
     cfg_path.write_text(
         f"""
 [database]
-path = "{tmp_path / 'catalogue.sqlite3'}"
+path = "{db_path}"
 [logging]
 level = "INFO"
-path = "{tmp_path / 'ppa.log'}"
+path = "{log_path}"
 [library]
-directories = ["{library}"]
+directories = ["{lib_path}"]
 """,
         encoding="utf-8",
     )

@@ -162,14 +162,14 @@ def library_stats(conn: Connection) -> LibraryStats:
     files = conn.execute("SELECT COUNT(*) AS n FROM files").fetchone()["n"]
     total_bytes = (
         conn.execute(
-            "SELECT COALESCE(SUM(size_bytes), 0) AS n FROM files WHERE status = 'active'"
+            "SELECT COALESCE(SUM(size_bytes), 0) AS n FROM files WHERE presence_status = 'present'"
         ).fetchone()["n"]
     )
     active = conn.execute(
-        "SELECT COUNT(*) AS n FROM files WHERE status = 'active'"
+        "SELECT COUNT(*) AS n FROM files WHERE presence_status = 'present'"
     ).fetchone()["n"]
     missing = conn.execute(
-        "SELECT COUNT(*) AS n FROM files WHERE status = 'missing'"
+        "SELECT COUNT(*) AS n FROM files WHERE presence_status = 'missing'"
     ).fetchone()["n"]
     duplicate_files = conn.execute(
         """
@@ -230,15 +230,15 @@ def grid_items(conn: Connection, view: str = VIEW_ALL, limit: int | None = None)
     )
 
     if view == VIEW_MISSING:
-        where, order = "WHERE f.status = 'missing' ", "ORDER BY f.filename, f.id"
+        where, order = "WHERE f.presence_status = 'missing' ", "ORDER BY f.filename, f.id"
     elif view == VIEW_RECENT:
-        where, order = "WHERE f.status = 'active' ", "ORDER BY f.first_seen_at DESC, f.filename"
+        where, order = "WHERE f.presence_status = 'present' ", "ORDER BY f.first_seen_at DESC, f.filename"
     elif view == VIEW_DUPLICATES:
         # Every file whose Photo has more than one file, grouped so copies sit
         # together. Missing copies included — the point is to see the cluster.
         where, order = "WHERE counts.c > 1 ", "ORDER BY f.photo_id, f.filename, f.id"
     else:  # VIEW_ALL
-        where, order = "WHERE f.status = 'active' ", "ORDER BY f.filename, f.id"
+        where, order = "WHERE f.presence_status = 'present' ", "ORDER BY f.filename, f.id"
 
     sql = cte + select + where + order
     if limit is not None:

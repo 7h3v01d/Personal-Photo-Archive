@@ -4,20 +4,22 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening 3.1 complete (Schema v4). 20 adversarial regression tests green; 79 tests total.**
+Status: **Archive Core Hardening 3.2 complete (Schema v5). 25 adversarial regression tests green; 84 tests total.**
 
-The Library -> File -> FileRevision -> Observation model is in place and its
-interfaces are now consistent: integrity verification speaks presence/health,
-a Verify-flagged hash_mismatch poisons the scan fast-path (no silent
-laundering), historical revisions cannot be re-extracted from today's bytes,
-filesystem-date history survives per revision, crashed scans record FAILED,
-and the database enforces revision/file ownership (triggers). Windows-correct
-library identity via normcase+realpath.
+The Library -> File -> FileRevision -> Observation model holds under attack;
+this slice closed the transaction/identity edges: a failed scan now rolls
+back ALL partial reconciliation before recording FAILED (no half-committed
+catalogue, no orphaned revision); within-library identity is the canonical
+relative path (a respelled/junctioned root is no longer a phantom move);
+overlapping library roots are rejected; and metadata extraction records its
+extractor name/version so a version bump re-runs extraction. Catalogue reads
+now use presence_status; `status`/`files.sha256` remain maintained compat
+mirrors.
 
-See `docs/HARDENING.md` for the full findings -> fix -> test map. Phase 6
-(Date Reliability Engine) can unblock once a confirming adversarial pass on
-this build comes back clean. Source-file safety was never implicated: no
-path writes to originals.
+See `docs/HARDENING.md` for the full findings -> fix -> test map (25 across
+Hardening 1-3.2). Per the reviewer, Phase 6 (Date Reliability Engine) can
+unblock once a confirming adversarial pass on this build comes back clean.
+Source-file safety was never implicated: no path writes to originals.
 
 ## Setup
 
@@ -132,6 +134,7 @@ src/ppa/
             002_libraries.sql
             003_revisions.sql
             004_ownership.sql
+            005_identity.sql
         migrations/001_initial.sql       SQLite schema v1
         connection.py    DB open/init
 tests/                  pytest suite

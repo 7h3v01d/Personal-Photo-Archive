@@ -134,7 +134,8 @@ class _DiskFile:
     mime_type: str
     sha256: str
     hashed_now: bool
-    known_row: Row | None  # active catalogue row at this exact path, if any
+    rel_key: str          # canonical within-library identity
+    known_row: Row | None  # active catalogue row with this identity, if any
 
 
 def scan_library(
@@ -184,14 +185,15 @@ def scan_library(
                 "AND (library_id = ? OR (library_id IS NULL AND path LIKE ?))",
                 (library_id, root_prefix),
             ).fetchall()
-            active_by_path: dict[str, Row] = {
-                r["path"]: r for r in cat_rows if r["status"] == "active"
+            active_by_relkey: dict[str, Row] = {
+                _row_relkey(r, walk_base): r for r in cat_rows if r["status"] == "active"
             }
 
             # --- Pass 1: inventory the filesystem (read-only) ---------------------
             _progress("Scanning library…")
             disk_files: list[_DiskFile] = []
             seen_paths: set[str] = set()  # every supported file physically present,
+            seen_relkeys: set[str] = set()  # ...keyed by within-library identity
             #                               whether or not it could be decoded
             traversal_errors: list[str] = []
 
@@ -214,12 +216,14 @@ def scan_library(
 
                     if ext in extensions:
                         seen_paths.add(str(path))  # physically present regardless of decode
+                        seen_relkeys.add(_relkey(_relative_to(str(path), walk_base)))
                         df = _inventory_supported_file(
                             report=report,
                             path=path,
                             ext=ext,
                             format_map=extensions,
-                            active_by_path=active_by_path,
+                            walk_base=walk_base,
+                            active_by_relkey=active_by_relkey,
                         )
                         if df is not None:
                             disk_files.append(df)
@@ -232,6 +236,7 @@ def scan_library(
 
             disk_files.sort(key=lambda d: d.path)  # deterministic reconcile order
             disk_paths = {d.path for d in disk_files}
+            disk_relkeys = {d.rel_key for d in disk_files}
             scan_complete = not traversal_errors
 
             # --- Pass 2: reconcile inventory against the catalogue ----------------
@@ -270,24 +275,24 @@ def scan_library(
                     df=df,
                     hash_index=hash_index,
                     matched_row_ids=matched_row_ids,
-                    disk_paths=disk_paths,
+                    disk_relkeys=disk_relkeys,
                     library_id=library_id,
                     walk_base=walk_base,
                 )
 
-            # 2c. Account for catalogue files not matched above.
-            #     - present on disk but not successfully inventoried  -> present + unhealthy
-            #       (e.g. corrupt/unreadable), NEVER "missing"
-            #     - genuinely absent                                  -> missing, but only
-            #       if this scan saw the whole library. An INCOMPLETE traversal must not
-            #       be allowed to conclude anything vanished (fail closed).
+            # 2c. Account for catalogue files not matched above. Identity is the
+            #     within-library canonical relative path, so a differently-spelled
+            #     root can't make a present file look absent.
+            #     - present but not successfully inventoried -> present + unhealthy
+            #     - genuinely absent -> missing, but only if the scan was COMPLETE.
             for row in cat_rows:
                 if row["id"] in matched_row_ids:
                     continue
-                if row["path"] in disk_paths:
-                    continue  # its path exists on disk; a duplicate/move claimed it
+                row_relkey = _row_relkey(row, walk_base)
+                if row_relkey in disk_relkeys:
+                    continue  # its identity exists on disk; a duplicate/move claimed it
 
-                if row["path"] in seen_paths:
+                if row_relkey in seen_relkeys:
                     # Physically present but we couldn't read/decode it this scan.
                     if row["health_status"] != "unreadable":
                         conn.execute(
@@ -350,9 +355,11 @@ def scan_library(
             log.info("Scan complete: session=%s\n%s", session_id, report.summary())
             return report
     except Exception:
-        # Any crash mid-scan must leave an honest audit trail, not a
-        # session that still claims it completed. Mark FAILED, commit that,
-        # then re-raise.
+        # Any crash mid-scan must leave the catalogue untouched AND an honest
+        # audit trail. Roll back ALL partial reconciliation first (the RUNNING
+        # session row was committed before this block, so it survives), then
+        # commit only the FAILED audit state, then re-raise.
+        conn.rollback()
         conn.execute(
             "UPDATE import_sessions SET scan_status = 'failed', completed_at = ? "
             "WHERE id = ?",
@@ -362,10 +369,23 @@ def scan_library(
         raise
 
 
+class OverlappingLibraryError(ValueError):
+    """Raised when a new library root nests inside (or contains) an existing one."""
+
+
+def _relkey(rel: str) -> str:
+    """Canonical within-library identity for a relative path: case- and
+    separator-normalised so the same file is identified consistently however
+    its library root was spelled.
+    """
+    return os.path.normcase(os.path.normpath(rel))
+
+
 def _resolve_library(conn: Connection, root_path: Path) -> tuple[int, str]:
     """Return (library_id, canonical_root) for ``root_path``, creating the
-    library row on first sight. Canonicalisation here is a normpath+abspath;
-    full Windows case-folding is a later hardening step.
+    library row on first sight. Rejects a root that overlaps an existing
+    library (one nested inside the other), which would otherwise catalogue the
+    same physical file twice under two libraries.
     """
     # Canonical identity key: resolve symlinks, then normalise case/separators
     # so D:\Family Photos and d:\family photos are recognised as one library on
@@ -376,6 +396,20 @@ def _resolve_library(conn: Connection, root_path: Path) -> tuple[int, str]:
     ).fetchone()
     if row is not None:
         return row["id"], canonical
+
+    # Fail closed on overlapping roots (either direction).
+    for other in conn.execute("SELECT root_canonical_path FROM libraries").fetchall():
+        existing = other["root_canonical_path"]
+        try:
+            common = os.path.commonpath([existing, canonical])
+        except ValueError:
+            continue  # different drives / unrelated
+        if common == existing or common == canonical:
+            raise OverlappingLibraryError(
+                f"Library root {canonical!r} overlaps existing library {existing!r}. "
+                "Nested/overlapping libraries are not allowed."
+            )
+
     cur = conn.execute(
         "INSERT INTO libraries (root_display_path, root_canonical_path) VALUES (?, ?)",
         (str(root_path), canonical),
@@ -455,12 +489,14 @@ def _inventory_supported_file(
     path: Path,
     ext: str,
     format_map: dict[str, str],
-    active_by_path: dict[str, Row],
+    walk_base: str,
+    active_by_relkey: dict[str, Row],
 ) -> _DiskFile | None:
     """Pass 1 worker: stat, verify the image decodes, and resolve identity.
 
-    Returns a _DiskFile, or None if the file is inaccessible/corrupt (which
-    is recorded on the report). Reads bytes only; never writes.
+    Identity within a library is the canonical relative path (rel_key), not the
+    raw absolute path, so re-opening the same root with a different spelling
+    does not make a file look moved. Reads bytes only; never writes.
     """
     try:
         stat = path.stat()
@@ -483,7 +519,8 @@ def _inventory_supported_file(
         log.warning("Inaccessible/corrupt image, skipping: %s (%s)", path, exc)
         return None
 
-    known = active_by_path.get(str(path))
+    rel_key = _relkey(_relative_to(str(path), walk_base))
+    known = active_by_relkey.get(rel_key)
 
     # Fast path: catalogued here already, already hashed, size + mtime
     # unchanged, AND currently healthy -> trust the stored hash. Once there is
@@ -518,8 +555,18 @@ def _inventory_supported_file(
         mime_type=f"image/{format_map[ext].lower()}",
         sha256=sha,
         hashed_now=hashed_now,
+        rel_key=rel_key,
         known_row=known,
     )
+
+
+def _row_relkey(row: Row, walk_base: str) -> str:
+    """Canonical within-library identity for a catalogued row: its stored
+    relative_path when present (spelling-independent), else derived from the
+    absolute path relative to the current walk base.
+    """
+    rel = row["relative_path"] if row["relative_path"] else _relative_to(row["path"], walk_base)
+    return _relkey(rel)
 
 
 def _reconcile_known_path(
@@ -551,14 +598,14 @@ def _reconcile_known_path(
             UPDATE files
             SET sha256 = ?, hash_computed_at = ?, size_bytes = ?, fs_mtime = ?,
                 width_px = ?, height_px = ?, mime_type = ?,
-                library_id = ?, relative_path = ?,
+                library_id = ?, relative_path = ?, relative_path_key = ?,
                 status = 'active', presence_status = 'present', health_status = 'ok',
                 last_seen_at = ?, last_seen_session = ?
             WHERE id = ?
             """,
             (
                 df.sha256, now, df.size_bytes, df.fs_mtime, df.width, df.height,
-                df.mime_type, library_id, rel, now, session_id, row["id"],
+                df.mime_type, library_id, rel, _relkey(rel), now, session_id, row["id"],
             ),
         )
         if row["current_revision_id"]:
@@ -579,12 +626,12 @@ def _reconcile_known_path(
             UPDATE files
             SET last_seen_at = ?, last_seen_session = ?, width_px = ?,
                 height_px = ?, mime_type = ?, fs_mtime = ?, size_bytes = ?,
-                library_id = ?, relative_path = ?,
+                library_id = ?, relative_path = ?, relative_path_key = ?,
                 status = 'active', presence_status = 'present', health_status = 'ok'
             WHERE id = ?
             """,
             (now, session_id, df.width, df.height, df.mime_type, df.fs_mtime,
-             df.size_bytes, library_id, rel, row["id"]),
+             df.size_bytes, library_id, rel, _relkey(rel), row["id"]),
         )
         # Content is unchanged but the filesystem mtime may have been touched;
         # keep the filesystem-date evidence current.
@@ -617,14 +664,14 @@ def _reconcile_known_path(
         UPDATE files
         SET sha256 = ?, hash_computed_at = ?, size_bytes = ?, fs_mtime = ?,
             width_px = ?, height_px = ?, mime_type = ?,
-            library_id = ?, relative_path = ?, current_revision_id = ?,
+            library_id = ?, relative_path = ?, relative_path_key = ?, current_revision_id = ?,
             status = 'active', presence_status = 'present', health_status = 'ok',
             last_seen_at = ?, last_seen_session = ?
         WHERE id = ?
         """,
         (
             df.sha256, now, df.size_bytes, df.fs_mtime, df.width, df.height,
-            df.mime_type, library_id, rel, new_rev, now, session_id, row["id"],
+            df.mime_type, library_id, rel, _relkey(rel), new_rev, now, session_id, row["id"],
         ),
     )
     # Record the FULL previous hash so the archive never forgets those bytes.
@@ -656,26 +703,26 @@ def _reconcile_orphan(
     df: _DiskFile,
     hash_index: dict[str, list[Row]],
     matched_row_ids: set[str],
-    disk_paths: set[str],
+    disk_relkeys: set[str],
     library_id: int,
     walk_base: str,
 ) -> None:
     """A file at a path we don't recognise. Its content hash decides whether
     it's a move, an exact duplicate, a restoration, or genuinely new.
 
-    Move-vs-duplicate is decided by whether a same-content row's *own* path is
-    still present on disk. This uses the (maintained) hash index and the disk
-    inventory directly rather than a matched-set heuristic, so a row whose
-    content changed earlier in this scan can never be mistaken for a twin.
+    Move-vs-duplicate is decided by whether a same-content row's own
+    within-library identity (rel_key) is still present on disk — spelling of
+    the library root is irrelevant.
     """
     now = _now()
     candidates = hash_index.get(df.sha256, [])
 
-    # A relocation: same content whose own path is GONE from disk (moved here
-    # or reappeared after going missing). Never something already claimed.
+    # A relocation: same content whose own identity is GONE from disk (moved
+    # here or reappeared after going missing). Never something already claimed.
     relocated = next(
         (r for r in candidates
-         if r["id"] not in matched_row_ids and r["path"] not in disk_paths),
+         if r["id"] not in matched_row_ids
+         and _row_relkey(r, walk_base) not in disk_relkeys),
         None,
     )
     if relocated is not None:
@@ -686,9 +733,11 @@ def _reconcile_orphan(
         _index_add(hash_index, df.sha256, _refetch(conn, relocated["id"]))
         return
 
-    # An exact duplicate: same content whose path is STILL on disk (the
+    # An exact duplicate: same content whose identity is STILL on disk (the
     # original is present), so this is a second File of the same Photo.
-    present_twin = next((r for r in candidates if r["path"] in disk_paths), None)
+    present_twin = next(
+        (r for r in candidates if _row_relkey(r, walk_base) in disk_relkeys), None
+    )
     if present_twin is not None:
         new_row = _insert_file(
             conn, session_id, df, now, photo_id=present_twin["photo_id"],
@@ -749,14 +798,14 @@ def _apply_relocation(
             presence_status = 'present', health_status = 'ok',
             size_bytes = ?, fs_mtime = ?, width_px = ?, height_px = ?,
             mime_type = ?, sha256 = ?, hash_computed_at = COALESCE(hash_computed_at, ?),
-            library_id = ?, relative_path = ?,
+            library_id = ?, relative_path = ?, relative_path_key = ?,
             last_seen_at = ?, last_seen_session = ?
         WHERE id = ?
         """,
         (
             df.path, Path(df.path).name, df.ext, df.size_bytes, df.fs_mtime,
             df.width, df.height, df.mime_type, df.sha256, now,
-            library_id, rel, now, session_id, row["id"],
+            library_id, rel, _relkey(rel), now, session_id, row["id"],
         ),
     )
     _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
@@ -798,15 +847,16 @@ def _insert_file(
     conn.execute(
         """
         INSERT INTO files (
-            id, photo_id, library_id, path, relative_path, filename, extension,
-            size_bytes, fs_mtime, width_px, height_px, mime_type, sha256,
-            hash_computed_at, first_seen_at, last_seen_at, first_seen_session,
-            last_seen_session, status, presence_status, health_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            id, photo_id, library_id, path, relative_path, relative_path_key, filename,
+            extension, size_bytes, fs_mtime, width_px, height_px, mime_type,
+            sha256, hash_computed_at, first_seen_at, last_seen_at,
+            first_seen_session, last_seen_session, status, presence_status,
+            health_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   'active', 'present', 'ok')
         """,
         (
-            file_id, photo_id, library_id, df.path, rel, Path(df.path).name,
+            file_id, photo_id, library_id, df.path, rel, _relkey(rel), Path(df.path).name,
             df.ext, df.size_bytes, df.fs_mtime, df.width, df.height,
             df.mime_type, df.sha256, now, now, now, session_id, session_id,
         ),
