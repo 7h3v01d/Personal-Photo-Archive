@@ -72,12 +72,25 @@ def test_verify_backfills_missing_hash(tmp_path: Path) -> None:
 
     conn = connect(tmp_path / "catalogue.sqlite3")
     scan_library(conn, library)
+    # Simulate a truly unhashed legacy file: both the file mirror AND the
+    # authoritative current revision have no content hash.
     conn.execute("UPDATE files SET sha256 = NULL, hash_computed_at = NULL")
+    conn.execute(
+        "UPDATE file_revisions SET sha256 = NULL "
+        "WHERE id = (SELECT current_revision_id FROM files)"
+    )
     conn.commit()
 
     report = verify_library(conn)
     assert report.backfilled == 1
-    assert conn.execute("SELECT sha256 FROM files").fetchone()["sha256"] is not None
+    file_sha = conn.execute("SELECT sha256 FROM files").fetchone()["sha256"]
+    rev_sha = conn.execute(
+        "SELECT sha256 FROM file_revisions "
+        "WHERE id = (SELECT current_revision_id FROM files)"
+    ).fetchone()["sha256"]
+    assert file_sha is not None
+    assert rev_sha is not None  # revision (authoritative) backfilled too, no drift
+    assert file_sha == rev_sha
 
 
 def test_verify_flags_unreadable_file_as_corrupt(tmp_path: Path) -> None:
@@ -91,7 +104,11 @@ def test_verify_flags_unreadable_file_as_corrupt(tmp_path: Path) -> None:
     img_path.write_bytes(b"no longer a valid image")
     report = verify_library(conn)
     assert report.corrupt == 1
+    # Present-but-unreadable is a health problem, recorded as such.
     events = conn.execute(
-        "SELECT * FROM integrity_events WHERE event_type = 'corrupt'"
+        "SELECT * FROM integrity_events WHERE event_type = 'unreadable'"
     ).fetchall()
     assert len(events) == 1
+    row = conn.execute("SELECT presence_status, health_status FROM files").fetchone()
+    assert row["presence_status"] == "present"
+    assert row["health_status"] == "unreadable"

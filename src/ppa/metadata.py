@@ -236,14 +236,25 @@ def _set_camera_for_current_revision(
 
 def extract_for_revision(conn: Connection, file_id: str, revision_id: str) -> str:
     """Extract metadata for one revision's content. Returns the resulting
-    extraction_status. Reads the file at the file's current path (the bytes on
-    disk are the current revision's content).
+    extraction_status. Reads the file at its current path — which holds the
+    CURRENT revision's bytes.
+
+    Because we only have the current bytes on disk, extraction is refused for
+    any revision that is not the file's current one: re-reading current bytes
+    into a historical revision would silently rewrite that revision's recorded
+    provenance (contaminating exactly the evidence the archive exists to keep).
     """
     frow = conn.execute(
-        "SELECT path FROM files WHERE id = ?", (file_id,)
+        "SELECT path, current_revision_id FROM files WHERE id = ?", (file_id,)
     ).fetchone()
     if frow is None:
         return "failed_unreadable"
+    if frow["current_revision_id"] != revision_id:
+        log.warning(
+            "Refusing to extract historical revision %s from current bytes of %s",
+            revision_id, file_id,
+        )
+        return "refused_not_current"
     path = Path(frow["path"])
 
     try:

@@ -167,7 +167,8 @@ def scan_library(
     root_prefix = walk_base.rstrip(os.sep) + os.sep + "%"
 
     conn.execute(
-        "INSERT INTO import_sessions (id, library_path, started_at) VALUES (?, ?, ?)",
+        "INSERT INTO import_sessions (id, library_path, started_at, scan_status) "
+        "VALUES (?, ?, ?, 'running')",
         (session_id, str(library_path), started_at),
     )
     conn.commit()
@@ -177,176 +178,188 @@ def scan_library(
     # which we adopt on sight. Files belonging to *other* libraries are
     # invisible here, so scanning one library can never mark another's files
     # moved or missing, and identical content in two libraries stays two files.
-    cat_rows: list[Row] = conn.execute(
-        "SELECT * FROM files WHERE status IN ('active', 'missing') "
-        "AND (library_id = ? OR (library_id IS NULL AND path LIKE ?))",
-        (library_id, root_prefix),
-    ).fetchall()
-    active_by_path: dict[str, Row] = {
-        r["path"]: r for r in cat_rows if r["status"] == "active"
-    }
+    try:
+            cat_rows: list[Row] = conn.execute(
+                "SELECT * FROM files WHERE status IN ('active', 'missing') "
+                "AND (library_id = ? OR (library_id IS NULL AND path LIKE ?))",
+                (library_id, root_prefix),
+            ).fetchall()
+            active_by_path: dict[str, Row] = {
+                r["path"]: r for r in cat_rows if r["status"] == "active"
+            }
 
-    # --- Pass 1: inventory the filesystem (read-only) ---------------------
-    _progress("Scanning library…")
-    disk_files: list[_DiskFile] = []
-    seen_paths: set[str] = set()  # every supported file physically present,
-    #                               whether or not it could be decoded
-    traversal_errors: list[str] = []
+            # --- Pass 1: inventory the filesystem (read-only) ---------------------
+            _progress("Scanning library…")
+            disk_files: list[_DiskFile] = []
+            seen_paths: set[str] = set()  # every supported file physically present,
+            #                               whether or not it could be decoded
+            traversal_errors: list[str] = []
 
-    def _on_walk_error(exc: OSError) -> None:
-        # A directory we could not read means our view of the filesystem is
-        # incomplete. Record it; below we refuse to mark anything missing.
-        traversal_errors.append(str(exc))
-        log.warning("Traversal error (scan is incomplete): %s", exc)
+            def _on_walk_error(exc: OSError) -> None:
+                # A directory we could not read means our view of the filesystem is
+                # incomplete. Record it; below we refuse to mark anything missing.
+                traversal_errors.append(str(exc))
+                log.warning("Traversal error (scan is incomplete): %s", exc)
 
-    seen_count = 0
-    for root, _dirs, filenames in os.walk(library_path, onerror=_on_walk_error):
-        for name in sorted(filenames):  # sorted -> reproducible ordering
-            path = Path(root) / name
-            ext = path.suffix.lower()
-            extensions = supported_extensions()
+            seen_count = 0
+            for root, _dirs, filenames in os.walk(library_path, onerror=_on_walk_error):
+                for name in sorted(filenames):  # sorted -> reproducible ordering
+                    path = Path(root) / name
+                    ext = path.suffix.lower()
+                    extensions = supported_extensions()
 
-            seen_count += 1
-            if seen_count % 25 == 0:
-                _progress(f"Inventorying… {seen_count} files seen")
+                    seen_count += 1
+                    if seen_count % 25 == 0:
+                        _progress(f"Inventorying… {seen_count} files seen")
 
-            if ext in extensions:
-                seen_paths.add(str(path))  # physically present regardless of decode
-                df = _inventory_supported_file(
+                    if ext in extensions:
+                        seen_paths.add(str(path))  # physically present regardless of decode
+                        df = _inventory_supported_file(
+                            report=report,
+                            path=path,
+                            ext=ext,
+                            format_map=extensions,
+                            active_by_path=active_by_path,
+                        )
+                        if df is not None:
+                            disk_files.append(df)
+                    elif is_recognised_but_unsupported(ext):
+                        report.deferred_format_files += 1
+                        log.debug("Deferred format, skipping: %s", path)
+                    else:
+                        report.unsupported_files += 1
+                        log.debug("Unsupported extension, skipping: %s", path)
+
+            disk_files.sort(key=lambda d: d.path)  # deterministic reconcile order
+            disk_paths = {d.path for d in disk_files}
+            scan_complete = not traversal_errors
+
+            # --- Pass 2: reconcile inventory against the catalogue ----------------
+            _progress(f"Reconciling {len(disk_files)} files against the catalogue…")
+            matched_row_ids: set[str] = set()
+
+            # A live hash index, seeded from the catalogue and extended as we create
+            # or relocate rows, so two identical *new* files in one scan resolve as
+            # original + duplicate rather than two independents.
+            hash_index: dict[str, list[Row]] = {}
+            for r in cat_rows:
+                if r["sha256"]:
+                    hash_index.setdefault(r["sha256"], []).append(r)
+
+            # 2a. Files sitting at a path we already know (active). These are the
+            #     originals still in place; resolve them before anything else so the
+            #     move-vs-duplicate decision below has a correct "still present" set.
+            orphans: list[_DiskFile] = []
+            for df in disk_files:
+                row = df.known_row
+                if row is None:
+                    orphans.append(df)
+                    continue
+                _reconcile_known_path(
+                    conn, report, session_id, df, row, hash_index, library_id, walk_base
+                )
+                matched_row_ids.add(row["id"])
+
+            # 2b. Files at a path we don't recognise: move, duplicate, restore, or
+            #     genuinely new — decided by content hash.
+            for df in orphans:
+                _reconcile_orphan(
+                    conn=conn,
                     report=report,
-                    path=path,
-                    ext=ext,
-                    format_map=extensions,
-                    active_by_path=active_by_path,
+                    session_id=session_id,
+                    df=df,
+                    hash_index=hash_index,
+                    matched_row_ids=matched_row_ids,
+                    disk_paths=disk_paths,
+                    library_id=library_id,
+                    walk_base=walk_base,
                 )
-                if df is not None:
-                    disk_files.append(df)
-            elif is_recognised_but_unsupported(ext):
-                report.deferred_format_files += 1
-                log.debug("Deferred format, skipping: %s", path)
-            else:
-                report.unsupported_files += 1
-                log.debug("Unsupported extension, skipping: %s", path)
 
-    disk_files.sort(key=lambda d: d.path)  # deterministic reconcile order
-    disk_paths = {d.path for d in disk_files}
-    scan_complete = not traversal_errors
+            # 2c. Account for catalogue files not matched above.
+            #     - present on disk but not successfully inventoried  -> present + unhealthy
+            #       (e.g. corrupt/unreadable), NEVER "missing"
+            #     - genuinely absent                                  -> missing, but only
+            #       if this scan saw the whole library. An INCOMPLETE traversal must not
+            #       be allowed to conclude anything vanished (fail closed).
+            for row in cat_rows:
+                if row["id"] in matched_row_ids:
+                    continue
+                if row["path"] in disk_paths:
+                    continue  # its path exists on disk; a duplicate/move claimed it
 
-    # --- Pass 2: reconcile inventory against the catalogue ----------------
-    _progress(f"Reconciling {len(disk_files)} files against the catalogue…")
-    matched_row_ids: set[str] = set()
+                if row["path"] in seen_paths:
+                    # Physically present but we couldn't read/decode it this scan.
+                    if row["health_status"] != "unreadable":
+                        conn.execute(
+                            "UPDATE files SET presence_status = 'present', "
+                            "health_status = 'unreadable' WHERE id = ?",
+                            (row["id"],),
+                        )
+                        conn.execute(
+                            "INSERT INTO integrity_events (file_id, event_type, detail, session_id) "
+                            "VALUES (?, 'unreadable', ?, ?)",
+                            (row["id"],
+                             f"Present at {row['path']} but could not be read/decoded during scan.",
+                             session_id),
+                        )
+                    continue
 
-    # A live hash index, seeded from the catalogue and extended as we create
-    # or relocate rows, so two identical *new* files in one scan resolve as
-    # original + duplicate rather than two independents.
-    hash_index: dict[str, list[Row]] = {}
-    for r in cat_rows:
-        if r["sha256"]:
-            hash_index.setdefault(r["sha256"], []).append(r)
+                if not scan_complete:
+                    continue  # incomplete view of the filesystem -> refuse to mark missing
 
-    # 2a. Files sitting at a path we already know (active). These are the
-    #     originals still in place; resolve them before anything else so the
-    #     move-vs-duplicate decision below has a correct "still present" set.
-    orphans: list[_DiskFile] = []
-    for df in disk_files:
-        row = df.known_row
-        if row is None:
-            orphans.append(df)
-            continue
-        _reconcile_known_path(
-            conn, report, session_id, df, row, hash_index, library_id, walk_base
-        )
-        matched_row_ids.add(row["id"])
+                if row["status"] == "active":
+                    conn.execute(
+                        "UPDATE files SET status = 'missing', presence_status = 'missing' "
+                        "WHERE id = ?",
+                        (row["id"],),
+                    )
+                    conn.execute(
+                        "INSERT INTO integrity_events (file_id, event_type, detail, session_id) "
+                        "VALUES (?, 'missing', ?, ?)",
+                        (row["id"], f"Not found during complete scan of {library_path}", session_id),
+                    )
+                    report.missing_files += 1
 
-    # 2b. Files at a path we don't recognise: move, duplicate, restore, or
-    #     genuinely new — decided by content hash.
-    for df in orphans:
-        _reconcile_orphan(
-            conn=conn,
-            report=report,
-            session_id=session_id,
-            df=df,
-            hash_index=hash_index,
-            matched_row_ids=matched_row_ids,
-            disk_paths=disk_paths,
-            library_id=library_id,
-            walk_base=walk_base,
-        )
-
-    # 2c. Account for catalogue files not matched above.
-    #     - present on disk but not successfully inventoried  -> present + unhealthy
-    #       (e.g. corrupt/unreadable), NEVER "missing"
-    #     - genuinely absent                                  -> missing, but only
-    #       if this scan saw the whole library. An INCOMPLETE traversal must not
-    #       be allowed to conclude anything vanished (fail closed).
-    for row in cat_rows:
-        if row["id"] in matched_row_ids:
-            continue
-        if row["path"] in disk_paths:
-            continue  # its path exists on disk; a duplicate/move claimed it
-
-        if row["path"] in seen_paths:
-            # Physically present but we couldn't read/decode it this scan.
-            if row["health_status"] != "unreadable":
-                conn.execute(
-                    "UPDATE files SET presence_status = 'present', "
-                    "health_status = 'unreadable' WHERE id = ?",
-                    (row["id"],),
-                )
-                conn.execute(
-                    "INSERT INTO integrity_events (file_id, event_type, detail, session_id) "
-                    "VALUES (?, 'unreadable', ?, ?)",
-                    (row["id"],
-                     f"Present at {row['path']} but could not be read/decoded during scan.",
-                     session_id),
-                )
-            continue
-
-        if not scan_complete:
-            continue  # incomplete view of the filesystem -> refuse to mark missing
-
-        if row["status"] == "active":
+            report.completed_at = _now()
             conn.execute(
-                "UPDATE files SET status = 'missing', presence_status = 'missing' "
-                "WHERE id = ?",
-                (row["id"],),
+                "UPDATE libraries SET last_scan_at = ? WHERE id = ?",
+                (report.completed_at, library_id),
             )
             conn.execute(
-                "INSERT INTO integrity_events (file_id, event_type, detail, session_id) "
-                "VALUES (?, 'missing', ?, ?)",
-                (row["id"], f"Not found during complete scan of {library_path}", session_id),
+                """
+                UPDATE import_sessions
+                SET completed_at = ?, files_scanned = ?, files_new = ?,
+                    files_modified = ?, files_missing = ?, files_errored = ?,
+                    scan_status = ?, traversal_errors = ?
+                WHERE id = ?
+                """,
+                (
+                    report.completed_at,
+                    report.files_scanned,
+                    report.new_files,
+                    report.modified_files,
+                    report.missing_files,
+                    len(report.inaccessible_files),
+                    "complete" if scan_complete else "incomplete",
+                    len(traversal_errors),
+                    session_id,
+                ),
             )
-            report.missing_files += 1
+            conn.commit()
 
-    report.completed_at = _now()
-    conn.execute(
-        "UPDATE libraries SET last_scan_at = ? WHERE id = ?",
-        (report.completed_at, library_id),
-    )
-    conn.execute(
-        """
-        UPDATE import_sessions
-        SET completed_at = ?, files_scanned = ?, files_new = ?,
-            files_modified = ?, files_missing = ?, files_errored = ?,
-            scan_status = ?, traversal_errors = ?
-        WHERE id = ?
-        """,
-        (
-            report.completed_at,
-            report.files_scanned,
-            report.new_files,
-            report.modified_files,
-            report.missing_files,
-            len(report.inaccessible_files),
-            "complete" if scan_complete else "incomplete",
-            len(traversal_errors),
-            session_id,
-        ),
-    )
-    conn.commit()
-
-    log.info("Scan complete: session=%s\n%s", session_id, report.summary())
-    return report
+            log.info("Scan complete: session=%s\n%s", session_id, report.summary())
+            return report
+    except Exception:
+        # Any crash mid-scan must leave an honest audit trail, not a
+        # session that still claims it completed. Mark FAILED, commit that,
+        # then re-raise.
+        conn.execute(
+            "UPDATE import_sessions SET scan_status = 'failed', completed_at = ? "
+            "WHERE id = ?",
+            (_now(), session_id),
+        )
+        conn.commit()
+        raise
 
 
 def _resolve_library(conn: Connection, root_path: Path) -> tuple[int, str]:
@@ -354,7 +367,10 @@ def _resolve_library(conn: Connection, root_path: Path) -> tuple[int, str]:
     library row on first sight. Canonicalisation here is a normpath+abspath;
     full Windows case-folding is a later hardening step.
     """
-    canonical = os.path.abspath(os.path.normpath(str(root_path)))
+    # Canonical identity key: resolve symlinks, then normalise case/separators
+    # so D:\Family Photos and d:\family photos are recognised as one library on
+    # Windows. The display path is stored separately, unchanged.
+    canonical = os.path.normcase(os.path.realpath(str(root_path)))
     row = conn.execute(
         "SELECT id FROM libraries WHERE root_canonical_path = ?", (canonical,)
     ).fetchone()
@@ -416,12 +432,15 @@ def _record_fs_observation(
     observes the filesystem; keeping it here means the evidence can never go
     stale relative to files.fs_mtime.
     """
-    if not fs_mtime:
+    if not fs_mtime or not revision_id:
         return
+    # Scope the replace to THIS revision, so a superseded revision keeps the
+    # filesystem date that was observed while its bytes were current (that's
+    # evidence for later timestamp reconstruction).
     conn.execute(
-        "DELETE FROM metadata_observations WHERE file_id = ? AND source = 'filesystem' "
-        "AND key = 'mtime'",
-        (file_id,),
+        "DELETE FROM metadata_observations WHERE file_revision_id = ? "
+        "AND source = 'filesystem' AND key = 'mtime'",
+        (revision_id,),
     )
     conn.execute(
         "INSERT INTO metadata_observations (file_id, file_revision_id, source, key, value, session_id) "
@@ -466,13 +485,16 @@ def _inventory_supported_file(
 
     known = active_by_path.get(str(path))
 
-    # Fast path: catalogued here already, already hashed, and neither size
-    # nor mtime moved -> trust the stored hash instead of re-reading bytes.
+    # Fast path: catalogued here already, already hashed, size + mtime
+    # unchanged, AND currently healthy -> trust the stored hash. Once there is
+    # positive evidence of trouble (health != ok, e.g. a hash_mismatch found
+    # by Verify), the shortcut is poisoned and we always re-read the bytes.
     if (
         known is not None
         and known["sha256"]
         and known["size_bytes"] == size_bytes
         and known["fs_mtime"] == fs_mtime
+        and known["health_status"] == "ok"
     ):
         sha = known["sha256"]
         hashed_now = False
@@ -569,8 +591,19 @@ def _reconcile_known_path(
         _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
         return
 
-    # Same path, different content -> a genuine in-place modification. Append a
-    # new immutable revision and move the pointer; never mutate/delete the old.
+    # Same path, different content. If Verify has already flagged this file as
+    # a hash_mismatch, do NOT silently promote the suspicious bytes to a new
+    # trusted revision — hold the recorded revision intact for explicit
+    # reconciliation, preserving Verify's forensic finding.
+    if row["health_status"] == "hash_mismatch":
+        conn.execute(
+            "UPDATE files SET last_seen_at = ?, last_seen_session = ? WHERE id = ?",
+            (now, session_id, row["id"]),
+        )
+        return
+
+    # Otherwise this is a legitimate in-place modification: append a new
+    # immutable revision and move the pointer; never mutate/delete the old.
     old_sha = row["sha256"]
     report.modified_files += 1
     if row["current_revision_id"]:

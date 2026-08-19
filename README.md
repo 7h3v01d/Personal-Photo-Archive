@@ -4,25 +4,20 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening complete (Schema v3). All 10 adversarial acceptance tests green.**
+Status: **Archive Core Hardening 3.1 complete (Schema v4). 20 adversarial regression tests green; 79 tests total.**
 
-- Phases 0-3 functional; the archive-core provenance model is now in place:
-  **Library -> File -> FileRevision -> Observation**, with a
-  `current_revision_id` pointer and genuinely immutable revisions.
-- `status` is decomposed into presence (present/missing/unknown) and health
-  (ok/unreadable/hash_mismatch/unknown): a present-but-corrupt file is
-  present+unreadable, never "missing".
-- Scans carry an explicit completion state; an INCOMPLETE traversal is
-  forbidden from marking anything missing (fail closed).
-- Metadata attaches to the revision it describes, is never deleted as
-  history, tracks a transient-vs-permanent extraction lifecycle, keeps the
-  filesystem-date evidence current, and clears a stale camera when the
-  current content no longer names one.
-- Phase 6 (Date Reliability Engine) can unblock once a confirming
-  adversarial review of this hardening comes back clean.
+The Library -> File -> FileRevision -> Observation model is in place and its
+interfaces are now consistent: integrity verification speaks presence/health,
+a Verify-flagged hash_mismatch poisons the scan fast-path (no silent
+laundering), historical revisions cannot be re-extracted from today's bytes,
+filesystem-date history survives per revision, crashed scans record FAILED,
+and the database enforces revision/file ownership (triggers). Windows-correct
+library identity via normcase+realpath.
 
-The 10 defects from adversarial review are all closed and kept as permanent
-regression tests (`tests/test_hardening_regressions.py`). Source-file safety was never implicated: no path writes to originals.
+See `docs/HARDENING.md` for the full findings -> fix -> test map. Phase 6
+(Date Reliability Engine) can unblock once a confirming adversarial pass on
+this build comes back clean. Source-file safety was never implicated: no
+path writes to originals.
 
 ## Setup
 
@@ -136,6 +131,7 @@ src/ppa/
             001_initial.sql
             002_libraries.sql
             003_revisions.sql
+            004_ownership.sql
         migrations/001_initial.sql       SQLite schema v1
         connection.py    DB open/init
 tests/                  pytest suite

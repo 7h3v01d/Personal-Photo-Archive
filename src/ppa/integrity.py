@@ -77,8 +77,18 @@ def verify_library(
 
     report = VerifyReport(started_at=_now())
 
+    # Operate on the v3 presence/health model, and treat the current
+    # revision's hash as the authoritative content identity (files.sha256 is a
+    # maintained mirror). Verify updates presence/health; it never silently
+    # accepts suspicious bytes as a new trusted revision.
     rows = conn.execute(
-        "SELECT id, path, sha256 FROM files WHERE status = 'active'"
+        """
+        SELECT f.id, f.path, f.health_status, f.current_revision_id,
+               r.sha256 AS revision_sha
+        FROM files f
+        LEFT JOIN file_revisions r ON r.id = f.current_revision_id
+        WHERE f.presence_status = 'present'
+        """
     ).fetchall()
     total = len(rows)
 
@@ -88,7 +98,11 @@ def verify_library(
         path = Path(row["path"])
 
         if not path.exists():
-            conn.execute("UPDATE files SET status = 'missing' WHERE id = ?", (row["id"],))
+            conn.execute(
+                "UPDATE files SET status = 'missing', presence_status = 'missing' "
+                "WHERE id = ?",
+                (row["id"],),
+            )
             conn.execute(
                 "INSERT INTO integrity_events (file_id, event_type, detail) "
                 "VALUES (?, 'missing', ?)",
@@ -98,14 +112,17 @@ def verify_library(
             report.problems.append((str(path), "missing"))
             continue
 
-        # A file we cannot decode/read is a corruption signal in its own right.
+        # A file we cannot decode/read is a health problem, not absence.
         try:
             with Image.open(path) as img:
                 img.verify()
         except (UnidentifiedImageError, OSError) as exc:
             conn.execute(
+                "UPDATE files SET health_status = 'unreadable' WHERE id = ?", (row["id"],)
+            )
+            conn.execute(
                 "INSERT INTO integrity_events (file_id, event_type, detail) "
-                "VALUES (?, 'corrupt', ?)",
+                "VALUES (?, 'unreadable', ?)",
                 (row["id"], f"Failed to decode during verification: {exc}"),
             )
             report.corrupt += 1
@@ -116,33 +133,54 @@ def verify_library(
             actual = sha256_file(path)
         except OSError as exc:
             conn.execute(
+                "UPDATE files SET health_status = 'unreadable' WHERE id = ?", (row["id"],)
+            )
+            conn.execute(
                 "INSERT INTO integrity_events (file_id, event_type, detail) "
-                "VALUES (?, 'corrupt', ?)",
+                "VALUES (?, 'unreadable', ?)",
                 (row["id"], f"Failed to hash during verification: {exc}"),
             )
             report.corrupt += 1
             report.problems.append((str(path), f"unhashable: {exc}"))
             continue
 
-        stored = row["sha256"]
+        stored = row["revision_sha"]
         if stored is None:
+            # Complete the current revision's content identity (and the file
+            # mirror) — the revision is authoritative, so backfill it too.
+            if row["current_revision_id"]:
+                conn.execute(
+                    "UPDATE file_revisions SET sha256 = ? WHERE id = ?",
+                    (actual, row["current_revision_id"]),
+                )
             conn.execute(
-                "UPDATE files SET sha256 = ?, hash_computed_at = ? WHERE id = ?",
+                "UPDATE files SET sha256 = ?, hash_computed_at = ?, health_status = 'ok' "
+                "WHERE id = ?",
                 (actual, _now(), row["id"]),
             )
             report.backfilled += 1
         elif stored == actual:
             report.verified_ok += 1
+            if row["health_status"] != "ok":
+                # Content matches again (e.g. an original was restored) -> healthy.
+                conn.execute(
+                    "UPDATE files SET health_status = 'ok' WHERE id = ?", (row["id"],)
+                )
         else:
-            # Do NOT overwrite the stored hash. Record and let the user decide.
+            # Positive evidence the bytes disagree with the recorded identity.
+            # Flag health; NEVER overwrite the trusted revision hash here.
+            conn.execute(
+                "UPDATE files SET health_status = 'hash_mismatch' WHERE id = ?",
+                (row["id"],),
+            )
             conn.execute(
                 "INSERT INTO integrity_events (file_id, event_type, detail) "
                 "VALUES (?, 'hash_mismatch', ?)",
                 (
                     row["id"],
-                    f"Stored {stored[:12]}... but file now hashes {actual[:12]}.... "
+                    f"Recorded content {stored} but file now hashes {actual}. "
                     "Content changed with no scan detecting it (possible corruption "
-                    "or external edit). Stored hash left unchanged for investigation.",
+                    "or external edit). Recorded revision left intact for investigation.",
                 ),
             )
             report.mismatches += 1
