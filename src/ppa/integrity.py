@@ -17,6 +17,7 @@ Run it on a schedule or before a backup, not on every scan.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +45,8 @@ class VerifyReport:
     backfilled: int = 0
     now_missing: int = 0
     corrupt: int = 0
+    unavailable_libraries: int = 0
+    skipped_unavailable: int = 0
     problems: list[tuple[str, str]] = field(default_factory=list)  # (path, reason)
 
     def summary(self) -> str:
@@ -54,6 +57,8 @@ class VerifyReport:
             f"  hashes backfilled:{self.backfilled}",
             f"  now missing:      {self.now_missing}",
             f"  unreadable:       {self.corrupt}",
+            f"  offline libraries:{self.unavailable_libraries}",
+            f"  skipped (offline):{self.skipped_unavailable}",
         ]
         return "\n".join(lines)
 
@@ -77,13 +82,24 @@ def verify_library(
 
     report = VerifyReport(started_at=_now())
 
-    # Operate on the v3 presence/health model, and treat the current
-    # revision's hash as the authoritative content identity (files.sha256 is a
-    # maintained mirror). Verify updates presence/health; it never silently
-    # accepts suspicious bytes as a new trusted revision.
+    # Determine which libraries are currently reachable. If a library root is
+    # offline (external drive unplugged, network share down, drive-letter
+    # changed), we must NOT conclude its photos are missing — we only know the
+    # library is unavailable. Record that and skip its files entirely.
+    lib_available: dict[int, bool] = {}
+    for lib in conn.execute("SELECT id, root_canonical_path FROM libraries").fetchall():
+        available = os.path.isdir(lib["root_canonical_path"])
+        lib_available[lib["id"]] = available
+        conn.execute(
+            "UPDATE libraries SET state = ? WHERE id = ?",
+            ("active" if available else "unavailable", lib["id"]),
+        )
+        if not available:
+            report.unavailable_libraries += 1
+
     rows = conn.execute(
         """
-        SELECT f.id, f.path, f.health_status, f.current_revision_id,
+        SELECT f.id, f.path, f.health_status, f.current_revision_id, f.library_id,
                r.sha256 AS revision_sha
         FROM files f
         LEFT JOIN file_revisions r ON r.id = f.current_revision_id
@@ -95,6 +111,12 @@ def verify_library(
     for i, row in enumerate(rows, start=1):
         if i % 25 == 0 or i == total:
             _progress(f"Verifying… {i}/{total}")
+
+        # Skip files whose library is unreachable: absence can't be concluded.
+        if row["library_id"] is not None and not lib_available.get(row["library_id"], True):
+            report.skipped_unavailable += 1
+            continue
+
         path = Path(row["path"])
 
         if not path.exists():

@@ -32,16 +32,22 @@ class ScanWorker(QObject):
     finished = Signal(object)  # ScanReport
     failed = Signal(str)
 
-    def __init__(self, db_path: Path, library_path: Path) -> None:
+    def __init__(self, db_path: Path, library_path: Path,
+                 protected_paths: list[Path] | None = None) -> None:
         super().__init__()
         self._db_path = db_path
         self._library_path = library_path
+        self._protected_paths = protected_paths
 
     @Slot()
     def run(self) -> None:
         try:
             conn = connect(self._db_path)  # own connection, this thread
-            report = scan_library(conn, self._library_path, progress_cb=self.progress.emit)
+            report = scan_library(
+                conn, self._library_path,
+                progress_cb=self.progress.emit,
+                protected_paths=self._protected_paths,
+            )
             conn.close()
             self.finished.emit(report)
         except Exception as exc:  # surfaced to the UI, never swallowed

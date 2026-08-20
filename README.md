@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening 3.2 complete (Schema v5). 25 adversarial regression tests green; 84 tests total.**
+Status: **Archive Core Hardening ACCEPTED (Schema v6). Phase 6 Slice 1.1 — conservative intrinsic date reliability (provenance-preserving; never TRUSTED from a lone photo). 120 tests total, 0 xfails.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls
@@ -135,6 +135,7 @@ src/ppa/
             003_revisions.sql
             004_ownership.sql
             005_identity.sql
+            006_unique_identity.sql
         migrations/001_initial.sql       SQLite schema v1
         connection.py    DB open/init
 tests/                  pytest suite
@@ -167,35 +168,3 @@ knowable until the whole tree has been walked. Pass 1 inventories and
 hashes; Pass 2 reconciles. Every path change is written to
 `file_path_history` and every notable transition to `integrity_events`,
 so nothing is silently overwritten.
-
-## Next up — Archive Core Hardening (Schema v2)
-
-Ordered so each step rests on the last:
-
-1. `libraries` table + `library_id`; scope all reconciliation to the
-   scanned library (closes the multi-library blockers).
-2. `file_revisions` (immutable: full SHA-256, size, dimensions, mtime,
-   observed-at, is_current) so a content change supersedes rather than
-   erases — the old full hash is never discarded.
-3. Attach `metadata_observations` to `file_revision_id`; stop deleting
-   historical machine metadata (revisions supersede).
-4. Decompose `status` into presence (present/missing/unknown) and health
-   (ok/unreadable/hash_mismatch/unknown).
-5. Fail-closed traversal: an incomplete scan never marks files missing.
-6. Fix the live SHA index on in-place content change; canonicalise compare
-   paths (Windows) while preserving the display path.
-7. Metadata: `extraction_status`; only success stamps the SHA marker;
-   refresh the filesystem mtime observation; clear `camera_id` when the
-   current revision no longer supports it.
-8. Turn every strict-xfail in `test_hardening_regressions.py` green.
-
-Landed so far: **atomic** migration runner with duplicate/gap rejection
-(`db/migrations/`), a Qt-free `geometry` module, genuine queued cross-thread
-thumbnail dispatch, and the **libraries** layer (migration 002) — scans are
-now scoped per library, and the reconciliation/index bugs are fixed.
-
-Remaining strict-xfails (next slice): present-but-corrupt vs missing
-(status decomposition), fail-closed traversal, stale filesystem-mtime and
-camera observations, transient-extraction-as-success, and metadata history
-across revisions — all closed by `file_revisions` + `current_revision_id` +
-observations-per-revision + the metadata rework.

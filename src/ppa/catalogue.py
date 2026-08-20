@@ -31,7 +31,8 @@ class LibraryStats:
     active: int
     missing: int
     duplicate_files: int  # files sharing a Photo with at least one other file
-    hash_mismatches: int
+    hash_mismatches: int            # files currently in mismatch state
+    historical_mismatch_events: int  # all mismatch events ever recorded
     last_library_path: str | None
 
 
@@ -171,20 +172,43 @@ def library_stats(conn: Connection) -> LibraryStats:
     missing = conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE presence_status = 'missing'"
     ).fetchone()["n"]
+    # "Duplicate files" for the dashboard means copies that currently exist on
+    # disk: photos with more than one PRESENT file. A copy that has since gone
+    # missing is history, not a current duplicate, so it is excluded here (the
+    # Duplicate *view* still shows historical relationships).
     duplicate_files = conn.execute(
         """
         SELECT COUNT(*) AS n FROM files
-        WHERE photo_id IN (
-            SELECT photo_id FROM files GROUP BY photo_id HAVING COUNT(*) > 1
-        )
+        WHERE presence_status = 'present'
+          AND photo_id IN (
+              SELECT photo_id FROM files
+              WHERE presence_status = 'present'
+              GROUP BY photo_id HAVING COUNT(*) > 1
+          )
         """
     ).fetchone()["n"]
     hash_mismatches = conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE health_status = 'hash_mismatch'"
+    ).fetchone()["n"]
+    historical_mismatch_events = conn.execute(
         "SELECT COUNT(*) AS n FROM integrity_events WHERE event_type = 'hash_mismatch'"
     ).fetchone()["n"]
+    # Prefer the authoritative libraries table: the most recently scanned
+    # library's canonical (absolute) root. import_sessions.library_path stores
+    # whatever spelling was supplied (possibly a relative path), which is not a
+    # safe selector to reopen with from a different working directory.
     last = conn.execute(
-        "SELECT library_path FROM import_sessions ORDER BY started_at DESC LIMIT 1"
+        "SELECT root_display_path, root_canonical_path FROM libraries "
+        "WHERE last_scan_at IS NOT NULL ORDER BY last_scan_at DESC LIMIT 1"
     ).fetchone()
+    if last is not None:
+        # Prefer the display path when it is absolute; otherwise the canonical
+        # (always absolute) root.
+        import os as _os
+        disp = last["root_display_path"]
+        last_library_path = disp if (disp and _os.path.isabs(disp)) else last["root_canonical_path"]
+    else:
+        last_library_path = None
 
     return LibraryStats(
         photos=photos,
@@ -194,7 +218,8 @@ def library_stats(conn: Connection) -> LibraryStats:
         missing=missing,
         duplicate_files=duplicate_files,
         hash_mismatches=hash_mismatches,
-        last_library_path=last["library_path"] if last else None,
+        historical_mismatch_events=historical_mismatch_events,
+        last_library_path=last_library_path,
     )
 
 

@@ -166,3 +166,110 @@ def test_extractor_version_bump_makes_extraction_stale(tmp_path, monkeypatch):
     assert metadata.extract_stale(conn) == 1
     rev2 = conn.execute("SELECT extractor_version FROM file_revisions").fetchone()
     assert rev2["extractor_version"] == "pillow-exif/2"
+
+
+# --- Hardening 3.2.2: canonical paths, offline-aware verify, DB identity -----
+
+
+def test_files_path_is_always_absolute(tmp_path, monkeypatch):
+    lib = tmp_path / "lib"; _img(lib / "a.jpg")
+    monkeypatch.chdir(tmp_path)
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, Path("lib"))          # scanned via a RELATIVE spelling
+    stored = conn.execute("SELECT path FROM files").fetchone()["path"]
+    assert os.path.isabs(stored)             # ...but stored absolute
+
+
+def test_relative_first_scan_survives_cwd_change(tmp_path, monkeypatch):
+    lib = tmp_path / "lib"; _img(lib / "a.jpg")
+    monkeypatch.chdir(tmp_path)
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, Path("lib"))          # relative root, cwd = tmp_path
+
+    other = tmp_path / "elsewhere"; other.mkdir()
+    monkeypatch.chdir(other)                  # launch PPA from a different cwd
+    from ppa.integrity import verify_library
+    verify_library(conn)
+    presence = conn.execute("SELECT presence_status FROM files").fetchone()["presence_status"]
+    assert presence == "present"             # not a false "missing"
+
+
+def test_verify_skips_unavailable_library(tmp_path):
+    from ppa.integrity import verify_library
+    A = tmp_path / "A"; B = tmp_path / "B"
+    _img(A / "a.jpg"); _img(B / "b.jpg", "blue")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, A); scan_library(conn, B)
+
+    os.rename(A, tmp_path / "A_offline")      # external drive unplugged
+    rep = verify_library(conn)
+
+    presence = {r["filename"]: r["presence_status"]
+                for r in conn.execute("SELECT filename, presence_status FROM files")}
+    assert presence["a.jpg"] == "present"     # unreachable != missing
+    assert presence["b.jpg"] == "present"
+    assert rep.unavailable_libraries == 1 and rep.skipped_unavailable == 1
+    states = [r["state"] for r in conn.execute("SELECT state FROM libraries ORDER BY id")]
+    assert "unavailable" in states
+
+
+def test_duplicate_identity_rejected_by_db(tmp_path):
+    import sqlite3, uuid
+    lib = tmp_path / "lib"; _img(lib / "a.jpg")
+    conn = connect(tmp_path / "c.sqlite3"); scan_library(conn, lib)
+    row = conn.execute(
+        "SELECT library_id, relative_path_key, photo_id FROM files"
+    ).fetchone()
+    conn.execute("INSERT INTO photos (id) VALUES (?)", (str(uuid.uuid4()),))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO files (id, photo_id, library_id, path, relative_path, "
+            "relative_path_key, filename, size_bytes, first_seen_at, last_seen_at, "
+            "status, presence_status, health_status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,'active','present','ok')",
+            (str(uuid.uuid4()), row["photo_id"], row["library_id"], "/x/d.jpg",
+             "a.jpg", row["relative_path_key"], "d.jpg", 1, "t", "t"),
+        )
+
+
+def test_deleted_then_recreated_path_does_not_violate_uniqueness(tmp_path):
+    # A missing File keeps its identity; a genuinely different photo may later
+    # occupy the same relative path. Present-scoped uniqueness must allow this.
+    lib = tmp_path / "lib"; _img(lib / "a.jpg", "red")
+    conn = connect(tmp_path / "c.sqlite3"); scan_library(conn, lib)
+    (lib / "a.jpg").unlink(); scan_library(conn, lib)          # -> missing
+    _img(lib / "a.jpg", "blue"); scan_library(conn, lib)       # new content, same path
+    present = conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE presence_status='present'"
+    ).fetchone()["n"]
+    assert present == 1                                        # no crash, one present File
+
+
+def test_archive_inside_library_rejected(tmp_path):
+    from ppa.scanner import ArchiveInsideLibraryError
+    lib = tmp_path / "Photos"; _img(lib / "orig.jpg")
+    (lib / ".ppa").mkdir()
+    conn = connect(tmp_path / "c.sqlite3")
+    with pytest.raises(ArchiveInsideLibraryError):
+        scan_library(conn, lib, protected_paths=[lib / ".ppa" / "catalogue.sqlite3",
+                                                 lib / ".ppa" / "thumbnails"])
+
+
+def test_current_vs_historical_mismatch_counts(tmp_path):
+    from ppa.integrity import verify_library
+    from ppa.catalogue import library_stats
+    lib = tmp_path / "lib"; p = lib / "a.jpg"; _img(p, "red")
+    original = p.read_bytes()                 # keep exact good bytes
+    conn = connect(tmp_path / "c.sqlite3"); scan_library(conn, lib)
+
+    _img(p, "blue")                           # silent content change
+    verify_library(conn)                      # flags hash_mismatch
+    s1 = library_stats(conn)
+    assert s1.hash_mismatches == 1            # CURRENT state: one file mismatched
+    assert s1.historical_mismatch_events == 1  # and one event in the ledger
+
+    p.write_bytes(original)                   # restore the exact original bytes
+    verify_library(conn)                      # health returns to ok
+    s2 = library_stats(conn)
+    assert s2.hash_mismatches == 0            # dashboard reflects current health
+    assert s2.historical_mismatch_events == 1  # ledger still remembers it happened

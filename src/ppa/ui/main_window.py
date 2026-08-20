@@ -452,7 +452,11 @@ class MainWindow(QMainWindow):
 
         self._set_busy(True)
         self._status.showMessage("Starting scan…")
-        worker = ScanWorker(self._config.db_path, self._current_library)
+        data_dir = self._config.db_path.parent
+        protected = [self._config.db_path, data_dir / "thumbnails", self._config.log_path]
+        worker = ScanWorker(
+            self._config.db_path, self._current_library, protected_paths=protected
+        )
         worker.progress.connect(self._status.showMessage)
         worker.finished.connect(self._on_scan_done)
         worker.failed.connect(self._on_worker_failed)

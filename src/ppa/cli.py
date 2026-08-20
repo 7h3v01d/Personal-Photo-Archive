@@ -23,6 +23,12 @@ from ppa.metadata import extract_stale
 from ppa.scanner import scan_library
 
 
+def _protected_paths(config: Config) -> list[Path]:
+    """Operational paths that must never live inside a scanned library."""
+    data_dir = config.db_path.parent
+    return [config.db_path, data_dir / "thumbnails", config.log_path]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ppa")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -40,6 +46,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Read EXIF/metadata into the catalogue as observations",
     )
 
+    dates_parser = subparsers.add_parser(
+        "dates",
+        help="Assess timestamp reliability of catalogued photos (read-only)",
+    )
+    dates_parser.add_argument(
+        "--rating", default=None,
+        help="Only show photos with this rating "
+             "(TRUSTED/PROBABLY_VALID/QUESTIONABLE/LIKELY_WRONG/UNKNOWN)",
+    )
+
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -54,7 +70,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         log.info("Scanning %s", args.path)
-        report = scan_library(conn, args.path)
+        protected = _protected_paths(config)
+        report = scan_library(conn, args.path, protected_paths=protected)
         print(report.summary())
 
         if report.inaccessible_files:
@@ -79,6 +96,31 @@ def main(argv: list[str] | None = None) -> int:
             print("\nProblems found:")
             for path, reason in report.problems:
                 print(f"  {path}: {reason}")
+        return 0
+
+    if args.command == "dates":
+        from collections import Counter
+        from ppa.dating import assess_file
+
+        rows = conn.execute(
+            "SELECT id, filename FROM files WHERE presence_status = 'present' "
+            "ORDER BY filename"
+        ).fetchall()
+        counts: Counter[str] = Counter()
+        want = args.rating.upper() if args.rating else None
+        for r in rows:
+            a = assess_file(conn, r["id"])
+            counts[a.reliability.value] += 1
+            if want and a.reliability.value != want:
+                continue
+            est = a.candidate_date.date().isoformat() if a.candidate_date else "-"
+            print(f"  {a.reliability.value:15} {est:12} {r['filename']}")
+        print("\nSummary:")
+        for rating in ("TRUSTED", "PROBABLY_VALID", "QUESTIONABLE",
+                       "LIKELY_WRONG", "UNKNOWN"):
+            if counts.get(rating):
+                print(f"  {rating:15} {counts[rating]}")
+        print("\n(Read-only assessment; no photo or date was modified.)")
         return 0
 
     return 1

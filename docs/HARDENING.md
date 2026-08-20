@@ -59,3 +59,78 @@ Adversarial-review defects and where each is closed + regression-tested.
   unrelated image would also be modelled as the same Photo. The revision ledger
   loses nothing, so this is deferred: later perceptual-similarity / user review
   can split a Photo when an in-place replacement is not the same subject.
+
+## Hardening 3.2.2 (Schema v6) — filesystem-environment closure — all closed
+
+| Finding | Fix | Test |
+|---------|-----|------|
+| Relative `files.path` → false "missing" after cwd change | store absolute (realpath) access path; refresh it on rescan | `test_hardening_32::test_files_path_is_always_absolute`, `…::test_relative_first_scan_survives_cwd_change` |
+| Verify marked offline-library files missing | Verify is library-aware: unreachable root → `state='unavailable'`, files skipped, never missing | `…::test_verify_skips_unavailable_library` |
+| `(library_id, relative_path_key)` not DB-unique | partial UNIQUE index scoped to present files (migration 006) | `…::test_duplicate_identity_rejected_by_db`, `…::test_deleted_then_recreated_path_does_not_violate_uniqueness` |
+| Archive machinery could live inside a library (self-cataloguing loop) | scan rejects operational paths inside the library root | `…::test_archive_inside_library_rejected` |
+| Dashboard counted historical mismatch events as current | `library_stats.hash_mismatches` = current `health_status`; `historical_mismatch_events` separate | `…::test_current_vs_historical_mismatch_counts` |
+| Scanner still read legacy `status` for decisions | decision reads converted to `presence_status` | (covered by scanner + hardening suites) |
+
+## Hardening 3.2.3 (Schema v6) — identity boundaries — all closed
+
+| Finding | Fix | Test |
+|---------|-----|------|
+| Missing file returning to its exact path became a duplicate File | restoration ordered before duplicate; present-twin must be present | `test_hardening_323::test_missing_then_restored_same_path_reuses_file_id`, `…::test_exact_duplicate_still_detected` |
+| File symlink inside a library resolved/catalogued outside it | containment check: every File must resolve beneath the library root; escaping links skipped | `…::test_file_symlink_outside_library_is_not_catalogued` |
+| Library stayed `unavailable` after a successful scan | a successful scan sets `state='active'` | `…::test_library_state_recovers_active_after_successful_scan` |
+| GUI startup selector came from raw `import_sessions.library_path` (could be relative) | recover from `libraries` (absolute canonical/display root) | `…::test_startup_library_selector_is_absolute_after_relative_scan` |
+
+## Known limitation recorded for later (not blocking a local collection)
+
+- **Removable-storage identity.** A Library is identified by its canonical path.
+  If a different volume later occupies the same path (external drive swapped,
+  drive letter reused), Verify sees the root as present and could mark the
+  original photos missing. Mitigation for a future slice: record a volume/device
+  identity (e.g. Windows volume serial) so "expected path present + wrong volume"
+  reads as LIBRARY REPLACED / WRONG MEDIA rather than mass-missing. Fine for a
+  fixed local library; matters before serious external-drive archive use.
+
+## Hardening 3.2.4 (Schema v6) — operational boundary closure — all closed
+
+| Finding | Fix | Test |
+|---------|-----|------|
+| Unavailable-root scan marked the library `active` (and a nonexistent path created a phantom Library) | root-availability pre-check: existing Library → `unavailable`, no `active`/`last_scan_at`; new absent path → `LibraryUnavailableError`, no Library row | `test_hardening_324::test_unavailable_root_scan_does_not_mark_active`, `…::test_nonexistent_root_creates_no_library` |
+| Internal file symlink (alias of an in-library file) aborted the whole scan via the uniqueness constraint | alias detection: a dir entry resolving to an already-seen file is skipped (`alias_skipped`) instead of catalogued twice | `…::test_internal_symlink_alias_does_not_abort_scan` |
+| `duplicate_files` counted missing historical copies as current | count only present copies (photos with >1 present file); the Duplicate view still shows historical relationships | `…::test_duplicate_files_counts_only_present_copies` |
+
+---
+
+# Archive Core Hardening — ACCEPTED (at 3.2.4)
+
+Every finding across the review series is closed and fenced with a permanent
+regression test (42 adversarial tests across six files). Source photographs are
+never written. Foundation contract now holding under attack:
+
+    Library -> File (persistent identity) -> FileRevision (immutable bytes)
+    -> MetadataObservation (what those bytes said)
+
+Next: Phase 6 — Date Reliability Engine (identify unreliable timestamps without
+changing anything). Slice 1 (intrinsic per-photo signals) landed in `dating.py`.
+
+## Phase 6 Slice 1.1 — date-engine epistemics (adversarial review)
+
+Design principle adopted: **"multiple fields repeating the same claim are not
+multiple witnesses."** Fixes to `dating.py`:
+
+- Evidence is **source-qualified**: only an allow-list of `(source, key)` pairs
+  is consulted; a non-EXIF value labelled `DateTimeOriginal` can't masquerade as
+  EXIF. The pure API takes `DateObservation(source, key, value)`; a flat
+  `{key: value}` dict is rejected.
+- Intrinsic evidence **never yields TRUSTED** (reserved for independent evidence:
+  human anchors, GPS time). Matching Original/Digitized or a nearby mtime is
+  corroborating, not independent.
+- **Contradiction never raises confidence**: disagreeing EXIF fields → QUESTIONABLE
+  (with the disagreement as a reason); a corroborating mtime can't hide it.
+- **Future** uses a timezone tolerance (+48h) so a timezone-less local time ahead
+  of UTC isn't mislabelled.
+- **Reset epochs** are suspicion (QUESTIONABLE), any time of day — not exact-midnight
+  certainty; Slice 2 escalates with cross-photo evidence.
+- **Malformed vs absent** distinguished via `DateSignal.status`.
+- `best_estimate` renamed `candidate_date` (not an interpreted capture date).
+
+Tests: `tests/test_dating.py` (19), including the review's eight adversarial cases.
