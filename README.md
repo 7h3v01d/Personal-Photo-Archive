@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED (Schema v6). Phase 6 Slice 1 FROZEN; Slice 2 complete; Slice 3.0.1 (independent calendar evidence engine — explicit evidence-effect provenance; contradiction-triggered propagation). 163 tests, 0 xfails.**
+Status: **Archive Core Hardening ACCEPTED. Phase 6 (Date Reliability) COMPLETE & FROZEN. Phase 7.0.1 — reconstruction engine: offset anchored only by exact human dates (GPS UTC = ±1-day range, never an offset), strong-identity-gated bracketing, typed trust boundary. 200 tests, 0 xfails.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls

@@ -289,3 +289,131 @@ independent of the camera clock that addresses the calendar date.
 
 Deferred to 3.1: anchors table + migration, manufacture-floor config, GPS reader,
 `analyse`/CLI integration. Tests: `tests/test_reconcile.py` (11).
+
+## Phase 6 Slice 3.1 — independent-evidence persistence & wiring
+
+- **Anchors table (schema v7, migration 007).** User-asserted calendar evidence
+  (file/directory/library scope; exact/range), stored separately from
+  observations — interpretation, resolved to photos at read time. `anchors.py`:
+  add/list, and most-specific resolution (file > directory > library).
+- **GPS reader.** `exif-gps:GPSDateStamp` ('YYYY:MM:DD', satellite-derived) read
+  per current revision as independent calendar evidence.
+- **Manufacture floors.** `camera_floors.py`: optional `(make|model) -> date` JSON
+  config; EMPTY default (unknown model -> no floor -> no conclusion).
+- **`analyse_library_reconciled(conn, camera_floors=...)`** runs Slice 1->2->3
+  read-only, assembling GPS/anchor/floor evidence per photo and applying the pure
+  reconcile engine (with its 3.0.1 provenance rules).
+- **CLI:** read-only `ppa reconcile [--floors f.json] [--rating R]`; `ppa anchor
+  add/list` (anchors are user interpretation, not originals/observations).
+
+Tests: `tests/test_reconcile_catalogue.py` (8) — migration, anchor validation &
+resolution precedence, GPS corroboration->TRUSTED, GPS contradiction->reset-run
+condemnation, manufacture floor, exact-file-anchor precedence, read-only.
+
+## Phase 6 Slice 3.2 — structured prior-doubt resolution
+
+Answers the reviewer's deferred request: GPS can resolve a *specific* doubt
+rather than blanket-trusting. Cross-layer:
+
+- **Slice 1 emits structured `DoubtReason` codes** alongside free-text (RESET_EPOCH,
+  ONLY_FILESYSTEM, FALLBACK_FIELD, FIELD_DISAGREEMENT, CONFLICTING_DUPLICATE,
+  MTIME_PREDATES, MALFORMED), each flagged `resolvable_by_independent_date` or not.
+- **Slice 2** adds `SequenceDoubt.ORDER_CONFLICT` (not resolvable) to downgraded
+  photos; `PhotoChronology` carries the combined doubt list.
+- **Slice 3** upgrades a QUESTIONABLE photo to TRUSTED on GPS corroboration ONLY
+  when EVERY doubt is date-resolvable (RESET_EPOCH / ONLY_FILESYSTEM /
+  FALLBACK_FIELD). Any unrelated doubt (field disagreement, order conflict,
+  conflicting duplicate, mtime-predates) leaves it QUESTIONABLE, with the resolved
+  and unresolved doubts both stated. QUESTIONABLE with no coded doubts is not
+  upgraded (conservative). LIKELY_WRONG is still never resolved by GPS agreement.
+
+So a reset-epoch photo whose GPS confirms the date becomes TRUSTED, but a photo
+that is ALSO doubtful for an unrelated reason stays QUESTIONABLE — exactly the
+"resolve the reset suspicion, leave unrelated contradictions intact" behaviour.
+
+Tests: test_reconcile.py (+5), test_dating.py (doubt-code emission),
+test_reconcile_catalogue.py (end-to-end GPS-resolves-reset-epoch).
+
+## Phase 6 Slice 3.2.1 — group propagation gated on membership strength
+
+Principle: **evidence may propagate across a group only when the evidence
+establishing membership is strong enough to support the propagated claim.**
+Slice 2's reset_pattern was harmless (no downgrade); Slice 3 made it actionable,
+exposing that a serial-less model-only group can span multiple physical bodies.
+
+- **Device-identity gate on reset propagation.** A reset group carries
+  `reset_group_strong` (every member has a credible unique serial via
+  `_is_strong_serial`). Whole-run condemnation from one independent contradiction
+  is allowed ONLY for a confirmed single-device group; for a model-only/unknown
+  group the contradiction applies to its own frame and the group merely stays
+  suspicious.
+- **Conflicting group evidence.** If independent evidence within one reset group
+  both SUPPORTS and CONTRADICTS the shared date, propagation is withheld: frames
+  with their own evidence keep individual results; frames without stay
+  QUESTIONABLE with an explicit "group evidence conflicts" reason.
+
+Tests: two serial-less same-model bodies (no propagation), placeholder-serial
+group (no propagation), confirmed single device (one contradiction propagates),
+support+contradiction in one group (withheld). Module header updated to 3.2.1.
+
+---
+
+# Phase 6 — Date Reliability Engine — COMPLETE & FROZEN
+
+Slices 1 (intrinsic), 2 (cross-photo/sequence), and 3 (independent calendar
+evidence) are accepted and frozen. Read-only, deterministic, layered; the enum
+is never used as provenance; weaker signals never carry stronger claims.
+
+Layered model, enforced in code:
+  filename sequence      -> ORDER evidence (not calendar truth)
+  camera/device identity -> how strongly order/reset evidence may be interpreted
+  reset-epoch pattern    -> SUSPICION (never self-escalating)
+  independent evidence   -> earned LIKELY_WRONG + first TRUSTED (anchors/GPS/floors)
+
+`ppa reconcile [--floors f.json] [--export report.csv]` runs the full stack
+read-only for reviewing against a real collection.
+
+Next: **Phase 7 — Historical Date Reconstruction** (docs/PHASE7_DESIGN.md):
+recover the actual capture date/range for flagged photos (clock-offset
+propagation across confirmed reset runs, neighbour bracketing), as a separate
+interpretation layer that never overwrites observations.
+
+## Phase 7.0 — historical date reconstruction (pure engine)
+
+`reconstruct.py`: storage-agnostic, read-only, deterministic. Produces an
+interpreted capture date/range with confidence + evidence; never overwrites the
+recorded date (interpretation stays separate from observation).
+
+- **direct** — a frame's own independent true date (exact anchor / GPS) -> CONFIRMED.
+- **offset** — a CONFIRMED single-device reset run has a wrong-but-monotonic clock;
+  one known true date gives a day offset applied to the whole run (multi-day
+  rollover handled) -> STRONG. Withheld for model-only groups and for conflicting
+  datums. The marquee timeline-recovery step.
+- **anchor_range** — a range/event anchor -> RANGE.
+- **bracket** — a wrong frame between two point-dated neighbours (filename order)
+  -> RANGE.
+
+Tests: `tests/test_reconstruct.py` (9). Deferred to 7.1: reconstructions table +
+migration, catalogue wiring, `ppa reconstruct` report, confirm/reject flow.
+See docs/PHASE7_DESIGN.md.
+
+## Phase 7.0.1 — reconstruction epistemics hardening
+
+Rule: **a reconstruction may never be more precise or more certain than the
+evidence that supports it.**
+
+- **GPS never anchors an exact offset.** `GPSDateStamp` is UTC-derived while
+  `DateTimeOriginal` is local/timezone-less, so a GPS date can be ±1 day from the
+  true local date. GPS now reconstructs only its own frame as a ±1-day RANGE;
+  offset propagation is anchored ONLY by an exact human/local date (typed
+  `KnownTrueKind.HUMAN_EXACT`) belonging to the run.
+- **Bracketing requires strong single-device ordering** (`reset_group_strong`);
+  model-only groups may interleave two bodies, so filename order can't place a
+  frame there.
+- **Offset only revises QUESTIONABLE/LIKELY_WRONG** targets — never a clean claim.
+- **Typed trust boundary:** `KnownTrueKind` enum; unknown confirmation sources,
+  invalid ranges (end < start), and duplicate file_ids are rejected (ValueError).
+
+Tests: `tests/test_reconstruct.py` (15), incl. Brisbane/UTC ±1-day non-propagation
+and model-only bracket withholding. Deferred to 7.1: reconstructions table +
+migration, wiring, `ppa reconstruct`, confirm/reject flow.

@@ -20,8 +20,9 @@ def _dt(y, m, d):
     return datetime(y, m, d, tzinfo=timezone.utc)
 
 
-def _photo(fid, cand, rel, *, reset_group=None, ev=None):
-    return ReconcilablePhoto(fid, cand, rel, reset_group, ev or CalendarEvidence())
+def _photo(fid, cand, rel, *, reset_group=None, ev=None, reset_group_strong=True):
+    return ReconcilablePhoto(fid, cand, rel, reset_group, ev or CalendarEvidence(),
+                             [], reset_group_strong)
 
 
 # --- anchoring -> the first TRUSTED ------------------------------------------
@@ -186,3 +187,91 @@ def test_naive_datetimes_do_not_crash():
     p = _photo("n", _d(2001, 1, 1), Reliability.QUESTIONABLE,      # naive candidate
                ev=CalendarEvidence(gps_date=_dt(2004, 1, 1)))
     assert reconcile([p])["n"].reliability is Reliability.LIKELY_WRONG
+
+
+# --- 3.2: doubt-specific resolution ------------------------------------------
+
+from ppa.dating import DoubtReason  # noqa: E402
+
+
+def _q(fid, cand, doubts, ev):
+    return ReconcilablePhoto(fid, cand, Reliability.QUESTIONABLE, None, ev, doubts)
+
+
+def test_gps_resolves_reset_epoch_only_doubt_to_trusted():
+    p = _q("a", _dt(2001, 1, 1), [DoubtReason.RESET_EPOCH],
+           CalendarEvidence(gps_date=_dt(2001, 1, 1)))
+    assert reconcile([p])["a"].reliability is Reliability.TRUSTED
+
+
+def test_gps_does_not_resolve_when_unrelated_doubt_present():
+    p = _q("b", _dt(2001, 1, 1),
+           [DoubtReason.RESET_EPOCH, DoubtReason.FIELD_DISAGREEMENT],
+           CalendarEvidence(gps_date=_dt(2001, 1, 1)))
+    assert reconcile([p])["b"].reliability is Reliability.QUESTIONABLE
+
+
+def test_gps_does_not_resolve_questionable_with_no_coded_doubts():
+    p = _q("c", _dt(2001, 1, 1), [], CalendarEvidence(gps_date=_dt(2001, 1, 1)))
+    assert reconcile([p])["c"].reliability is Reliability.QUESTIONABLE
+
+
+def test_only_filesystem_doubt_resolved_by_confirming_gps():
+    p = _q("d", _dt(2015, 3, 4), [DoubtReason.ONLY_FILESYSTEM],
+           CalendarEvidence(gps_date=_dt(2015, 3, 4)))
+    assert reconcile([p])["d"].reliability is Reliability.TRUSTED
+
+
+def test_field_disagreement_alone_is_not_resolved_by_gps():
+    # An internal inconsistency is not settled just because an outside date
+    # agrees with the chosen reading.
+    p = _q("e", _dt(2010, 6, 1), [DoubtReason.FIELD_DISAGREEMENT],
+           CalendarEvidence(gps_date=_dt(2010, 6, 1)))
+    assert reconcile([p])["e"].reliability is Reliability.QUESTIONABLE
+
+
+# --- 3.2.1: propagation gated on device identity & group-evidence coherence ---
+
+
+def test_model_only_group_does_not_propagate_condemnation():
+    # A reset group that is NOT a confirmed single device (serial-less) may be
+    # two bodies; one contradiction condemns only its own frame.
+    photos = [_photo(f"f{i}", _dt(2001, 1, 1), Reliability.QUESTIONABLE,
+                     reset_group="R1", reset_group_strong=False) for i in range(6)]
+    photos[1] = _photo("f1", _dt(2001, 1, 1), Reliability.QUESTIONABLE, reset_group="R1",
+                       reset_group_strong=False, ev=CalendarEvidence(gps_date=_dt(2004, 12, 25)))
+    res = reconcile(photos)
+    assert res["f1"].reliability is Reliability.LIKELY_WRONG
+    assert all(res[f"f{i}"].reliability is Reliability.QUESTIONABLE for i in (0, 2, 3, 4, 5))
+
+
+def test_confirmed_device_group_propagates_condemnation():
+    photos = [_photo(f"f{i}", _dt(2001, 1, 1), Reliability.QUESTIONABLE,
+                     reset_group="R1", reset_group_strong=True) for i in range(6)]
+    photos[1] = _photo("f1", _dt(2001, 1, 1), Reliability.QUESTIONABLE, reset_group="R1",
+                       reset_group_strong=True, ev=CalendarEvidence(gps_date=_dt(2004, 12, 25)))
+    res = reconcile(photos)
+    assert all(res[f"f{i}"].reliability is Reliability.LIKELY_WRONG for i in range(6))
+
+
+def test_conflicting_group_evidence_withholds_propagation():
+    # One frame's GPS confirms 2001, another's GPS disproves it: the group's
+    # independent evidence conflicts. Frames without their own evidence stay
+    # QUESTIONABLE; frames with evidence keep individual results.
+    photos = [
+        _photo("A", _dt(2001, 1, 1), Reliability.QUESTIONABLE, reset_group="R1",
+               reset_group_strong=True, ev=CalendarEvidence(gps_date=_dt(2001, 1, 1))),
+        _photo("B", _dt(2001, 1, 1), Reliability.QUESTIONABLE, reset_group="R1",
+               reset_group_strong=True, ev=CalendarEvidence(gps_date=_dt(2004, 12, 25))),
+        _photo("C", _dt(2001, 1, 1), Reliability.QUESTIONABLE, reset_group="R1",
+               reset_group_strong=True),
+    ]
+    # A needs its reset-epoch doubt to be resolvable for GPS to trust it.
+    photos[0] = ReconcilablePhoto("A", _dt(2001, 1, 1), Reliability.QUESTIONABLE, "R1",
+                                  CalendarEvidence(gps_date=_dt(2001, 1, 1)),
+                                  [DoubtReason.RESET_EPOCH], True)
+    res = reconcile(photos)
+    assert res["A"].reliability is Reliability.TRUSTED        # its GPS confirms 2001
+    assert res["B"].reliability is Reliability.LIKELY_WRONG   # its GPS disproves 2001
+    assert res["C"].reliability is Reliability.QUESTIONABLE   # withheld, not condemned
+    assert any("conflict" in r.lower() for r in res["C"].reasons)

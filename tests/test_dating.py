@@ -248,3 +248,13 @@ def test_identical_malformed_duplicate_is_not_a_conflict():
                 DateObservation("exif", "DateTimeOriginal", "garbage")], now=NOW)
     assert a.reliability is Reliability.UNKNOWN
     assert not any("Conflicting" in r for r in a.reasons)
+
+
+def test_assessment_emits_structured_doubt_codes():
+    from ppa.dating import DoubtReason
+    a = assess(_exif(DateTimeOriginal="2001:01:01 09:00:00"), now=NOW)  # reset epoch
+    assert DoubtReason.RESET_EPOCH in a.doubts
+    b = assess([DateObservation("filesystem", "mtime", "2015-03-04T10:00:00Z")], now=NOW)
+    assert DoubtReason.ONLY_FILESYSTEM in b.doubts
+    c = assess(_exif(DateTimeOriginal="2010:06:01 12:00:00"), now=NOW)  # clean
+    assert c.doubts == []

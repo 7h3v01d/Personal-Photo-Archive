@@ -55,6 +55,35 @@ class ParseStatus(str, Enum):
     MALFORMED = "malformed"          # supplied, but not a usable timestamp
 
 
+class DoubtReason(str, Enum):
+    """Structured codes for WHY a date is doubted, so a later layer can resolve a
+    specific doubt with matching independent evidence rather than blanket-trusting.
+
+    ``resolvable_by_independent_date``: whether an external, clock-independent
+    witness (GPS date, exact anchor) confirming the candidate settles this doubt.
+    Doubts about internal inconsistency are NOT auto-resolved that way — an
+    outside date agreeing with one reading doesn't explain the inconsistency.
+    """
+    RESET_EPOCH = "reset_epoch"                # date sits on a camera reset epoch
+    ONLY_FILESYSTEM = "only_filesystem"        # no EXIF capture date, just mtime
+    FALLBACK_FIELD = "fallback_field"          # no DateTimeOriginal; used a fallback
+    FIELD_DISAGREEMENT = "field_disagreement"  # Original vs Digitized disagree
+    CONFLICTING_DUPLICATE = "conflicting_duplicate"  # same (source,key) two values
+    MTIME_PREDATES = "mtime_predates"          # filesystem mtime before capture
+    MALFORMED = "malformed"                    # a date field present but unusable
+
+    @property
+    def resolvable_by_independent_date(self) -> bool:
+        return self in _DATE_RESOLVABLE_DOUBTS
+
+
+_DATE_RESOLVABLE_DOUBTS = frozenset({
+    DoubtReason.RESET_EPOCH,
+    DoubtReason.ONLY_FILESYSTEM,
+    DoubtReason.FALLBACK_FIELD,
+})
+
+
 # Evidence the intrinsic engine is allowed to consult, as (source, key). Any
 # observation with another source is ignored for dating, whatever its key.
 ALLOWED_EVIDENCE: frozenset[tuple[str, str]] = frozenset({
@@ -122,6 +151,7 @@ class DateAssessment:
     #                                    capture date (Phase 7 produces that)
     signals: list[DateSignal] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    doubts: list[DoubtReason] = field(default_factory=list)  # structured doubt codes
 
 
 def parse_exif_datetime(raw: str) -> datetime | None:
@@ -208,6 +238,7 @@ def assess(
 
     signals: list[DateSignal] = []
     reasons: list[str] = []
+    doubts: list[DoubtReason] = []
 
     parsed_by_sk: dict[tuple[str, str], list[datetime]] = {}
     reps_by_sk: dict[tuple[str, str], list[tuple[str, str]]] = {}   # canonical reps
@@ -258,15 +289,17 @@ def assess(
 
     if "DateTimeOriginal" in exif_malformed:
         reasons.append("DateTimeOriginal is present but malformed (unusable).")
+        doubts.append(DoubtReason.MALFORMED)
 
     # No usable EXIF capture time.
     if primary is None:
         if fs_dt is not None:
             reasons.append("No EXIF capture date; only a filesystem mtime, which is "
                            "not a capture time and drifts on copy/restore.")
-            return DateAssessment(Reliability.QUESTIONABLE, fs_dt, signals, reasons)
+            doubts.append(DoubtReason.ONLY_FILESYSTEM)
+            return DateAssessment(Reliability.QUESTIONABLE, fs_dt, signals, reasons, doubts)
         reasons.append("No usable date evidence.")
-        return DateAssessment(Reliability.UNKNOWN, None, signals, reasons)
+        return DateAssessment(Reliability.UNKNOWN, None, signals, reasons, doubts)
 
     # Hard-impossible checks -> LIKELY_WRONG.
     if primary > now + future_tolerance:
@@ -283,6 +316,7 @@ def assess(
 
     if conflicts:
         questionable = True
+        doubts.append(DoubtReason.CONFLICTING_DUPLICATE)
         for (s, k) in conflicts:
             vals = ", ".join(sorted(set(disp_by_sk[(s, k)])))
             reasons.append(f"Conflicting {s}:{k} observations ({vals}); ambiguous evidence.")
@@ -292,6 +326,7 @@ def assess(
     # downgrade — not a verdict. The reverse direction is normal and ignored.
     if fs_dt is not None and fs_dt < primary - _MTIME_BEFORE_CAPTURE_TOLERANCE:
         questionable = True
+        doubts.append(DoubtReason.MTIME_PREDATES)
         reasons.append(
             f"Filesystem mtime predates the claimed capture date by "
             f"{_fmt_days(primary - fs_dt)}. Filesystem timestamps are weak evidence, "
@@ -302,20 +337,23 @@ def assess(
         delta = exif_parsed["DateTimeDigitized"] - exif_parsed["DateTimeOriginal"]
         if abs(delta) > _FIELD_AGREEMENT_TOLERANCE:
             questionable = True
+            doubts.append(DoubtReason.FIELD_DISAGREEMENT)
             reasons.append("EXIF capture-date fields disagree "
                            f"(DateTimeOriginal vs DateTimeDigitized by {_fmt_days(delta)}).")
 
     if _is_reset_epoch(primary):
         questionable = True
+        doubts.append(DoubtReason.RESET_EPOCH)
         reasons.append(f"Capture date {primary.date()} matches a common camera "
                        "reset/clock-never-set epoch (suspicion, not proof).")
 
     if primary_key != "DateTimeOriginal":
         questionable = True
+        doubts.append(DoubtReason.FALLBACK_FIELD)
         reasons.append(f"No usable DateTimeOriginal; capture time taken from {primary_key}.")
 
     if questionable:
-        return DateAssessment(Reliability.QUESTIONABLE, primary, signals, reasons)
+        return DateAssessment(Reliability.QUESTIONABLE, primary, signals, reasons, doubts)
 
     # A clean, plausible DateTimeOriginal. Matching DateTimeDigitized may be
     # noted, but it is the same clock — plausible, not trusted.
@@ -323,7 +361,7 @@ def assess(
         reasons.append("DateTimeOriginal agrees with DateTimeDigitized (same camera "
                        "clock — corroborating, not independent).")
     reasons.append("Plausible DateTimeOriginal; no intrinsic contradiction found.")
-    return DateAssessment(Reliability.PROBABLY_VALID, primary, signals, reasons)
+    return DateAssessment(Reliability.PROBABLY_VALID, primary, signals, reasons, doubts)
 
 
 def assess_file(conn: Connection, file_id: str, **kwargs) -> DateAssessment:

@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from sqlite3 import Connection
 
 from ppa.dating import (
@@ -48,6 +49,17 @@ from ppa.dating import (
     Reliability,
     assess,
 )
+
+
+class SequenceDoubt(str, Enum):
+    """Structured doubt a photo can inherit from cross-photo evidence."""
+    ORDER_CONFLICT = "order_conflict"
+
+    @property
+    def resolvable_by_independent_date(self) -> bool:
+        # An unexplained order conflict is not settled merely by an outside date
+        # agreeing with one frame's reading.
+        return False
 
 # A run of at least this many adjacent frames at one reset epoch, clock ticking
 # forward, is reported as a reset *pattern* (not proof). Configurable.
@@ -115,6 +127,8 @@ class PhotoChronology:
     file_id: str
     intrinsic: Reliability          # Slice 1's rating (unchanged)
     reliability: Reliability        # combined rating after cross-photo evidence
+    candidate: datetime | None = None   # Slice-1 candidate date
+    doubts: list = field(default_factory=list)   # structured doubt codes (Slice 1 + 2)
     cross_photo_reasons: list[str] = field(default_factory=list)
 
 
@@ -222,6 +236,8 @@ def _detect_order_conflicts(seg, chron, findings, regression_tolerance):
                     c = chron[q.file_id]
                     if c.reliability is Reliability.PROBABLY_VALID:
                         c.reliability = Reliability.QUESTIONABLE
+                    if SequenceDoubt.ORDER_CONFLICT not in c.doubts:
+                        c.doubts.append(SequenceDoubt.ORDER_CONFLICT)
                     c.cross_photo_reasons.append(
                         "Timestamp order conflicts with filename order for the same "
                         "confirmed camera; which of the conflicting dates is wrong "
@@ -247,7 +263,8 @@ def analyse_sequence(
     )
     chron = {
         p.file_id: PhotoChronology(p.file_id, p.intrinsic.reliability,
-                                   p.intrinsic.reliability)
+                                   p.intrinsic.reliability, p.candidate,
+                                   list(p.intrinsic.doubts))
         for p in photos
     }
     findings: list[SequenceFinding] = []
