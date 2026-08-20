@@ -60,6 +60,33 @@ DEFAULT_REGRESSION_TOLERANCE = timedelta(hours=12)
 
 _TRAILING_DIGITS = re.compile(r"(\d+)(?=\D*$)")
 
+# Serial strings that are present but do not identify a unique physical body.
+# Compared case-insensitively after stripping. All-identical-character serials
+# (000000000, FFFFFFFF, …) are rejected separately.
+_PLACEHOLDER_SERIALS = frozenset({
+    "", "0", "00", "000", "0000", "00000000", "000000000000",
+    "UNKNOWN", "NONE", "NULL", "NIL", "N/A", "NA", "NOT AVAILABLE",
+    "-", "--", "DEFAULT", "SERIAL", "XXXXXXXX",
+})
+
+
+def _is_strong_serial(serial: str | None) -> bool:
+    """Whether an EXIF body-serial credibly identifies one physical camera.
+
+    Conservative: an absent, empty, placeholder, or all-same-character serial is
+    NOT strong. We would rather miss a real serial than let a generic one (which
+    two identical bodies can share) drive chronology scoring. Note this is still
+    only "EXIF claims this serial" — evidence, not proof.
+    """
+    if serial is None:
+        return False
+    s = serial.strip()
+    if not s or s.upper() in _PLACEHOLDER_SERIALS:
+        return False
+    if len(set(s)) == 1:            # 00000000, 11111111, FFFFFFFF, "-", …
+        return False
+    return True
+
 
 @dataclass
 class SequencedPhoto:
@@ -69,7 +96,7 @@ class SequencedPhoto:
     seq: int | None                 # numeric filename sequence, if any
     intrinsic: DateAssessment
     camera_id: str | None = None    # camera-metadata cluster id, if any
-    device_confirmed: bool = False  # camera has a unique body identifier (serial)
+    strong_device_identity: bool = False  # EXIF claims a credible unique body serial
 
     @property
     def candidate(self) -> datetime | None:
@@ -176,8 +203,8 @@ def _detect_order_conflicts(seg, chron, findings, regression_tolerance):
     cluster can merge two identical bodies (e.g. two serial-less Canon A70s), so
     the "conflict" may just be two cameras: report it, but do not score it.
     """
-    device_confirmed = (bool(seg) and all(p.device_confirmed for p in seg)
-                        and len({p.camera_id for p in seg}) == 1)
+    strong_identity = (bool(seg) and all(p.strong_device_identity for p in seg)
+                       and len({p.camera_id for p in seg}) == 1)
     dated = [p for p in seg if p.candidate is not None]
     running_max: datetime | None = None
     running_photo: SequencedPhoto | None = None
@@ -188,9 +215,9 @@ def _detect_order_conflicts(seg, chron, findings, regression_tolerance):
                 f"{p.filename} ({p.candidate.isoformat()}) is earlier than "
                 f"earlier-sequenced {running_photo.filename} "
                 f"({running_max.isoformat()}); which date is wrong is undetermined"
-                + ("." if device_confirmed
-                   else " (model-only camera cluster — may be two bodies; not scored).")))
-            if device_confirmed:
+                + ("." if strong_identity
+                   else " (no credible unique camera serial — may be two bodies; not scored).")))
+            if strong_identity:
                 for q in (running_photo, p):
                     c = chron[q.file_id]
                     if c.reliability is Reliability.PROBABLY_VALID:
@@ -210,10 +237,14 @@ def analyse_sequence(
     regression_tolerance: timedelta = DEFAULT_REGRESSION_TOLERANCE,
     max_seq_gap: int = DEFAULT_MAX_SEQ_GAP,
 ) -> tuple[list[SequenceFinding], dict[str, PhotoChronology]]:
-    """Analyse one grouped session (same library/directory/camera/naming scheme),
-    ordered by filename sequence. Segments it by sequence adjacency first. Pure
-    and deterministic; never upgrades reliability.
+    """Analyse one grouped session (same library/directory/camera/naming scheme).
+    Sorts defensively by filename sequence, then segments by sequence adjacency.
+    Pure and deterministic; never upgrades reliability.
     """
+    photos = sorted(
+        photos,
+        key=lambda p: (p.seq is None, p.seq if p.seq is not None else 0, p.filename),
+    )
     chron = {
         p.file_id: PhotoChronology(p.file_id, p.intrinsic.reliability,
                                    p.intrinsic.reliability)
@@ -260,12 +291,13 @@ def _load_sequenced_photos(conn: Connection, **assess_kwargs) -> dict[tuple, lis
         directory = rel.rsplit("/", 1)[0] if "/" in rel else ""
         seq, prefix = filename_sequence(r["filename"])
         # A serial uniquely identifies a physical body; make+model alone can
-        # merge two identical cameras, so it is NOT a confirmed device.
-        device_confirmed = r["camera_serial"] is not None
+        # A credible unique serial identifies a physical body; make+model alone,
+        # or a placeholder/generic serial, can merge two identical cameras.
+        strong_identity = _is_strong_serial(r["camera_serial"])
         key = (r["library_id"], directory, r["camera_id"], prefix)
         groups.setdefault(key, []).append(
             SequencedPhoto(r["id"], r["filename"], seq, intrinsic,
-                           r["camera_id"], device_confirmed))
+                           r["camera_id"], strong_identity))
 
     for photos in groups.values():
         photos.sort(key=lambda p: (p.seq is None, p.seq if p.seq is not None else 0, p.filename))

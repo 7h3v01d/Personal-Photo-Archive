@@ -27,10 +27,10 @@ from ppa.scanner import scan_library
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _photo(fid, name, dto, camera_id="cam-A", device_confirmed=True):
+def _photo(fid, name, dto, camera_id="cam-A", strong_device_identity=True):
     intr = assess([DateObservation("exif", "DateTimeOriginal", dto)], now=NOW)
     seq, _ = filename_sequence(name)
-    return SequencedPhoto(fid, name, seq, intr, camera_id, device_confirmed)
+    return SequencedPhoto(fid, name, seq, intr, camera_id, strong_device_identity)
 
 
 def test_filename_sequence_parsing():
@@ -166,11 +166,50 @@ def test_confirmed_device_order_conflict_is_scored(tmp_path):
     assert all(chron[i].reliability is Reliability.QUESTIONABLE for i in ids)  # both doubted
 
 
+def test_placeholder_serial_is_not_strong_identity(tmp_path):
+    # Two different A70 bodies both emit a generic serial 00000000; they collapse
+    # to one camera record. A placeholder serial must NOT license scoring.
+    lib = tmp_path / "lib"
+    _exif_jpg(lib / "IMG_0001.jpg", "2018:07:01 10:00:00", "Canon", "A70", serial="00000000")
+    _exif_jpg(lib / "IMG_0002.jpg", "2010:07:01 10:00:00", "Canon", "A70", serial="00000000")
+    _exif_jpg(lib / "IMG_0003.jpg", "2018:07:01 11:00:00", "Canon", "A70", serial="00000000")
+    _exif_jpg(lib / "IMG_0004.jpg", "2010:07:01 11:00:00", "Canon", "A70", serial="00000000")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib); metadata.extract_stale(conn)
+    assert conn.execute("SELECT COUNT(*) AS n FROM cameras").fetchone()["n"] == 1
+
+    findings, chron = analyse_library(conn, now=NOW)
+    assert any(f.kind == "timestamp_order_conflict" for f in findings)   # still reported
+    ids = [r["id"] for r in conn.execute("SELECT id FROM files")]
+    assert all(chron[i].reliability is Reliability.PROBABLY_VALID for i in ids)  # not scored
+
+
+def test_is_strong_serial_rejects_placeholders_and_repeats():
+    from ppa.chronology import _is_strong_serial
+    for good in ("SN-123456", "SN12345678", "1234"):
+        assert _is_strong_serial(good)
+    for bad in (None, "", "0", "00000000", "000000000000", "UNKNOWN", "unknown",
+                "N/A", "na", "NOT AVAILABLE", "-", "111111111", "FFFFFFFF", "  0000  "):
+        assert not _is_strong_serial(bad)
+
+
+def test_analyse_sequence_sorts_defensively():
+    # Given out-of-order input, the engine still segments by true sequence order.
+    photos = [_photo("p3", "IMG_0203.jpg", "2001:01:01 00:07:00"),
+              _photo("p1", "IMG_0201.jpg", "2001:01:01 00:01:00"),
+              _photo("p2", "IMG_0202.jpg", "2001:01:01 00:04:00"),
+              _photo("p4", "IMG_0204.jpg", "2001:01:01 00:11:00"),
+              _photo("p5", "IMG_0205.jpg", "2001:01:01 00:14:00")]
+    findings, _ = analyse_sequence(photos, min_reset_run=5)
+    resets = [f for f in findings if f.kind == "reset_pattern"]
+    assert len(resets) == 1 and len(resets[0].file_ids) == 5
+
+
 
 
 def test_order_conflict_doubts_both_photos_for_a_confirmed_device():
-    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-X", device_confirmed=True),
-           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-X", device_confirmed=True)]
+    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-X", strong_device_identity=True),
+           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-X", strong_device_identity=True)]
     findings, chron = analyse_sequence(reg)
     assert any(f.kind == "timestamp_order_conflict" for f in findings)
     # BOTH implicated claims inherit doubt, not just one.
@@ -180,8 +219,8 @@ def test_order_conflict_doubts_both_photos_for_a_confirmed_device():
 
 def test_order_conflict_without_confirmed_device_is_reported_not_scored():
     # Same camera cluster but no serial (model-only) — may be two bodies.
-    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-A", device_confirmed=False),
-           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-A", device_confirmed=False)]
+    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-A", strong_device_identity=False),
+           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-A", strong_device_identity=False)]
     findings, chron = analyse_sequence(reg)
     assert any(f.kind == "timestamp_order_conflict" for f in findings)  # reported
     assert chron["r0"].reliability is Reliability.PROBABLY_VALID        # not scored

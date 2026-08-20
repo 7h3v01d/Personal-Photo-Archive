@@ -245,3 +245,47 @@ NULL) collapses to one `cameras` row, so it can merge distinct bodies.
 
 Tests: `tests/test_chronology.py` (14), incl. two serial-less A70 bodies not
 scored, a serial-confirmed body that IS scored, and duplicate-seq ambiguity.
+
+## Phase 6 Slice 2.3 — device-identity strength (final Slice 2 correction)
+
+Principle: **a present serial is not necessarily a meaningful unique serial.**
+`00000000`, `UNKNOWN`, `N/A`, all-same-character strings, etc. are shared by many
+bodies, so they must not license chronology scoring.
+
+- `_is_strong_serial()` conservatively rejects absent/empty/placeholder and
+  all-identical-character serials; only a credible unique serial counts.
+- `device_confirmed` renamed `strong_device_identity` — epistemically honest:
+  the archive has OBSERVED a purported EXIF serial, not independently confirmed a
+  body. Order conflicts only downgrade under strong identity; otherwise reported,
+  not scored.
+- `analyse_sequence()` now sorts defensively by filename sequence, so a caller
+  passing unordered input still gets correct segmentation.
+
+Tests: `tests/test_chronology.py` (17), incl. two same-model bodies both emitting
+`00000000` (reported, not scored), serial-quality unit checks, defensive sort.
+
+### Slice 2 — ready to freeze
+Layered model: filename sequence = ORDER evidence; camera/device identity strength
+determines how strongly order conflicts may be interpreted; reset epoch = SUSPICION;
+independent calendar evidence = later escalation (next slice / Phase 7).
+
+## Phase 6 Slice 3.0 — independent calendar evidence (design + pure engine)
+
+See docs/PHASE6_SLICE3_DESIGN.md. Storage-agnostic reconciliation core
+(`reconcile.py`): layers a FINAL assessment over Slice-2 using ONLY evidence
+independent of the camera clock that addresses the calendar date.
+
+- **Escalation (earned LIKELY_WRONG):** candidate before a camera manufacture
+  floor; outside a user anchor's exact date/range; or disagreeing with an
+  independent GPS date.
+- **Reset-run propagation:** one independent contradiction (or an exact anchor
+  differing from the run's epoch) on any frame condemns every non-anchored frame
+  of that clock-reset run.
+- **Anchoring (first TRUSTED):** an exact user anchor (human ground truth, human
+  date wins) or a GPS date that corroborates the recorded date. Nothing else
+  yields TRUSTED; a lone contradicting GPS escalates but is NOT adopted as a
+  trusted corrected date (reconstruction is Phase 7).
+- Read-only, deterministic; with no Slice-3 evidence the Slice-2 result stands.
+
+Deferred to 3.1: anchors table + migration, manufacture-floor config, GPS reader,
+`analyse`/CLI integration. Tests: `tests/test_reconcile.py` (11).
