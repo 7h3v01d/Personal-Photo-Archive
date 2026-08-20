@@ -220,3 +220,31 @@ def test_identical_duplicate_source_key_is_not_a_conflict():
     a = assess([DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00"),
                 DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00")], now=NOW)
     assert a.reliability is Reliability.PROBABLY_VALID
+
+
+# --- Slice 1.3: ambiguous duplicate evidence incl. malformed -----------------
+
+
+def test_valid_and_malformed_duplicate_source_key_is_questionable():
+    a = assess([DateObservation("exif", "DateTimeOriginal", "garbage"),
+                DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00")], now=NOW)
+    assert a.reliability is Reliability.QUESTIONABLE
+    assert any("Conflicting" in r for r in a.reasons)
+    # The old contradictory pairing must not appear.
+    assert not any("no intrinsic contradiction" in r for r in a.reasons)
+
+
+def test_zeroed_and_valid_duplicate_source_key_is_questionable():
+    a = assess([DateObservation("exif", "DateTimeOriginal", "0000:00:00 00:00:00"),
+                DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00")], now=NOW)
+    assert a.reliability is Reliability.QUESTIONABLE
+    assert any("Conflicting" in r for r in a.reasons)
+
+
+def test_identical_malformed_duplicate_is_not_a_conflict():
+    # Two copies of the same unusable value is redundant, not contradictory
+    # (and, with no usable date at all, unknown).
+    a = assess([DateObservation("exif", "DateTimeOriginal", "garbage"),
+                DateObservation("exif", "DateTimeOriginal", "garbage")], now=NOW)
+    assert a.reliability is Reliability.UNKNOWN
+    assert not any("Conflicting" in r for r in a.reasons)

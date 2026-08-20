@@ -210,7 +210,18 @@ def assess(
     reasons: list[str] = []
 
     parsed_by_sk: dict[tuple[str, str], list[datetime]] = {}
+    reps_by_sk: dict[tuple[str, str], list[tuple[str, str]]] = {}   # canonical reps
+    disp_by_sk: dict[tuple[str, str], list[str]] = {}               # for messages
     exif_malformed: set[str] = set()
+
+    def _record(source: str, key: str, parsed: datetime | None, raw: str) -> None:
+        if parsed is not None:
+            parsed_by_sk.setdefault((source, key), []).append(parsed)
+            rep, disp = ("v", parsed.isoformat()), parsed.isoformat()
+        else:
+            rep, disp = ("m", raw.strip()), repr(raw)
+        reps_by_sk.setdefault((source, key), []).append(rep)
+        disp_by_sk.setdefault((source, key), []).append(disp)
 
     for o in obs:
         if (o.source, o.key) not in ALLOWED_EVIDENCE:
@@ -220,20 +231,20 @@ def assess(
             status = ParseStatus.OK if parsed is not None else ParseStatus.MALFORMED
             note = "" if parsed is not None else "present but not a usable timestamp"
             signals.append(DateSignal("exif", o.key, o.value, parsed, status, note))
-            if parsed is not None:
-                parsed_by_sk.setdefault(("exif", o.key), []).append(parsed)
-            else:
+            if parsed is None:
                 exif_malformed.add(o.key)
+            _record("exif", o.key, parsed, o.value)
         elif o.source == "filesystem" and o.key == "mtime":
             parsed = parse_fs_datetime(o.value)
             status = ParseStatus.OK if parsed is not None else ParseStatus.MALFORMED
             signals.append(DateSignal("filesystem", "mtime", o.value, parsed, status))
-            if parsed is not None:
-                parsed_by_sk.setdefault(("filesystem", "mtime"), []).append(parsed)
+            _record("filesystem", "mtime", parsed, o.value)
 
-    # Conflicting duplicate evidence: the same (source, key) supplied with more
-    # than one distinct value is ambiguous — never silently adopt one.
-    conflicts = [sk for sk, vals in parsed_by_sk.items() if len(set(vals)) > 1]
+    # Conflicting duplicate evidence: the same (source, key) supplied more than
+    # once with observations that are not all semantically identical — differing
+    # values, OR a mix of valid and malformed. Redundant identical repeats are
+    # fine. Ambiguous evidence must never be silently resolved by insertion order.
+    conflicts = [sk for sk, reps in reps_by_sk.items() if len(set(reps)) > 1]
 
     # Representative (first-seen) value per key; deterministic, order-stable.
     exif_parsed: dict[str, datetime] = {
@@ -273,7 +284,7 @@ def assess(
     if conflicts:
         questionable = True
         for (s, k) in conflicts:
-            vals = ", ".join(sorted({v.isoformat() for v in parsed_by_sk[(s, k)]}))
+            vals = ", ".join(sorted(set(disp_by_sk[(s, k)])))
             reasons.append(f"Conflicting {s}:{k} observations ({vals}); ambiguous evidence.")
 
     # Filesystem mtime materially BEFORE the claimed capture time is unusual (a

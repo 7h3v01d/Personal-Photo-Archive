@@ -148,3 +148,25 @@ Tests: `tests/test_dating.py` (19), including the review's eight adversarial cas
 
 Adopted Phase 6 invariant: **repetition of a claim is not independent
 corroboration.** (`DEFAULT_EARLIEST` remains policy/config, per-call overridable.)
+
+## Phase 6 Slice 1.3 — ambiguous duplicate evidence (final Slice 1 cleanup)
+
+- Duplicate `(source, key)` conflict detection now spans ALL observations, not
+  just parsed ones: `valid + malformed` and `zeroed + valid` for the same key are
+  ambiguous -> QUESTIONABLE (removing the contradictory "malformed, but no
+  contradiction found" output). Identical repeats (same value, or same malformed
+  raw) stay redundant, not conflicting.
+
+### Slice 1 — FROZEN
+
+The intrinsic single-photo Date Reliability Engine is complete and frozen. Its
+epistemic hierarchy: UNKNOWN (no usable evidence) < QUESTIONABLE (usable but
+doubtful) < PROBABLY_VALID (clean intrinsic evidence); LIKELY_WRONG for hard
+impossibilities (far-future / before window); TRUSTED deliberately unreachable
+from intrinsic evidence alone. Four standing rules: provenance is evidence;
+repetition is not independent corroboration; contradiction cannot raise
+confidence; intrinsic evidence alone never yields TRUSTED.
+
+Next: **Slice 2 — Sequence / Cross-Photo Evidence** (filename/EXIF sequence,
+neighbouring trusted images, reset-epoch runs) to escalate suspicions to
+well-evidenced conclusions and reconstruct spans.
