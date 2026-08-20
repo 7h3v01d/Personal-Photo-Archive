@@ -170,3 +170,59 @@ confidence; intrinsic evidence alone never yields TRUSTED.
 Next: **Slice 2 — Sequence / Cross-Photo Evidence** (filename/EXIF sequence,
 neighbouring trusted images, reset-epoch runs) to escalate suspicions to
 well-evidenced conclusions and reconstruct spans.
+
+## Phase 6 Slice 2 — cross-photo / sequence evidence (`chronology.py`)
+
+Layers on frozen Slice 1 without rewriting it. Read-only, deterministic.
+
+- **Clock-reset runs -> LIKELY_WRONG.** A maximal run of consecutive files (by
+  filename sequence, which is independent of the clock) all timestamped at the
+  SAME reset epoch with a forward-ticking clock, length >= `min_reset_run`
+  (default 5), is treated as one camera-clock-reset event and its photos are
+  escalated from QUESTIONABLE to LIKELY_WRONG. Short clusters and real bursts on
+  non-reset days are NOT escalated (no false positives).
+- **Timestamp regression -> downgrade.** A later-sequenced file with an earlier
+  timestamp (beyond a 12h tolerance) is chronologically inconsistent; the
+  out-of-order photo, if PROBABLY_VALID, becomes QUESTIONABLE. We can't prove
+  WHICH is wrong, so it only adds doubt.
+- **Grouping** is (library, directory, filename-prefix), so two cameras in one
+  folder don't contaminate each other's chronology.
+- **Escalation is licensed by independence** (filename order is independent of
+  the clock); Slice 2 only adds doubt or confirms wrongness, never launders a
+  doubtful date into a good one. `ppa chronology` reports runs/regressions.
+
+Deferred to a later slice / Phase 7: genuinely-independent positive evidence
+(user anchors, GPS time) that could yield the first TRUSTED dates, and actual
+capture-date *reconstruction* (interpreting a corrected span from a reset run).
+Tests: `tests/test_chronology.py` (9).
+
+## Phase 6 Slice 2.1 — corrected cross-photo inference semantics
+
+Governing principle: **filename sequence independently tells us about ORDER, not
+calendar TRUTH.** Corrections to `chronology.py`:
+
+- **Reset runs no longer escalate.** `reset_run` -> `reset_pattern`: a run of
+  adjacent frames at one reset epoch with a forward clock is *reported* as a
+  pattern consistent with a running reset clock, but reliability stays where
+  Slice 1 put it (QUESTIONABLE). Order evidence corroborates "A before B", never
+  "this calendar date is false". Escalation to LIKELY_WRONG is reserved for a
+  later slice that adds independent evidence ABOUT THE DATE (trusted neighbour,
+  camera-manufacture floor, user-confirmed event).
+- **Camera-aware grouping.** Sessions group by (library, directory, camera_id,
+  filename-prefix) using `files.camera_id` — two cameras that both name files
+  IMG_* are not merged. Prefix is not assumed to identify a camera.
+- **Adjacency segmentation.** Groups are split into segments by filename-sequence
+  continuity (gap > `max_seq_gap`, default 10, or a backward jump breaks a
+  segment), so IMG_0001/IMG_0100/IMG_5000 can't be one run and a folder spanning
+  years isn't one session. Dates are deliberately NOT used to segment.
+- **Order conflicts doubt both sides.** `timestamp_regression` ->
+  `timestamp_order_conflict`, referencing both implicated file_ids; both drop
+  PROBABLY_VALID -> QUESTIONABLE when the segment is a confirmed single camera.
+  For unknown camera it's reported but not scored (may be interleaved cameras).
+- **Still read-only; Slice 2 only ever adds doubt, never upgrades.**
+
+Tests: `tests/test_chronology.py` (11), incl. the review's adversarial cases.
+Escalation of a reset pattern to LIKELY_WRONG is deferred to a later slice /
+Phase 7 (independent calendar evidence: trusted neighbours, camera floors,
+user anchors), which is also where the first TRUSTED dates and capture-date
+reconstruction will come from.

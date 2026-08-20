@@ -56,6 +56,16 @@ def main(argv: list[str] | None = None) -> int:
              "(TRUSTED/PROBABLY_VALID/QUESTIONABLE/LIKELY_WRONG/UNKNOWN)",
     )
 
+    chron_parser = subparsers.add_parser(
+        "chronology",
+        help="Cross-photo/sequence date analysis: reset-clock runs, regression "
+             "(read-only)",
+    )
+    chron_parser.add_argument(
+        "--min-reset-run", type=int, default=None,
+        help="Minimum sequential-file run at a reset epoch to call a clock reset",
+    )
+
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -121,6 +131,31 @@ def main(argv: list[str] | None = None) -> int:
             if counts.get(rating):
                 print(f"  {rating:15} {counts[rating]}")
         print("\n(Read-only assessment; no photo or date was modified.)")
+        return 0
+
+    if args.command == "chronology":
+        from ppa.chronology import analyse_library
+
+        kwargs = {}
+        if args.min_reset_run is not None:
+            kwargs["min_reset_run"] = args.min_reset_run
+        findings, chron = analyse_library(conn, **kwargs)
+
+        resets = [f for f in findings if f.kind == "reset_pattern"]
+        regs = [f for f in findings if f.kind == "timestamp_order_conflict"]
+        print(f"Cross-photo chronology: {len(resets)} reset-clock pattern(s), "
+              f"{len(regs)} order conflict(s).\n")
+        for f in resets:
+            print(f"  RESET PATTERN ({len(f.file_ids)} files): {f.detail}")
+        for f in regs:
+            print(f"  ORDER CONFLICT: {f.detail}")
+
+        downgraded = sum(1 for c in chron.values()
+                         if c.reliability.value != c.intrinsic.value)
+        print(f"\n{downgraded} photo(s) re-rated (downgraded) by cross-photo evidence.")
+        print("Reset patterns are flagged for investigation but NOT concluded wrong "
+              "without independent calendar evidence.")
+        print("(Read-only; intrinsic assessments and stored dates are unchanged.)")
         return 0
 
     return 1
