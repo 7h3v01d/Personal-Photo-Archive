@@ -226,3 +226,22 @@ Escalation of a reset pattern to LIKELY_WRONG is deferred to a later slice /
 Phase 7 (independent calendar evidence: trusted neighbours, camera floors,
 user anchors), which is also where the first TRUSTED dates and capture-date
 reconstruction will come from.
+
+## Phase 6 Slice 2.2 — camera identity strength & sequence ambiguity
+
+Principle: **`camera_id` means "camera metadata clustered these photos", not
+"one physical body".** A serial-less make+model (e.g. two Canon A70s, serial
+NULL) collapses to one `cameras` row, so it can merge distinct bodies.
+
+- **Device-strength gate on order-conflict scoring.** `SequencedPhoto` carries
+  `device_confirmed` (true iff the joined `cameras.serial` is present). A
+  timestamp order conflict is: DEVICE_CONFIRMED -> reported AND both photos
+  downgraded PROBABLY_VALID -> QUESTIONABLE; MODEL_ONLY / UNKNOWN -> reported but
+  NOT scored (the "conflict" may be two different bodies). No schema migration —
+  confidence is read from the joined camera row.
+- **Duplicate filename sequence numbers are ambiguous order.** `_segment` now
+  requires `1 <= delta <= max_seq_gap`; equal sequence numbers (delta 0) break a
+  segment rather than being treated as adjacent frames.
+
+Tests: `tests/test_chronology.py` (14), incl. two serial-less A70 bodies not
+scored, a serial-confirmed body that IS scored, and duplicate-seq ambiguity.

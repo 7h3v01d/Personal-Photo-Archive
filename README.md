@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED (Schema v6). Phase 6 Slice 1 FROZEN; Slice 2.1 (cross-photo/sequence evidence) — camera-aware, segmented; reset patterns flagged not escalated; order conflicts doubt both sides. 139 tests, 0 xfails.**
+Status: **Archive Core Hardening ACCEPTED (Schema v6). Phase 6 Slice 1 FROZEN; Slice 2.2 (cross-photo/sequence) — device-strength-gated scoring; duplicate-seq ambiguity; reset patterns flagged not escalated. 142 tests, 0 xfails.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls

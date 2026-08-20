@@ -27,10 +27,10 @@ from ppa.scanner import scan_library
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def _photo(fid, name, dto, camera_id="cam-A"):
+def _photo(fid, name, dto, camera_id="cam-A", device_confirmed=True):
     intr = assess([DateObservation("exif", "DateTimeOriginal", dto)], now=NOW)
     seq, _ = filename_sequence(name)
-    return SequencedPhoto(fid, name, seq, intr, camera_id)
+    return SequencedPhoto(fid, name, seq, intr, camera_id, device_confirmed)
 
 
 def test_filename_sequence_parsing():
@@ -103,12 +103,15 @@ def test_same_camera_contiguous_reset_pattern_still_detected():
 # --- camera grouping ---------------------------------------------------------
 
 
-def _exif_jpg(p: Path, dto: str, make: str, model: str, color="red"):
+def _exif_jpg(p: Path, dto: str, make: str, model: str, color="red", serial=None):
     p.parent.mkdir(parents=True, exist_ok=True)
     im = Image.new("RGB", (32, 24), color)
     ex = im.getexif()
     ex[0x010F] = make; ex[0x0110] = model
-    ex.get_ifd(ExifTags.IFD.Exif)[0x9003] = dto
+    sub = ex.get_ifd(ExifTags.IFD.Exif)
+    sub[0x9003] = dto
+    if serial is not None:
+        sub[0xA431] = serial                 # BodySerialNumber
     im.save(p, format="JPEG", exif=ex)
 
 
@@ -130,9 +133,44 @@ def test_two_cameras_sharing_img_prefix_do_not_share_a_sequence(tmp_path):
     assert nikon and all(chron[i].reliability is Reliability.PROBABLY_VALID for i in nikon)
 
 
-def test_order_conflict_doubts_both_photos_for_a_known_camera():
-    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-X"),
-           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-X")]
+def test_same_model_without_serial_does_not_score_order_conflicts(tmp_path):
+    # Two DIFFERENT serial-less Canon A70 bodies collapse to one camera record.
+    # Interleaved in one folder, their (legitimate) dates conflict in filename
+    # order — but that must NOT be scored down: it may just be two cameras.
+    lib = tmp_path / "lib"
+    _exif_jpg(lib / "IMG_0001.jpg", "2018:07:01 10:00:00", "Canon", "A70", color="red")
+    _exif_jpg(lib / "IMG_0002.jpg", "2010:07:01 10:00:00", "Canon", "A70", color="blue")
+    _exif_jpg(lib / "IMG_0003.jpg", "2018:07:01 11:00:00", "Canon", "A70", color="green")
+    _exif_jpg(lib / "IMG_0004.jpg", "2010:07:01 11:00:00", "Canon", "A70", color="orange")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib); metadata.extract_stale(conn)
+    assert conn.execute("SELECT COUNT(*) AS n FROM cameras").fetchone()["n"] == 1  # collapsed
+
+    findings, chron = analyse_library(conn, now=NOW)
+    assert any(f.kind == "timestamp_order_conflict" for f in findings)   # still reported
+    ids = [r["id"] for r in conn.execute("SELECT id FROM files")]
+    assert all(chron[i].reliability is Reliability.PROBABLY_VALID for i in ids)  # not scored
+
+
+def test_confirmed_device_order_conflict_is_scored(tmp_path):
+    # One physical body (serial present); a real backwards timestamp is scored.
+    lib = tmp_path / "lib"
+    _exif_jpg(lib / "IMG_0001.jpg", "2018:07:05 10:00:00", "Canon", "5D", serial="SN-123")
+    _exif_jpg(lib / "IMG_0002.jpg", "2018:07:02 10:00:00", "Canon", "5D", serial="SN-123")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib); metadata.extract_stale(conn)
+
+    findings, chron = analyse_library(conn, now=NOW)
+    assert any(f.kind == "timestamp_order_conflict" for f in findings)
+    ids = [r["id"] for r in conn.execute("SELECT id FROM files")]
+    assert all(chron[i].reliability is Reliability.QUESTIONABLE for i in ids)  # both doubted
+
+
+
+
+def test_order_conflict_doubts_both_photos_for_a_confirmed_device():
+    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-X", device_confirmed=True),
+           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-X", device_confirmed=True)]
     findings, chron = analyse_sequence(reg)
     assert any(f.kind == "timestamp_order_conflict" for f in findings)
     # BOTH implicated claims inherit doubt, not just one.
@@ -140,14 +178,24 @@ def test_order_conflict_doubts_both_photos_for_a_known_camera():
     assert chron["r1"].reliability is Reliability.QUESTIONABLE
 
 
-def test_order_conflict_without_known_camera_is_reported_not_scored():
-    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id=None),
-           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id=None)]
+def test_order_conflict_without_confirmed_device_is_reported_not_scored():
+    # Same camera cluster but no serial (model-only) — may be two bodies.
+    reg = [_photo("r0", "IMG_0001.jpg", "2015:06:05 12:00:00", camera_id="cam-A", device_confirmed=False),
+           _photo("r1", "IMG_0002.jpg", "2015:06:02 12:00:00", camera_id="cam-A", device_confirmed=False)]
     findings, chron = analyse_sequence(reg)
     assert any(f.kind == "timestamp_order_conflict" for f in findings)  # reported
-    # ...but not scored down (could be interleaved cameras).
-    assert chron["r0"].reliability is Reliability.PROBABLY_VALID
+    assert chron["r0"].reliability is Reliability.PROBABLY_VALID        # not scored
     assert chron["r1"].reliability is Reliability.PROBABLY_VALID
+
+
+def test_duplicate_sequence_numbers_are_ambiguous_order():
+    from ppa.chronology import _segment
+    photos = [_photo("d0", "IMG_0001.jpg", "2015:06:01 12:00:00"),
+              _photo("d1", "IMG_0001.raw", "2015:06:02 12:00:00"),
+              _photo("d2", "IMG_0002.jpg", "2015:06:03 12:00:00")]
+    photos.sort(key=lambda p: (p.seq, p.filename))
+    sizes = [len(s) for s in _segment(photos, max_seq_gap=10)]
+    assert sizes[0] == 1   # the duplicate-seq pair is split, not treated as adjacency
 
 
 def test_analyse_library_is_read_only(tmp_path):

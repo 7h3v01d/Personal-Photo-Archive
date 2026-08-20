@@ -68,7 +68,8 @@ class SequencedPhoto:
     filename: str
     seq: int | None                 # numeric filename sequence, if any
     intrinsic: DateAssessment
-    camera_id: str | None = None    # confirmed camera identity, if known
+    camera_id: str | None = None    # camera-metadata cluster id, if any
+    device_confirmed: bool = False  # camera has a unique body identifier (serial)
 
     @property
     def candidate(self) -> datetime | None:
@@ -121,9 +122,11 @@ def _segment(photos: list[SequencedPhoto], max_seq_gap: int) -> list[list[Sequen
             current = []
             prev = None
             continue
-        if prev is None or 0 <= (p.seq - prev) <= max_seq_gap:
+        if prev is None or 1 <= (p.seq - prev) <= max_seq_gap:
             current.append(p)
         else:
+            # Gap too large, a backward jump (rollover), or a duplicate sequence
+            # number (delta 0 — order between the two is not established).
             if current:
                 segments.append(current)
             current = [p]
@@ -168,10 +171,13 @@ def _detect_reset_patterns(seg, chron, findings, min_reset_run):
 def _detect_order_conflicts(seg, chron, findings, regression_tolerance):
     """A later-sequenced frame timestamped earlier than an earlier-sequenced one
     is chronologically inconsistent. We can't tell WHICH date is wrong, so both
-    implicated photos inherit doubt — but only when the segment is a confirmed
-    single camera (else it may just be interleaved cameras, so: report only).
+    implicated photos inherit doubt — but only when the sequence belongs to a
+    confirmed single physical device (camera serial present). A make+model-only
+    cluster can merge two identical bodies (e.g. two serial-less Canon A70s), so
+    the "conflict" may just be two cameras: report it, but do not score it.
     """
-    camera_known = bool(seg and seg[0].camera_id) and len({p.camera_id for p in seg}) == 1
+    device_confirmed = (bool(seg) and all(p.device_confirmed for p in seg)
+                        and len({p.camera_id for p in seg}) == 1)
     dated = [p for p in seg if p.candidate is not None]
     running_max: datetime | None = None
     running_photo: SequencedPhoto | None = None
@@ -181,15 +187,18 @@ def _detect_order_conflicts(seg, chron, findings, regression_tolerance):
                 "timestamp_order_conflict", [running_photo.file_id, p.file_id],
                 f"{p.filename} ({p.candidate.isoformat()}) is earlier than "
                 f"earlier-sequenced {running_photo.filename} "
-                f"({running_max.isoformat()}); which date is wrong is undetermined."))
-            if camera_known:
+                f"({running_max.isoformat()}); which date is wrong is undetermined"
+                + ("." if device_confirmed
+                   else " (model-only camera cluster — may be two bodies; not scored).")))
+            if device_confirmed:
                 for q in (running_photo, p):
                     c = chron[q.file_id]
                     if c.reliability is Reliability.PROBABLY_VALID:
                         c.reliability = Reliability.QUESTIONABLE
                     c.cross_photo_reasons.append(
                         "Timestamp order conflicts with filename order for the same "
-                        "camera; which of the conflicting dates is wrong is undetermined.")
+                        "confirmed camera; which of the conflicting dates is wrong "
+                        "is undetermined.")
         else:
             running_max, running_photo = p.candidate, p
 
@@ -230,8 +239,10 @@ def _load_sequenced_photos(conn: Connection, **assess_kwargs) -> dict[tuple, lis
     conservatively downstream (order-conflicts there are reported, not scored).
     """
     rows = conn.execute(
-        "SELECT id, filename, relative_path, library_id, camera_id FROM files "
-        "WHERE presence_status = 'present'"
+        "SELECT f.id, f.filename, f.relative_path, f.library_id, f.camera_id, "
+        "c.serial AS camera_serial "
+        "FROM files f LEFT JOIN cameras c ON c.id = f.camera_id "
+        "WHERE f.presence_status = 'present'"
     ).fetchall()
 
     groups: dict[tuple, list[SequencedPhoto]] = {}
@@ -248,9 +259,13 @@ def _load_sequenced_photos(conn: Connection, **assess_kwargs) -> dict[tuple, lis
         rel = (r["relative_path"] or r["filename"]).replace("\\", "/")
         directory = rel.rsplit("/", 1)[0] if "/" in rel else ""
         seq, prefix = filename_sequence(r["filename"])
+        # A serial uniquely identifies a physical body; make+model alone can
+        # merge two identical cameras, so it is NOT a confirmed device.
+        device_confirmed = r["camera_serial"] is not None
         key = (r["library_id"], directory, r["camera_id"], prefix)
         groups.setdefault(key, []).append(
-            SequencedPhoto(r["id"], r["filename"], seq, intrinsic, r["camera_id"]))
+            SequencedPhoto(r["id"], r["filename"], seq, intrinsic,
+                           r["camera_id"], device_confirmed))
 
     for photos in groups.values():
         photos.sort(key=lambda p: (p.seq is None, p.seq if p.seq is not None else 0, p.filename))
