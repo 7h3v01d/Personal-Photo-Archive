@@ -89,6 +89,11 @@ DEFAULT_EARLIEST = datetime(1990, 1, 1, tzinfo=timezone.utc)
 DEFAULT_FUTURE_TOLERANCE = timedelta(hours=48)
 # How far two EXIF capture fields may differ before it counts as disagreement.
 _FIELD_AGREEMENT_TOLERANCE = timedelta(days=1)
+# A filesystem mtime this far *before* the claimed capture time is
+# chronologically unusual (a file can't ordinarily be modified before it
+# exists). Generous, in days, to absorb timezone/clock noise. The reverse
+# (mtime after capture) is normal — copies/edits happen later — and is ignored.
+_MTIME_BEFORE_CAPTURE_TOLERANCE = timedelta(days=2)
 
 
 @dataclass(frozen=True)
@@ -204,9 +209,8 @@ def assess(
     signals: list[DateSignal] = []
     reasons: list[str] = []
 
-    exif_parsed: dict[str, datetime] = {}
+    parsed_by_sk: dict[tuple[str, str], list[datetime]] = {}
     exif_malformed: set[str] = set()
-    fs_dt: datetime | None = None
 
     for o in obs:
         if (o.source, o.key) not in ALLOWED_EVIDENCE:
@@ -217,13 +221,26 @@ def assess(
             note = "" if parsed is not None else "present but not a usable timestamp"
             signals.append(DateSignal("exif", o.key, o.value, parsed, status, note))
             if parsed is not None:
-                exif_parsed[o.key] = parsed
+                parsed_by_sk.setdefault(("exif", o.key), []).append(parsed)
             else:
                 exif_malformed.add(o.key)
         elif o.source == "filesystem" and o.key == "mtime":
-            fs_dt = parse_fs_datetime(o.value)
-            status = ParseStatus.OK if fs_dt is not None else ParseStatus.MALFORMED
-            signals.append(DateSignal("filesystem", "mtime", o.value, fs_dt, status))
+            parsed = parse_fs_datetime(o.value)
+            status = ParseStatus.OK if parsed is not None else ParseStatus.MALFORMED
+            signals.append(DateSignal("filesystem", "mtime", o.value, parsed, status))
+            if parsed is not None:
+                parsed_by_sk.setdefault(("filesystem", "mtime"), []).append(parsed)
+
+    # Conflicting duplicate evidence: the same (source, key) supplied with more
+    # than one distinct value is ambiguous — never silently adopt one.
+    conflicts = [sk for sk, vals in parsed_by_sk.items() if len(set(vals)) > 1]
+
+    # Representative (first-seen) value per key; deterministic, order-stable.
+    exif_parsed: dict[str, datetime] = {
+        k: v[0] for (s, k), v in parsed_by_sk.items() if s == "exif"
+    }
+    fs_vals = parsed_by_sk.get(("filesystem", "mtime"))
+    fs_dt: datetime | None = fs_vals[0] if fs_vals else None
 
     primary_key = next((k for k in _EXIF_CAPTURE_KEYS if k in exif_parsed), None)
     primary = exif_parsed.get(primary_key) if primary_key else None
@@ -252,6 +269,23 @@ def assess(
 
     # Soft doubts -> QUESTIONABLE (any one is enough; collect all reasons).
     questionable = False
+
+    if conflicts:
+        questionable = True
+        for (s, k) in conflicts:
+            vals = ", ".join(sorted({v.isoformat() for v in parsed_by_sk[(s, k)]}))
+            reasons.append(f"Conflicting {s}:{k} observations ({vals}); ambiguous evidence.")
+
+    # Filesystem mtime materially BEFORE the claimed capture time is unusual (a
+    # file can't ordinarily be modified before it exists). Weak evidence, so a
+    # downgrade — not a verdict. The reverse direction is normal and ignored.
+    if fs_dt is not None and fs_dt < primary - _MTIME_BEFORE_CAPTURE_TOLERANCE:
+        questionable = True
+        reasons.append(
+            f"Filesystem mtime predates the claimed capture date by "
+            f"{_fmt_days(primary - fs_dt)}. Filesystem timestamps are weak evidence, "
+            "but this is chronologically unusual."
+        )
 
     if "DateTimeOriginal" in exif_parsed and "DateTimeDigitized" in exif_parsed:
         delta = exif_parsed["DateTimeDigitized"] - exif_parsed["DateTimeOriginal"]

@@ -134,3 +134,17 @@ multiple witnesses."** Fixes to `dating.py`:
 - `best_estimate` renamed `candidate_date` (not an interpreted capture date).
 
 Tests: `tests/test_dating.py` (19), including the review's eight adversarial cases.
+
+## Phase 6 Slice 1.2 — chronology consistency & duplicate-evidence defence
+
+- Filesystem mtime materially *before* the claimed capture time (a file can't be
+  modified before it exists) downgrades PROBABLY_VALID -> QUESTIONABLE with a
+  reason. Asymmetric: mtime *after* capture (copy/edit later) is normal and
+  ignored. Generous 2-day tolerance absorbs timezone/clock noise.
+- Conflicting duplicate `(source, key)` observations (same key, different values)
+  are treated as ambiguous -> QUESTIONABLE, instead of silently adopting insertion
+  order. Identical duplicates are redundant, not a conflict. The engine defends
+  itself against imperfect input rather than trusting uniqueness upstream.
+
+Adopted Phase 6 invariant: **repetition of a claim is not independent
+corroboration.** (`DEFAULT_EARLIEST` remains policy/config, per-call overridable.)

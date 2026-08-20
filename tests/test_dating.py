@@ -183,3 +183,40 @@ def test_engine_never_writes(tmp_path):
     after = conn.execute("SELECT COUNT(*) AS n FROM metadata_observations").fetchone()["n"]
     rev_after = conn.execute("SELECT current_revision_id FROM files").fetchone()["current_revision_id"]
     assert after == before and rev_after == rev_before
+
+
+# --- Slice 1.2: chronology consistency & duplicate-evidence defence ----------
+
+
+def test_mtime_predating_capture_downgrades():
+    a = assess(_exif(DateTimeOriginal="2020:01:01 12:00:00")
+               + [DateObservation("filesystem", "mtime", "2010-01-01T12:00:00Z")], now=NOW)
+    assert a.reliability is Reliability.QUESTIONABLE
+    assert any("predate" in r for r in a.reasons)
+
+
+def test_mtime_after_capture_is_normal():
+    # Photo captured 2010, copied/edited 2020: mtime after capture is expected.
+    a = assess(_exif(DateTimeOriginal="2010:01:01 12:00:00")
+               + [DateObservation("filesystem", "mtime", "2020-01-01T12:00:00Z")], now=NOW)
+    assert a.reliability is Reliability.PROBABLY_VALID
+
+
+def test_small_mtime_lead_within_tolerance_is_not_flagged():
+    a = assess(_exif(DateTimeOriginal="2015:06:01 12:00:00")
+               + [DateObservation("filesystem", "mtime", "2015-06-01T00:00:00Z")], now=NOW)
+    assert a.reliability is Reliability.PROBABLY_VALID
+
+
+def test_conflicting_duplicate_source_key_is_questionable():
+    a = assess([DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00"),
+                DateObservation("exif", "DateTimeOriginal", "2020:01:01 00:00:00")], now=NOW)
+    assert a.reliability is Reliability.QUESTIONABLE
+    assert any("Conflicting" in r for r in a.reasons)
+
+
+def test_identical_duplicate_source_key_is_not_a_conflict():
+    # Same key twice with the SAME value is redundant, not contradictory.
+    a = assess([DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00"),
+                DateObservation("exif", "DateTimeOriginal", "2010:06:01 12:00:00")], now=NOW)
+    assert a.reliability is Reliability.PROBABLY_VALID
