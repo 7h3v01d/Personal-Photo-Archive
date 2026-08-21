@@ -1,20 +1,19 @@
 -- Backfill ownership for legacy anchors created before ownership was enforced
--- (schema v9). Only deterministically recoverable cases are filled:
+-- (schema v9). Only backfill where identity is DURABLE.
 --
---   library scope: scope_ref IS the library id -> adopt it (if that library
---                  still exists).
---   file scope:    scope_ref -> files.id -> that file's library_id.
+--   file scope: scope_ref is a persistent UUID -> files.id -> that file's
+--               library_id. UUIDs are not reused, so this is provable.
 --
--- Directory anchors are intentionally left unowned: their path-like scope_ref
--- cannot identify an owning library, and guessing could reattach human evidence
--- to the wrong resource. Unowned rows are retained for audit but resolve_for()
--- no longer applies them automatically; they stay dormant until reassigned.
-
-UPDATE anchors
-SET library_id = CAST(scope_ref AS INTEGER)
-WHERE scope = 'library'
-  AND library_id IS NULL
-  AND CAST(scope_ref AS INTEGER) IN (SELECT id FROM libraries);
+-- Library anchors are NOT backfilled: their scope_ref is an integer library id,
+-- and SQLite reuses those after a library is removed. A legacy anchor for a
+-- removed Library A (id=1) would otherwise be reattached to an unrelated new
+-- Library B that reused id=1 — recreating the very cross-resource contamination
+-- ownership was added to prevent. Integer id alone is not provable provenance.
+--
+-- Directory anchors are likewise ambiguous (a path string can't identify a
+-- library). Both are left unowned/dormant: retained for audit, not resolved
+-- automatically, until a human reassigns them. Missing provenance is not global
+-- provenance, and it is not guessable provenance either.
 
 UPDATE anchors
 SET library_id = (SELECT f.library_id FROM files f WHERE f.id = anchors.scope_ref)

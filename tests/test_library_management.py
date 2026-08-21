@@ -167,9 +167,9 @@ def test_legacy_null_owner_directory_anchor_is_not_applied(tmp_path):
     assert anchors.resolve_for(a_list, file_id="x", directory="trip", library_id=ids["LibB"]) is None
 
 
-def test_migration_009_backfills_library_and_file_but_not_directory(tmp_path):
-    # Legacy unowned anchors: library/file ownership is deterministically
-    # recoverable and backfilled; directory ownership is ambiguous and stays NULL.
+def test_migration_009_backfills_only_files_not_library_or_directory(tmp_path):
+    # Only durable (UUID) file ownership is backfilled. Library ids are reusable
+    # and directory paths are ambiguous, so both stay dormant.
     from datetime import datetime, timezone
     from ppa import anchors
     lib = tmp_path / "L"; _img(lib / "trip" / "p.jpg")
@@ -184,13 +184,36 @@ def test_migration_009_backfills_library_and_file_but_not_directory(tmp_path):
                      (scope, ref, "exact", "2004-12-25", None, None, now))
     conn.commit()
     conn.executescript(
-        "UPDATE anchors SET library_id = CAST(scope_ref AS INTEGER) "
-        "WHERE scope='library' AND library_id IS NULL "
-        "AND CAST(scope_ref AS INTEGER) IN (SELECT id FROM libraries);"
         "UPDATE anchors SET library_id = (SELECT f.library_id FROM files f "
         "WHERE f.id = anchors.scope_ref) WHERE scope='file' AND library_id IS NULL "
         "AND EXISTS(SELECT 1 FROM files f WHERE f.id = anchors.scope_ref);")
     conn.commit()
     owners = {a.scope: a.library_id for a in anchors.list_anchors(conn)}
-    assert owners["library"] == lid and owners["file"] == lid
-    assert owners["directory"] is None            # ambiguous -> dormant, not guessed
+    assert owners["file"] == lid                  # durable UUID -> recovered
+    assert owners["library"] is None              # reusable id -> NOT guessed
+    assert owners["directory"] is None            # ambiguous path -> dormant
+
+
+def test_migration_009_does_not_attach_legacy_library_anchor_to_reused_id(tmp_path):
+    # The exact upgrade-time contamination path: old A(id=1) left a NULL-owner
+    # library anchor; B reuses id=1; running 009 must NOT adopt it for B.
+    from datetime import datetime, timezone
+    from ppa import anchors
+    b = tmp_path / "B"; _img(b / "b.jpg")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, b)
+    idb = catalogue.list_libraries(conn)[0].id
+    conn.execute("INSERT INTO anchors (scope, scope_ref, kind, start_date, end_date, "
+                 "note, created_at, library_id) VALUES "
+                 "('library', ?, 'exact', '2004-12-25', NULL, 'legacy A', ?, NULL)",
+                 (str(idb), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.executescript(
+        "UPDATE anchors SET library_id = (SELECT f.library_id FROM files f "
+        "WHERE f.id = anchors.scope_ref) WHERE scope='file' AND library_id IS NULL "
+        "AND EXISTS(SELECT 1 FROM files f WHERE f.id = anchors.scope_ref);")
+    conn.commit()
+    a = anchors.list_anchors(conn)[0]
+    assert a.library_id is None                   # stayed dormant, not adopted by B
+    assert anchors.resolve_for(anchors.list_anchors(conn),
+                               file_id="x", directory="", library_id=idb) is None

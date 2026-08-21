@@ -504,9 +504,13 @@ Closes the remaining gap: with ownership added, a NULL owner must NOT mean
   owning library; an unowned (legacy) anchor is never applied automatically —
   missing provenance is not global provenance. It's retained for audit but stays
   dormant until reassigned.
-- **Deterministic legacy backfill (migration 009, schema v9):** legacy library
-  anchors (scope_ref → library id) and file anchors (scope_ref → file's library)
-  are backfilled; ambiguous directory anchors are left dormant (never guessed).
+- **Durable-only legacy backfill (migration 009, schema v9):** ONLY file anchors
+  (scope_ref → the file's library) are backfilled, because a UUID file id is not
+  reused. Library anchors are NOT backfilled — integer library ids are reused, so
+  adopting `scope_ref` as the owner could reattach a removed library's anchor to a
+  new library that reused its id (the same contamination, at upgrade time).
+  Directory anchors stay dormant too. Ambiguous provenance is left unowned, not
+  guessed.
 
 Tests: unowned-directory rejected, nonexistent-file rejected, nonexistent-library
 rejected, legacy NULL-owner directory anchor not applied, and the 009 backfill.
