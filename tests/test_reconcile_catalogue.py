@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from PIL import ExifTags, Image
 
-from ppa import anchors, metadata
+from ppa import anchors, catalogue, metadata
 from ppa.camera_floors import CameraFloors
 from ppa.dating import Reliability
 from ppa.db import connect
@@ -58,14 +58,18 @@ def test_anchor_add_validates(tmp_path):
 
 
 def test_anchor_resolution_prefers_most_specific(tmp_path):
+    lib = tmp_path / "lib"
+    _jpg(lib / "F.jpg", "2015:01:01 00:00:00")
     conn = _catalogue(tmp_path)
-    anchors.add_anchor(conn, "library", "1", "exact", "2000-01-01")
-    anchors.add_anchor(conn, "directory", "trip", "exact", "2001-01-01")
-    anchors.add_anchor(conn, "file", "F", "exact", "2002-01-01")
+    scan_library(conn, lib)
+    lid = catalogue.list_libraries(conn)[0].id
+    anchors.add_anchor(conn, "library", str(lid), "exact", "2000-01-01")
+    anchors.add_anchor(conn, "directory", "trip", "exact", "2001-01-01", library_id=lid)
+    anchors.add_anchor(conn, "file", "F", "exact", "2002-01-01", library_id=lid)
     a = anchors.list_anchors(conn)
-    assert anchors.resolve_for(a, file_id="F", directory="trip", library_id=1).start_date.year == 2002
-    assert anchors.resolve_for(a, file_id="X", directory="trip", library_id=1).start_date.year == 2001
-    assert anchors.resolve_for(a, file_id="X", directory="other", library_id=1).start_date.year == 2000
+    assert anchors.resolve_for(a, file_id="F", directory="trip", library_id=lid).start_date.year == 2002
+    assert anchors.resolve_for(a, file_id="X", directory="trip", library_id=lid).start_date.year == 2001
+    assert anchors.resolve_for(a, file_id="X", directory="other", library_id=lid).start_date.year == 2000
 
 
 def test_gps_corroboration_makes_trusted(tmp_path):

@@ -459,3 +459,32 @@ for a file removed from disk after cataloguing.
   library in memory.
 - **Loading indicator:** decode is deferred one event-loop turn so a brief
   "Loading…" paints for big files; a navigation token discards stale decodes.
+
+## Resource Manager Hardening — anchor lifecycle (P0 fix, schema v8)
+
+**Bug (P0):** `forget_library` removed files/revisions/observations/orphan photos
+but NOT anchors. Because SQLite reuses integer library ids, a forgotten library's
+`scope='library'` anchor was inherited by an unrelated new library that reused the
+id — authoritative human date evidence leaking across resources (Phase 7 trusts
+exact anchors strongly). Reproduced end-to-end, then fixed.
+
+**Fix:**
+- **Explicit ownership (migration 008, schema v8):** anchors gain a nullable
+  `library_id REFERENCES libraries(id)`. `add_anchor` auto-derives it (library
+  scope → the referenced id; file scope → the file's library) or takes it
+  explicitly (`ppa anchor add --library-id`, for directory anchors).
+- **`forget_library` deletes owned anchors in the same transaction:** the
+  library-scoped anchor by ref, file-scoped anchors for the removed files, and
+  anything carrying that `library_id`.
+- **Resolution scoped to owner:** `resolve_for` only applies an anchor within its
+  owning library (legacy null-owner rows fall back to ref match), which also stops
+  identically named directories in different libraries sharing interpretations.
+
+**Directory-anchor ownership decision:** directory anchors carry an explicit
+`library_id` (set at creation) rather than being inferred from a path string. With
+ownership set they are cleaned on removal and never cross libraries; a legacy
+directory anchor with a null owner still resolves by path (documented fallback).
+
+Tests (permanent acceptance): `test_forget_library_removes_owned_anchors`,
+`test_forgotten_library_anchor_never_attaches_to_reused_id` (the A→forget→B
+id-reuse regression), `test_directory_anchor_does_not_cross_libraries`.

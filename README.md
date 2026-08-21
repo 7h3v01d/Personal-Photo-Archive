@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.0.1 engine. UI: library manager + full-size preview (bounded decode, EXIF orientation, LRU cache, loading indicator). 208 tests, 0 xfails.**
+Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.0.1 engine. UI: library manager + preview. Anchor ownership (schema v8): forgetting a library removes its anchors — no ID-reuse contamination. 211 tests, 0 xfails.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls

@@ -428,6 +428,19 @@ def forget_library(conn: Connection, library_id: int) -> int:
             conn.execute(f"DELETE FROM file_revisions WHERE file_id IN ({marks})",
                          file_ids)
         conn.execute("DELETE FROM files WHERE library_id = ?", (library_id,))
+        # Remove anchors OWNED by this library, so authoritative human date
+        # evidence never outlives the resource or leaks onto a reused library id.
+        # Covered three ways: the library-scoped anchor by its ref, file-scoped
+        # anchors for the files just removed, and anything carrying this
+        # library_id (directory anchors, plus any of the above with ownership).
+        conn.execute("DELETE FROM anchors WHERE scope = 'library' AND scope_ref = ?",
+                     (str(library_id),))
+        if file_ids:
+            marks = ",".join("?" * len(file_ids))
+            conn.execute(
+                f"DELETE FROM anchors WHERE scope = 'file' AND scope_ref IN ({marks})",
+                file_ids)
+        conn.execute("DELETE FROM anchors WHERE library_id = ?", (library_id,))
         # Remove now-orphaned photos only (a photo with a copy in another library
         # must survive).
         for pid in photo_ids:

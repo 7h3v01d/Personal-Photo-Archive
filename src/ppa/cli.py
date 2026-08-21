@@ -88,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     a_add.add_argument("start_date", help="YYYY-MM-DD")
     a_add.add_argument("--end-date", default=None, help="YYYY-MM-DD (makes it a range)")
     a_add.add_argument("--note", default=None)
+    a_add.add_argument("--library-id", type=int, default=None,
+                       help="Owning library id (auto for file/library scope; set "
+                            "this for directory anchors so removal can clean them)")
     anchor_sub.add_parser("list", help="List anchors")
 
     args = parser.parse_args(argv)
@@ -187,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.anchor_command == "add":
             kind = "range" if args.end_date else "exact"
             aid = anchors_mod.add_anchor(conn, args.scope, args.scope_ref, kind,
-                                         args.start_date, args.end_date, args.note)
+                                         args.start_date, args.end_date, args.note,
+                                         args.library_id)
             print(f"Added anchor #{aid} ({args.scope} {args.scope_ref}, {kind}).")
             return 0
         if args.anchor_command == "list":

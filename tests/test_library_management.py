@@ -71,3 +71,52 @@ def test_forget_library_is_atomic_on_bad_id(tmp_path):
     # A non-existent library removes nothing and leaves the catalogue intact.
     assert catalogue.forget_library(conn, 9999) == 0
     assert conn.execute("SELECT COUNT(*) AS n FROM files").fetchone()["n"] == before
+
+
+def test_forget_library_removes_owned_anchors(tmp_path):
+    from ppa import anchors
+    lib = tmp_path / "A"; _img(lib / "a.jpg")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib)
+    lid = catalogue.list_libraries(conn)[0].id
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+    anchors.add_anchor(conn, "library", str(lid), "exact", "2004-12-25")
+    anchors.add_anchor(conn, "file", fid, "exact", "2004-12-25")
+    assert len(anchors.list_anchors(conn)) == 2
+
+    catalogue.forget_library(conn, lid)
+    assert anchors.list_anchors(conn) == []           # owned anchors gone with the library
+
+
+def test_forgotten_library_anchor_never_attaches_to_reused_id(tmp_path):
+    # A -> anchor -> forget A -> B reuses id 1 -> B must NOT inherit A's anchor.
+    from ppa import anchors
+    a = tmp_path / "A"; _img(a / "a.jpg")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, a)
+    ida = catalogue.list_libraries(conn)[0].id
+    anchors.add_anchor(conn, "library", str(ida), "exact", "2004-12-25", note="Christmas")
+
+    catalogue.forget_library(conn, ida)
+
+    b = tmp_path / "B"; _img(b / "b.jpg")
+    scan_library(conn, b)
+    idb = catalogue.list_libraries(conn)[0].id
+    assert idb == ida                                 # SQLite reused the integer id
+    resolved = anchors.resolve_for(anchors.list_anchors(conn),
+                                   file_id="x", directory="", library_id=idb)
+    assert resolved is None                           # no cross-resource contamination
+
+
+def test_directory_anchor_does_not_cross_libraries(tmp_path):
+    from ppa import anchors
+    la, lb = tmp_path / "LibA", tmp_path / "LibB"
+    _img(la / "trip" / "p.jpg"); _img(lb / "trip" / "q.jpg", "blue")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, la); scan_library(conn, lb)
+    ids = {L.display_path[-4:]: L.id for L in catalogue.list_libraries(conn)}
+    anchors.add_anchor(conn, "directory", "trip", "exact", "2004-12-25",
+                       library_id=ids["LibA"])
+    a = anchors.list_anchors(conn)
+    assert anchors.resolve_for(a, file_id="x", directory="trip", library_id=ids["LibB"]) is None
+    assert anchors.resolve_for(a, file_id="x", directory="trip", library_id=ids["LibA"]) is not None
