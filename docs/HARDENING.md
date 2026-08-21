@@ -488,3 +488,25 @@ directory anchor with a null owner still resolves by path (documented fallback).
 Tests (permanent acceptance): `test_forget_library_removes_owned_anchors`,
 `test_forgotten_library_anchor_never_attaches_to_reused_id` (the A→forget→B
 id-reuse regression), `test_directory_anchor_does_not_cross_libraries`.
+
+## Anchor lifecycle — fail-closed ownership (P1 fix, schema v9)
+
+Closes the remaining gap: with ownership added, a NULL owner must NOT mean
+"belongs everywhere", and the API must not mint ownerless anchors.
+
+- **Ownership is mandatory and verified in `add_anchor`:** library scope derives
+  the owner from scope_ref and the library MUST exist; file scope derives it from
+  the file and the file MUST exist; directory scope REQUIRES an explicit
+  library_id that must exist. Anything unidentifiable raises ValueError — no
+  dangling/ownerless anchors can be created (rejects anchors for nonexistent
+  files/libraries, and unowned directory anchors).
+- **Resolution is fail-closed:** `resolve_for` applies an anchor only within its
+  owning library; an unowned (legacy) anchor is never applied automatically —
+  missing provenance is not global provenance. It's retained for audit but stays
+  dormant until reassigned.
+- **Deterministic legacy backfill (migration 009, schema v9):** legacy library
+  anchors (scope_ref → library id) and file anchors (scope_ref → file's library)
+  are backfilled; ambiguous directory anchors are left dormant (never guessed).
+
+Tests: unowned-directory rejected, nonexistent-file rejected, nonexistent-library
+rejected, legacy NULL-owner directory anchor not applied, and the 009 backfill.

@@ -59,15 +59,16 @@ def test_anchor_add_validates(tmp_path):
 
 def test_anchor_resolution_prefers_most_specific(tmp_path):
     lib = tmp_path / "lib"
-    _jpg(lib / "F.jpg", "2015:01:01 00:00:00")
+    _jpg(lib / "trip" / "F.jpg", "2015:01:01 00:00:00")
     conn = _catalogue(tmp_path)
     scan_library(conn, lib)
     lid = catalogue.list_libraries(conn)[0].id
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
     anchors.add_anchor(conn, "library", str(lid), "exact", "2000-01-01")
     anchors.add_anchor(conn, "directory", "trip", "exact", "2001-01-01", library_id=lid)
-    anchors.add_anchor(conn, "file", "F", "exact", "2002-01-01", library_id=lid)
+    anchors.add_anchor(conn, "file", fid, "exact", "2002-01-01")
     a = anchors.list_anchors(conn)
-    assert anchors.resolve_for(a, file_id="F", directory="trip", library_id=lid).start_date.year == 2002
+    assert anchors.resolve_for(a, file_id=fid, directory="trip", library_id=lid).start_date.year == 2002
     assert anchors.resolve_for(a, file_id="X", directory="trip", library_id=lid).start_date.year == 2001
     assert anchors.resolve_for(a, file_id="X", directory="other", library_id=lid).start_date.year == 2000
 
@@ -115,7 +116,9 @@ def test_exact_file_anchor_beats_directory_and_trusts(tmp_path):
     conn = _catalogue(tmp_path)
     scan_library(conn, lib); metadata.extract_stale(conn)
     fid = conn.execute("SELECT id FROM files").fetchone()["id"]
-    anchors.add_anchor(conn, "directory", "a", "range", "2004-12-20", "2004-12-31")
+    lid = catalogue.list_libraries(conn)[0].id
+    anchors.add_anchor(conn, "directory", "a", "range", "2004-12-20", "2004-12-31",
+                       library_id=lid)
     anchors.add_anchor(conn, "file", fid, "exact", "2004-12-25")
     _, res = analyse_library_reconciled(conn, now=NOW)
     assert res[fid].reliability is Reliability.TRUSTED

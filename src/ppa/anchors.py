@@ -48,13 +48,28 @@ def add_anchor(conn: Connection, scope: str, scope_ref: str, kind: str,
     if end_date is not None:
         if _parse_date(end_date) < _parse_date(start_date):
             raise ValueError("end_date must be >= start_date")
-    if library_id is None and scope == "library":
-        library_id = int(scope_ref)
-    if library_id is None and scope == "file":
+
+    # Ownership is mandatory and fail-closed: authoritative human evidence may
+    # never be recorded for a resource the catalogue cannot identify, and must
+    # never be ownerless (an ownerless anchor would apply to every library).
+    if scope == "library":
+        owner = int(scope_ref)
+        if conn.execute("SELECT 1 FROM libraries WHERE id = ?", (owner,)).fetchone() is None:
+            raise ValueError(f"library anchor references unknown library {owner}")
+        library_id = owner
+    elif scope == "file":
         row = conn.execute("SELECT library_id FROM files WHERE id = ?",
                            (scope_ref,)).fetchone()
-        if row is not None:
-            library_id = row["library_id"]
+        if row is None:
+            raise ValueError(f"file anchor references unknown file {scope_ref!r}")
+        library_id = row["library_id"]
+    else:  # directory
+        if library_id is None:
+            raise ValueError("directory anchor requires an owning library_id")
+        if conn.execute("SELECT 1 FROM libraries WHERE id = ?",
+                        (library_id,)).fetchone() is None:
+            raise ValueError(f"directory anchor references unknown library {library_id}")
+
     cur = conn.execute(
         "INSERT INTO anchors (scope, scope_ref, kind, start_date, end_date, note, "
         "created_at, library_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -83,12 +98,13 @@ def resolve_for(anchors: list[Anchor], *, file_id: str, directory: str,
                 library_id) -> Anchor | None:
     """Most-specific applicable anchor for a photo: file > directory > library.
 
-    An anchor that carries an owning ``library_id`` only applies within that
-    library, so a stale/foreign anchor can't attach across resources; anchors
-    with no recorded owner (legacy rows) fall back to matching by ref alone.
+    Fail-closed on ownership: an anchor applies ONLY within its owning library.
+    An anchor with no recorded owner (a legacy row from before ownership was
+    enforced) is NOT resolved automatically — missing provenance is not global
+    provenance; it is retained for audit but stays dormant until reassigned.
     """
     def owns(a: Anchor) -> bool:
-        return a.library_id is None or a.library_id == library_id
+        return a.library_id is not None and a.library_id == library_id
 
     for scope, ref in (("file", file_id), ("directory", directory),
                        ("library", str(library_id))):

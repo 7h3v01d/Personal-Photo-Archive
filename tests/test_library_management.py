@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from PIL import Image
 
 from ppa import catalogue, metadata
@@ -120,3 +122,75 @@ def test_directory_anchor_does_not_cross_libraries(tmp_path):
     a = anchors.list_anchors(conn)
     assert anchors.resolve_for(a, file_id="x", directory="trip", library_id=ids["LibB"]) is None
     assert anchors.resolve_for(a, file_id="x", directory="trip", library_id=ids["LibA"]) is not None
+
+
+def test_unowned_directory_anchor_is_rejected(tmp_path):
+    from ppa import anchors
+    lib = tmp_path / "A"; _img(lib / "trip" / "p.jpg")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib)
+    with pytest.raises(ValueError):
+        anchors.add_anchor(conn, "directory", "trip", "exact", "2004-12-25")  # no owner
+
+
+def test_anchor_for_nonexistent_file_is_rejected(tmp_path):
+    from ppa import anchors
+    conn = connect(tmp_path / "c.sqlite3")
+    with pytest.raises(ValueError):
+        anchors.add_anchor(conn, "file", "nonexistent-file-id", "exact", "2004-12-25")
+
+
+def test_anchor_for_nonexistent_library_is_rejected(tmp_path):
+    from ppa import anchors
+    conn = connect(tmp_path / "c.sqlite3")
+    with pytest.raises(ValueError):
+        anchors.add_anchor(conn, "library", "9999", "exact", "2004-12-25")
+
+
+def test_legacy_null_owner_directory_anchor_is_not_applied(tmp_path):
+    # A row from before ownership was enforced (inserted directly, owner NULL)
+    # must not resolve for any library — missing provenance is not global.
+    from datetime import datetime, timezone
+    from ppa import anchors
+    a, b = tmp_path / "LibA", tmp_path / "LibB"
+    _img(a / "trip" / "p.jpg"); _img(b / "trip" / "q.jpg", "blue")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, a); scan_library(conn, b)
+    conn.execute(
+        "INSERT INTO anchors (scope, scope_ref, kind, start_date, end_date, note, "
+        "created_at, library_id) VALUES ('directory','trip','exact','2004-12-25',"
+        "NULL,NULL,?,NULL)", (datetime.now(timezone.utc).isoformat(),))
+    conn.commit()
+    ids = {L.display_path[-4:]: L.id for L in catalogue.list_libraries(conn)}
+    a_list = anchors.list_anchors(conn)
+    assert anchors.resolve_for(a_list, file_id="x", directory="trip", library_id=ids["LibA"]) is None
+    assert anchors.resolve_for(a_list, file_id="x", directory="trip", library_id=ids["LibB"]) is None
+
+
+def test_migration_009_backfills_library_and_file_but_not_directory(tmp_path):
+    # Legacy unowned anchors: library/file ownership is deterministically
+    # recoverable and backfilled; directory ownership is ambiguous and stays NULL.
+    from datetime import datetime, timezone
+    from ppa import anchors
+    lib = tmp_path / "L"; _img(lib / "trip" / "p.jpg")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib)
+    lid = catalogue.list_libraries(conn)[0].id
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+    now = datetime.now(timezone.utc).isoformat()
+    for scope, ref in (("library", str(lid)), ("file", fid), ("directory", "trip")):
+        conn.execute("INSERT INTO anchors (scope, scope_ref, kind, start_date, end_date, "
+                     "note, created_at, library_id) VALUES (?,?,?,?,?,?,?,NULL)",
+                     (scope, ref, "exact", "2004-12-25", None, None, now))
+    conn.commit()
+    conn.executescript(
+        "UPDATE anchors SET library_id = CAST(scope_ref AS INTEGER) "
+        "WHERE scope='library' AND library_id IS NULL "
+        "AND CAST(scope_ref AS INTEGER) IN (SELECT id FROM libraries);"
+        "UPDATE anchors SET library_id = (SELECT f.library_id FROM files f "
+        "WHERE f.id = anchors.scope_ref) WHERE scope='file' AND library_id IS NULL "
+        "AND EXISTS(SELECT 1 FROM files f WHERE f.id = anchors.scope_ref);")
+    conn.commit()
+    owners = {a.scope: a.library_id for a in anchors.list_anchors(conn)}
+    assert owners["library"] == lid and owners["file"] == lid
+    assert owners["directory"] is None            # ambiguous -> dormant, not guessed
