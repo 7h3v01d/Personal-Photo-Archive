@@ -94,3 +94,80 @@ def test_selection_populates_inspector(app, tmp_path: Path) -> None:
     finally:
         win._registry.shutdown()
         win.close()
+
+
+def test_manage_libraries_dialog_lists_and_forgets(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.ui.libraries_dialog import LibrariesDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    dialog = LibrariesDialog(conn, None, None)
+    assert dialog._table.rowCount() == 1
+    assert dialog._table.item(0, 2).text() == "3"          # three photos present
+
+    lib_id = catalogue.list_libraries(conn)[0].id
+    catalogue.forget_library(conn, lib_id)
+    dialog._reload()
+    assert dialog._table.rowCount() == 0                   # forgotten from the list
+    # Source photos are untouched on disk.
+    assert (tmp_path / "library" / "IMG_0001.jpg").exists()
+    conn.close()
+
+
+def test_manage_libraries_scan_request_handoff(app, tmp_path: Path) -> None:
+    from ppa.ui.libraries_dialog import LibrariesDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    dialog = LibrariesDialog(conn, None, None)
+    # Selecting a row and 'rescan' records a request for the main window.
+    dialog._table.selectRow(0)
+    dialog._on_rescan()
+    assert dialog.scan_request is not None
+    conn.close()
+
+
+def test_preview_dialog_loads_and_navigates(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.ui.models import PhotoGridModel
+    from ppa.ui.preview_dialog import PreviewDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    model = PhotoGridModel()
+    model.set_items(catalogue.grid_items(conn, catalogue.VIEW_ALL))
+    assert model.rowCount() == 3
+
+    dlg = PreviewDialog(conn, model, 0, None)
+    app.processEvents()                                              # run deferred decode
+    assert dlg._original is not None and not dlg._original.isNull()  # image loaded
+    assert dlg._prev.isEnabled() is False                           # at first
+    dlg._go_next(); app.processEvents()
+    assert dlg._pos == 1 and "2 / 3" in dlg._caption.text()
+    dlg._go_next(); dlg._go_next(); app.processEvents()             # clamps at end
+    assert dlg._pos == 2 and dlg._next.isEnabled() is False
+    assert len(dlg._cache) >= 1                                      # decoded images cached
+    conn.close()
+
+
+def test_preview_dialog_handles_missing_file(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.ui.models import PhotoGridModel
+    from ppa.ui.preview_dialog import PreviewDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    model = PhotoGridModel()
+    model.set_items(catalogue.grid_items(conn, catalogue.VIEW_ALL))
+    # A file catalogued as present, then removed from disk before preview.
+    (tmp_path / "library" / "IMG_0001.jpg").unlink()
+
+    dlg = PreviewDialog(conn, model, 0, None)
+    shown = False
+    for pos in range(model.rowCount()):
+        dlg._pos = pos; dlg._load(); app.processEvents()
+        if dlg._original is None and "IMG_0001" in dlg._image.text():
+            shown = True; break
+    assert shown                                                     # placeholder, no crash
+    conn.close()

@@ -417,3 +417,45 @@ evidence that supports it.**
 Tests: `tests/test_reconstruct.py` (15), incl. Brisbane/UTC ±1-day non-propagation
 and model-only bracket withholding. Deferred to 7.1: reconstructions table +
 migration, wiring, `ppa reconstruct`, confirm/reject flow.
+
+## UI — Library (resource) management
+
+`catalogue.list_libraries` / `catalogue.forget_library` + `ui/libraries_dialog.py`
+(a "Libraries…" toolbar action). The manager shows every source folder with live
+present/missing counts, availability (offline drives shown amber), last-scan time,
+and the current scan target (●). Actions: Add, Rescan, Set as Scan Target, Remove.
+
+SAFETY: `forget_library` deletes only catalogue rows — never a source photograph.
+Deletes are ordered around the files↔revisions cycle (null current_revision_id
+first), orphaned photos are removed only when no File anywhere still references
+them (a duplicate in another library keeps its Photo), and the whole thing is
+atomic (rolls back on error). Verified: source files remain on disk, DB integrity
+and foreign_key_check clean, no dangling revisions/observations.
+
+Tests: `tests/test_library_management.py` (4), `tests/test_ui_smoke.py` (+2).
+
+## UI — full-size photo preview
+
+`ui/preview_dialog.py`. Double-click a grid tile (or press Enter/Return) to open
+the selected photograph at full size, scaled to fit the window (aspect preserved,
+smooth), with a caption (filename · dimensions · date · camera · copies) and a
+position counter. Left/Right (or Prev/Next) navigate the current grid contents.
+
+READ-ONLY: loads the original file's bytes only to display them (as thumbnails
+already do); never writes to a source photo. Files that are missing on disk or
+unreadable show a clear placeholder instead of crashing. Loading is gated on the
+file actually existing on disk, not on a status string.
+
+Tests: `tests/test_ui_smoke.py` (+2) — loads/navigates/clamps, and placeholder
+for a file removed from disk after cataloguing.
+
+## UI — preview performance & fidelity (self-initiated follow-up)
+
+- **Bounded decode:** large photos are decoded at most to screen size via
+  `QImageReader.setScaledSize` — a 24MP file no longer becomes a 24MP QPixmap
+  just to display on a 2K screen (memory + speed).
+- **EXIF orientation:** `setAutoTransform(True)` shows portrait photos upright.
+- **LRU pixmap cache** (6 images) makes prev/next instant without holding the
+  library in memory.
+- **Loading indicator:** decode is deferred one event-loop turn so a brief
+  "Loading…" paints for big files; a navigation token discards stale decodes.

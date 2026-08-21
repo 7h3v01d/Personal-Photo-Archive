@@ -37,6 +37,18 @@ class LibraryStats:
 
 
 @dataclass(frozen=True)
+class LibraryInfo:
+    id: int
+    display_path: str        # exactly as the user chose it
+    canonical_path: str      # normalised absolute root
+    state: str               # 'active' | 'unavailable'
+    last_scan_at: str | None
+    present: int             # files currently present on disk
+    missing: int             # files catalogued but currently missing
+    available: bool          # the root is reachable right now
+
+
+@dataclass(frozen=True)
 class GridItem:
     file_id: str
     photo_id: str
@@ -343,3 +355,89 @@ def file_detail(conn: Connection, file_id: str) -> FileDetail | None:
         integrity_events=events,
         path_history=history,
     )
+
+
+# --- library (resource) management ------------------------------------------
+
+def list_libraries(conn: Connection) -> list["LibraryInfo"]:
+    """All catalogued photo-source libraries with live present/missing counts.
+
+    ``available`` reflects whether the root directory is reachable right now, so
+    the UI can distinguish an offline drive from a genuinely empty library.
+    """
+    import os
+
+    rows = conn.execute(
+        """
+        SELECT l.id, l.root_display_path, l.root_canonical_path, l.state, l.last_scan_at,
+          (SELECT COUNT(*) FROM files f
+             WHERE f.library_id = l.id AND f.presence_status = 'present') AS present,
+          (SELECT COUNT(*) FROM files f
+             WHERE f.library_id = l.id AND f.presence_status = 'missing') AS missing
+        FROM libraries l
+        ORDER BY l.root_display_path
+        """
+    ).fetchall()
+    out: list[LibraryInfo] = []
+    for r in rows:
+        out.append(LibraryInfo(
+            id=r["id"],
+            display_path=r["root_display_path"],
+            canonical_path=r["root_canonical_path"],
+            state=r["state"],
+            last_scan_at=r["last_scan_at"],
+            present=r["present"],
+            missing=r["missing"],
+            available=os.path.isdir(r["root_canonical_path"]),
+        ))
+    return out
+
+
+def forget_library(conn: Connection, library_id: int) -> int:
+    """Remove a library and its catalogue records. Returns the number of File
+    records removed.
+
+    SAFETY: this only deletes catalogue rows. It never reads, moves, or deletes
+    a single source photograph — the files on disk are untouched. Removing a
+    library simply makes the archive stop tracking that folder.
+
+    Deletes are ordered to respect foreign keys (the files↔revisions cycle is
+    broken by nulling current_revision_id first), and photos are removed only
+    when no File anywhere still references them (duplicates in another library
+    keep their Photo alive). Atomic: rolls back on any error.
+    """
+    file_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM files WHERE library_id = ?", (library_id,)).fetchall()]
+    photo_ids = {r["photo_id"] for r in conn.execute(
+        "SELECT DISTINCT photo_id FROM files WHERE library_id = ?", (library_id,)).fetchall()}
+
+    try:
+        conn.execute("BEGIN")
+        # Break the files <-> file_revisions reference cycle.
+        conn.execute("UPDATE files SET current_revision_id = NULL WHERE library_id = ?",
+                     (library_id,))
+        if file_ids:
+            marks = ",".join("?" * len(file_ids))
+            # Observations reference file_revisions; remove them before revisions.
+            conn.execute(f"DELETE FROM metadata_observations WHERE file_id IN ({marks})",
+                         file_ids)
+            conn.execute(f"DELETE FROM file_path_history WHERE file_id IN ({marks})",
+                         file_ids)
+            conn.execute(f"DELETE FROM integrity_events WHERE file_id IN ({marks})",
+                         file_ids)
+            conn.execute(f"DELETE FROM file_revisions WHERE file_id IN ({marks})",
+                         file_ids)
+        conn.execute("DELETE FROM files WHERE library_id = ?", (library_id,))
+        # Remove now-orphaned photos only (a photo with a copy in another library
+        # must survive).
+        for pid in photo_ids:
+            still = conn.execute(
+                "SELECT 1 FROM files WHERE photo_id = ? LIMIT 1", (pid,)).fetchone()
+            if still is None:
+                conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+        conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return len(file_ids)

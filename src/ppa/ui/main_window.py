@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QApplication,
@@ -255,6 +255,10 @@ class MainWindow(QMainWindow):
         self._act_add.triggered.connect(self._on_add_library)
         tb.addAction(self._act_add)
 
+        self._act_libraries = QAction("Libraries…", self)
+        self._act_libraries.triggered.connect(self._on_manage_libraries)
+        tb.addAction(self._act_libraries)
+
         self._act_scan = QAction("Scan", self)
         self._act_scan.triggered.connect(self._on_scan)
         tb.addAction(self._act_scan)
@@ -305,6 +309,11 @@ class MainWindow(QMainWindow):
         self._grid.setUniformItemSizes(True)
         self._grid.setSelectionMode(QListView.SelectionMode.SingleSelection)
         self._grid.selectionModel().currentChanged.connect(self._on_selection)
+        self._grid.doubleClicked.connect(self._on_open_preview)
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            sc = QShortcut(QKeySequence(key), self._grid)
+            sc.activated.connect(
+                lambda: self._on_open_preview(self._grid.currentIndex()))
         self._apply_density(1)  # Medium
 
         # Empty-state page, shown when the current view has no photos.
@@ -420,6 +429,13 @@ class MainWindow(QMainWindow):
         thumb = self._model._pixmaps.get(item.file_id)
         self._inspector.show_detail(detail, thumb)
 
+    def _on_open_preview(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        from ppa.ui.preview_dialog import PreviewDialog
+        dialog = PreviewDialog(self._conn, self._model, index.row(), self)
+        dialog.show()
+
     # --- thumbnails ---------------------------------------------------------
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
@@ -427,7 +443,7 @@ class MainWindow(QMainWindow):
     # --- scan / verify ------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        for act in (self._act_add, self._act_scan, self._act_verify,
+        for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
                     self._act_extract, self._act_refresh):
             act.setEnabled(not busy)
 
@@ -438,6 +454,21 @@ class MainWindow(QMainWindow):
         self._current_library = Path(directory)
         self._update_status_summary()
         if self._confirm(f"Scan {directory} now?"):
+            self._on_scan()
+
+    def _on_manage_libraries(self) -> None:
+        if self._busy:
+            return
+        from ppa.ui.libraries_dialog import LibrariesDialog
+        dialog = LibrariesDialog(self._conn, self._current_library, self)
+        dialog.exec()
+        if dialog.target_request is not None:
+            self._current_library = dialog.target_request
+        # A library may have been removed inside the dialog; reflect it.
+        self.refresh()
+        self._update_status_summary()
+        if dialog.scan_request is not None:
+            self._current_library = dialog.scan_request
             self._on_scan()
 
     def _on_scan(self) -> None:
