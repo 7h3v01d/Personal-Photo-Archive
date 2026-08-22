@@ -535,3 +535,68 @@ human confirm/reject them into authoritative interpretations.
 Reuses Phase 6 evidence gathering and the fail-closed anchor ownership rules.
 Tests: `tests/test_reconstruct_catalogue.py` (7) — table, offset-run proposals,
 sticky decisions, read-only, status filter, cascade-on-forget.
+
+## Phase 7.1.1 — revision-bound reconstruction authority (P0/P1 fix, schema v11)
+
+A confirmation is a human decision about SPECIFIC bytes, not a File identity.
+
+- **Revision binding (migration 011):** reconstructions record `source_revision_id`
+  (+ `engine_version`). Staleness is derived: `source_revision_id !=
+  files.current_revision_id`. A confirmed reconstruction whose file's bytes later
+  change is preserved but marked STALE and is no longer authoritative until
+  re-reviewed — authority never crosses a revision boundary.
+- **Confirmation is revision-bound:** `confirm`/`reject` are refused (ValueError)
+  when the proposal is stale (bytes changed since it was generated) — you must
+  re-run reconstruction first.
+- **Terminal decisions:** confirm/reject are allowed ONLY from 'proposed'.
+  confirmed↛rejected and rejected↛confirmed silently; `reopen_reconstruction`
+  returns a decided row to 'proposed' to revisit it. (`ppa reconstruct reopen`.)
+- **created_at vs updated_at:** recompute preserves created_at (row birth) and
+  updates updated_at (last recompute) — created_at is no longer overwritten.
+- **forget_library** now deletes reconstructions before the file_revisions they
+  reference (source_revision_id FK).
+
+Tests: confirmed-doesn't-transfer-to-new-revision, stale-proposal-can't-confirm,
+confirmed-stays-visible-after-stale, rejected↛confirmed, confirmed↛rejected,
+reopen revisits, rerun preserves created_at / updates updated_at.
+
+## Phase 7.1.2 — evidence-fingerprint binding (P0/P1 provenance, schema v12)
+
+Revision binding (v11) caught byte changes; it did not catch EVIDENCE changes —
+e.g. a newer, more-specific anchor supersedes the old date while the bytes are
+identical. A confirmation is a decision about a specific evidence state.
+
+- **Evidence fingerprint (migration 012, +7.1.2a):** a deterministic SHA-256 over
+  the COMPLETE semantic input to reconstruct() — engine version, the recorded
+  candidate instant, per-frame reliability, sequence,
+  reset-group membership + device-identity strength, resolved anchor/GPS values,
+  and (for offset propagation) the same for every member of the reset group, so a
+  change to any member's anchor re-fingerprints the whole run. Frozen on the row
+  at proposal/decision time. Rule: if reconstruct() could produce a different
+  answer from today's inputs, the fingerprint changes — recorded included, since a
+  re-extraction can change the candidate for identical bytes.
+- **Two-dimensional staleness (derived by recompute):** `content_stale` =
+  current revision differs from the bound one; `evidence_stale` = today's evidence
+  fingerprint differs from the frozen one. `stale = content_stale OR
+  evidence_stale`.
+- **Confirmation refused when either is stale** — a proposal whose bytes OR
+  evidence moved on must be refreshed (`reconstruct run`) before it can be
+  confirmed. This also closes the reopen gap: a reopened row whose evidence has
+  since changed can't be re-confirmed until recomputed.
+- **Determinism / no false positives:** identical evidence yields an identical
+  fingerprint; a change in an UNRELATED library does not invalidate a file.
+
+Tests: confirmed-goes-stale-on-newer-anchor, stale-proposal-can't-confirm-after-
+anchor-change, unchanged-evidence-same-fingerprint, unrelated-change-doesn't-
+invalidate, reopened-row-needs-recompute-before-confirm.
+
+## Phase 7.1.2b — reset-group label excluded from the fingerprint
+
+A false-staleness (safe-direction) bug: the ephemeral reset-group label
+(`reset-0`, `reset-1`…) was in the canonical payload, so an unrelated earlier
+group renumbering the findings changed a fingerprint despite identical
+membership/evidence — needlessly staling a decision. The label is now excluded
+from `_canon_input`; group participation is carried only by the sorted
+group-member payload (the real semantic fact), so renumbering is inert while a
+genuine member evidence change still re-fingerprints the whole run.
+Test: `test_reset_group_renumbering_does_not_change_fingerprint`.

@@ -107,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     rc_confirm.add_argument("file_id")
     rc_reject = rc_sub.add_parser("reject", help="Reject a file's reconstruction")
     rc_reject.add_argument("file_id")
+    rc_reopen = rc_sub.add_parser(
+        "reopen", help="Return a confirmed/rejected reconstruction to proposed")
+    rc_reopen.add_argument("file_id")
 
     args = parser.parse_args(argv)
 
@@ -268,17 +271,32 @@ def main(argv: list[str] | None = None) -> int:
             rows = rc.list_reconstructions(conn, status=args.status)
             for r in rows:
                 span = r.start_date if r.end_date is None else f"{r.start_date}…{r.end_date}"
+                if r.content_stale and r.evidence_stale:
+                    flag = " STALE(bytes+evidence)"
+                elif r.content_stale:
+                    flag = " STALE(bytes)"
+                elif r.evidence_stale:
+                    flag = " STALE(evidence)"
+                else:
+                    flag = ""
                 print(f"  {r.status:9} {r.confidence:9} {span:23} {r.method:12} "
-                      f"{r.file_id[:12]}  {r.evidence or ''}")
+                      f"{r.file_id[:12]}{flag}  {r.evidence or ''}")
             print(f"\n{len(rows)} reconstruction(s).")
             return 0
-        if args.reconstruct_command == "confirm":
-            ok = rc.confirm_reconstruction(conn, args.file_id)
-            print("Confirmed." if ok else "No reconstruction for that file.")
+        if args.reconstruct_command in ("confirm", "reject"):
+            fn = rc.confirm_reconstruction if args.reconstruct_command == "confirm" \
+                else rc.reject_reconstruction
+            try:
+                ok = fn(conn, args.file_id)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print("Done." if ok else "No reconstruction for that file.")
             return 0 if ok else 1
-        if args.reconstruct_command == "reject":
-            ok = rc.reject_reconstruction(conn, args.file_id)
-            print("Rejected." if ok else "No reconstruction for that file.")
+        if args.reconstruct_command == "reopen":
+            ok = rc.reopen_reconstruction(conn, args.file_id)
+            print("Reopened (re-run reconstruct to refresh)." if ok
+                  else "No decided reconstruction to reopen.")
             return 0 if ok else 1
         return 1
 

@@ -36,6 +36,10 @@ from enum import Enum
 
 from ppa.dating import Reliability
 
+# Bumped when the reconstruction rules change, so a stored proposal records which
+# engine produced it (reproducibility / staleness reasoning).
+ENGINE_VERSION = "7.0.1"
+
 
 class Confidence(str, Enum):
     CONFIRMED = "confirmed"   # human anchor or direct independent evidence

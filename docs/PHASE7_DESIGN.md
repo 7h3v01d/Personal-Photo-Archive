@@ -73,6 +73,10 @@ into observations; resolved at read time. A confirmed reconstruction can feed a
 - **7.0**: pure reconstruction engine — offset propagation + bracketing over
   Phase-6 output + evidence; produces proposals with confidence. Storage-agnostic,
   tested, read-only.
+- **7.1.2** (DONE): evidence fingerprint; staleness = revision OR evidence
+  mismatch; confirmation refused when either is stale.
+- **7.1.1** (DONE): reconstructions bound to source revision; stale once bytes
+  change; terminal decisions + reopen; created/updated split; engine version.
 - **7.1** (DONE): `reconstructions` table + migration; wiring; `ppa reconstruct`
   run/list/confirm/reject flow; sticky human decisions.
 - **7.2**: UI to review/confirm proposals; timeline view using confirmed dates.

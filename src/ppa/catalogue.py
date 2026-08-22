@@ -425,6 +425,10 @@ def forget_library(conn: Connection, library_id: int) -> int:
                          file_ids)
             conn.execute(f"DELETE FROM integrity_events WHERE file_id IN ({marks})",
                          file_ids)
+            # Reconstructions reference file_revisions (source_revision_id); remove
+            # them before the revisions they point at.
+            conn.execute(f"DELETE FROM reconstructions WHERE file_id IN ({marks})",
+                         file_ids)
             conn.execute(f"DELETE FROM file_revisions WHERE file_id IN ({marks})",
                          file_ids)
         conn.execute("DELETE FROM files WHERE library_id = ?", (library_id,))

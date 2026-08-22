@@ -16,6 +16,8 @@ Invariants (inherited, enforced here):
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from sqlite3 import Connection
@@ -41,6 +43,16 @@ class StoredReconstruction:
     status: str
     created_at: str
     decided_at: str | None
+    source_revision_id: str | None
+    engine_version: str | None
+    updated_at: str | None
+    evidence_fingerprint: str | None
+    content_stale: bool   # the file's current revision differs from the bound one
+    evidence_stale: bool  # today's evidence differs from what produced this row
+
+    @property
+    def stale(self) -> bool:
+        return self.content_stale or self.evidence_stale
 
 
 def _parse_date(s: str) -> date:
@@ -124,19 +136,103 @@ def analyse_library_reconstructed(conn: Connection, *, camera_floors=None
     return reconstruct(inputs)
 
 
+def _canon_input(i) -> dict:
+    """Canonical, JSON-serialisable view of the COMPLETE semantic input to the
+    reconstruction engine for one frame. Every ReconstructionInput field that can
+    change ``reconstruct()``'s output is included — notably ``recorded``, since a
+    re-extraction or parser fix can change the interpreted capture instant for the
+    same bytes and offset propagation is ``recorded + offset``. (The bytes are the
+    revision dimension; the interpreted observation extracted from them is
+    evidence.)
+
+    The ephemeral ``reset_group`` LABEL (``reset-0``, ``reset-1``…) is deliberately
+    excluded: it's an enumeration artefact, so an unrelated earlier group could
+    renumber it without any real change. Group participation is instead carried by
+    the sorted group-member payload in ``_fingerprints`` — that captures which
+    frames actually belong together, which is the semantic fact.
+    """
+    return {
+        "file_id": i.file_id,
+        "recorded": i.recorded.isoformat() if i.recorded else None,
+        "reliability": i.reliability.value,
+        "seq": i.seq,
+        "reset_group_strong": i.reset_group_strong,
+        "known_true": i.known_true.isoformat() if i.known_true else None,
+        "known_true_kind": i.known_true_kind.value if i.known_true_kind else None,
+        "anchor_range": ([i.anchor_range[0].isoformat(), i.anchor_range[1].isoformat()]
+                         if i.anchor_range else None),
+    }
+
+
+def _fingerprints(inputs: list) -> dict[str, str]:
+    """Deterministic SHA-256 of the evidence that determines each file's
+    reconstruction. Offset propagation makes a frame depend on its reset group's
+    members, so a grouped frame's payload includes the whole group — a change to
+    any member's anchor/GPS re-fingerprints the whole run."""
+    from ppa.reconstruct import ENGINE_VERSION
+
+    by_group: dict[str, list] = {}
+    for i in inputs:
+        if i.reset_group is not None:
+            by_group.setdefault(i.reset_group, []).append(i)
+
+    out: dict[str, str] = {}
+    for i in inputs:
+        group = (sorted((_canon_input(m) for m in by_group[i.reset_group]),
+                        key=lambda d: d["file_id"])
+                 if i.reset_group is not None else None)
+        payload = {"engine": ENGINE_VERSION, "self": _canon_input(i), "group": group}
+        out[i.file_id] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return out
+
+
+def evaluate_staleness(conn: Connection, *, camera_floors=None
+                       ) -> dict[str, tuple[bool, bool]]:
+    """Recompute today's evidence and return {file_id: (content_stale,
+    evidence_stale)} for every stored reconstruction. content_stale = the file's
+    current revision differs from the bound one; evidence_stale = today's evidence
+    fingerprint differs from the one frozen on the row."""
+    inputs, _ = _build_inputs(conn, camera_floors)
+    current_fp = _fingerprints(inputs)
+    current_rev = {
+        r["id"]: r["current_revision_id"]
+        for r in conn.execute("SELECT id, current_revision_id FROM files")}
+    out: dict[str, tuple[bool, bool]] = {}
+    for r in conn.execute(
+            "SELECT file_id, source_revision_id, evidence_fingerprint "
+            "FROM reconstructions").fetchall():
+        fid = r["file_id"]
+        content_stale = r["source_revision_id"] != current_rev.get(fid)
+        evidence_stale = (r["evidence_fingerprint"] is None
+                          or r["evidence_fingerprint"] != current_fp.get(fid))
+        out[fid] = (content_stale, evidence_stale)
+    return out
+
+
 def store_reconstructions(conn: Connection, *, camera_floors=None) -> dict[str, int]:
     """Compute reconstructions and persist proposals. Sticky: only 'proposed'
     rows are refreshed; 'confirmed'/'rejected' decisions are left untouched.
-    Returns counts: {'proposed': n, 'skipped_decided': m, 'cleared': k}."""
+
+    Each proposal is bound to the file's CURRENT revision (source_revision_id) and
+    the engine version, so a later revision change makes the row recognisably
+    stale rather than silently authoritative over new bytes. created_at is
+    preserved across recompute; updated_at tracks the last recompute.
+    """
+    from ppa.reconstruct import ENGINE_VERSION
+
     results = analyse_library_reconstructed(conn, camera_floors=camera_floors)
+    inputs, _ = _build_inputs(conn, camera_floors)
+    fingerprints = _fingerprints(inputs)
+    current_rev = {
+        r["id"]: r["current_revision_id"]
+        for r in conn.execute("SELECT id, current_revision_id FROM files")}
     decided = {r["file_id"] for r in conn.execute(
         "SELECT file_id FROM reconstructions WHERE status IN ('confirmed','rejected')")}
     now = datetime.now(timezone.utc).isoformat()
     proposed = skipped = cleared = 0
     try:
         conn.execute("BEGIN")
-        # Drop stale proposals for files that no longer reconstruct (leave
-        # decisions alone).
         for row in conn.execute(
                 "SELECT file_id FROM reconstructions WHERE status = 'proposed'").fetchall():
             if row["file_id"] not in results:
@@ -149,16 +245,21 @@ def store_reconstructions(conn: Connection, *, camera_floors=None) -> dict[str, 
                 continue
             conn.execute(
                 "INSERT INTO reconstructions (file_id, start_date, end_date, confidence, "
-                "method, evidence, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?) "
+                "method, evidence, status, created_at, updated_at, source_revision_id, "
+                "engine_version, evidence_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?) "
                 "ON CONFLICT(file_id) DO UPDATE SET "
                 "start_date=excluded.start_date, end_date=excluded.end_date, "
                 "confidence=excluded.confidence, method=excluded.method, "
-                "evidence=excluded.evidence, created_at=excluded.created_at "
-                "WHERE reconstructions.status = 'proposed'",
+                "evidence=excluded.evidence, updated_at=excluded.updated_at, "
+                "source_revision_id=excluded.source_revision_id, "
+                "engine_version=excluded.engine_version, "
+                "evidence_fingerprint=excluded.evidence_fingerprint "
+                "WHERE reconstructions.status = 'proposed'",   # created_at preserved
                 (fid, rec.start.isoformat(),
                  rec.end.isoformat() if rec.end else None,
-                 rec.confidence.value, rec.method, rec.evidence, now))
+                 rec.confidence.value, rec.method, rec.evidence, now, now,
+                 current_rev.get(fid), ENGINE_VERSION, fingerprints.get(fid)))
             proposed += 1
         conn.execute("COMMIT")
     except Exception:
@@ -167,41 +268,84 @@ def store_reconstructions(conn: Connection, *, camera_floors=None) -> dict[str, 
     return {"proposed": proposed, "skipped_decided": skipped, "cleared": cleared}
 
 
-def list_reconstructions(conn: Connection, *, status: str | None = None
-                         ) -> list[StoredReconstruction]:
+def list_reconstructions(conn: Connection, *, status: str | None = None,
+                         camera_floors=None) -> list[StoredReconstruction]:
+    """Stored reconstructions, with staleness derived against today's revision AND
+    evidence. A decision made against superseded bytes (content_stale) or against
+    superseded evidence like a since-changed anchor (evidence_stale) is stale."""
+    staleness = evaluate_staleness(conn, camera_floors=camera_floors)
     sql = ("SELECT id, file_id, start_date, end_date, confidence, method, evidence, "
-           "status, created_at, decided_at FROM reconstructions")
+           "status, created_at, decided_at, source_revision_id, engine_version, "
+           "updated_at, evidence_fingerprint FROM reconstructions")
     params: tuple = ()
     if status is not None:
         sql += " WHERE status = ?"
         params = (status,)
     sql += " ORDER BY status, file_id"
-    return [
-        StoredReconstruction(
+    out: list[StoredReconstruction] = []
+    for r in conn.execute(sql, params).fetchall():
+        content_stale, evidence_stale = staleness.get(r["file_id"], (True, True))
+        out.append(StoredReconstruction(
             r["id"], r["file_id"], _parse_date(r["start_date"]),
             _parse_date(r["end_date"]) if r["end_date"] else None,
             r["confidence"], r["method"], r["evidence"], r["status"],
-            r["created_at"], r["decided_at"])
-        for r in conn.execute(sql, params).fetchall()
-    ]
+            r["created_at"], r["decided_at"], r["source_revision_id"],
+            r["engine_version"], r["updated_at"], r["evidence_fingerprint"],
+            content_stale, evidence_stale))
+    return out
 
 
-def _decide(conn: Connection, file_id: str, status: str) -> bool:
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
+def _decide(conn: Connection, file_id: str, status: str, camera_floors=None) -> bool:
+    """Confirm or reject — allowed ONLY from 'proposed', and ONLY when the proposal
+    is fresh against BOTH the current revision and the current evidence. A stale
+    proposal (bytes OR evidence changed since it was generated) must be refreshed
+    by re-running reconstruction first. Decisions are terminal; use
+    ``reopen_reconstruction`` to revisit one. Raises ValueError on a disallowed
+    transition or a stale proposal; returns False if there is no row."""
+    row = conn.execute("SELECT status FROM reconstructions WHERE file_id = ?",
+                       (file_id,)).fetchone()
+    if row is None:
+        return False
+    if row["status"] != "proposed":
+        raise ValueError(
+            f"cannot mark as {status}: reconstruction is already '{row['status']}' "
+            "(reopen it first to revisit the decision)")
+    content_stale, evidence_stale = evaluate_staleness(
+        conn, camera_floors=camera_floors).get(file_id, (True, True))
+    if content_stale:
+        raise ValueError(
+            f"cannot mark as {status}: the file's bytes changed since this proposal "
+            "was generated; re-run reconstruction to refresh it first")
+    if evidence_stale:
+        raise ValueError(
+            f"cannot mark as {status}: the evidence (e.g. an anchor) changed since "
+            "this proposal was generated; re-run reconstruction to refresh it first")
+    conn.execute(
         "UPDATE reconstructions SET status = ?, decided_at = ? WHERE file_id = ?",
-        (status, now, file_id))
+        (status, datetime.now(timezone.utc).isoformat(), file_id))
+    conn.commit()
+    return True
+
+
+def confirm_reconstruction(conn: Connection, file_id: str, *, camera_floors=None) -> bool:
+    """Mark a file's reconstruction authoritative for its CURRENT revision and
+    evidence. Does NOT touch observations or the recorded date. Terminal; refused
+    if the proposal is content- or evidence-stale."""
+    return _decide(conn, file_id, "confirmed", camera_floors)
+
+
+def reject_reconstruction(conn: Connection, file_id: str, *, camera_floors=None) -> bool:
+    """Reject a file's reconstruction. Terminal; refused if stale."""
+    return _decide(conn, file_id, "rejected", camera_floors)
+
+
+def reopen_reconstruction(conn: Connection, file_id: str) -> bool:
+    """Return a confirmed/rejected reconstruction to 'proposed' so it can be
+    revisited (e.g. after the bytes changed and the old decision went stale). The
+    next ``store_reconstructions`` rebinds it to the current revision. Returns
+    False if there is no decided row to reopen."""
+    cur = conn.execute(
+        "UPDATE reconstructions SET status = 'proposed', decided_at = NULL "
+        "WHERE file_id = ? AND status IN ('confirmed','rejected')", (file_id,))
     conn.commit()
     return cur.rowcount > 0
-
-
-def confirm_reconstruction(conn: Connection, file_id: str) -> bool:
-    """Mark a file's reconstruction authoritative. Does NOT touch observations or
-    the recorded date. Returns True if a row was updated."""
-    return _decide(conn, file_id, "confirmed")
-
-
-def reject_reconstruction(conn: Connection, file_id: str) -> bool:
-    """Reject a file's reconstruction (kept for audit, never resolved). Returns
-    True if a row was updated."""
-    return _decide(conn, file_id, "rejected")
