@@ -76,17 +76,21 @@ def build_review_queue(conn: Connection, *, library_id: int,
                        file_ids: Collection[str] | None = None,
                        camera_floors=None,
                        progress_cb: Callable[[str], None] | None = None,
-                       cancel_cb: Callable[[], bool] | None = None) -> ReviewQueue:
+                       cancel_cb: Callable[[], bool] | None = None,
+                       report: PilotReport | None = None) -> ReviewQueue:
     """Return a deterministic queue ordered by human-review value.
 
     This function is read-only.  All chronology/reconstruction facts come from
     ``analyse_pilot`` / the accepted persistence read model; this layer merely
     assigns an action and an explanation to each file in the selected scope.
     """
-    report = analyse_pilot(conn, library_id=library_id,
-                           directory_prefix=directory_prefix, file_ids=file_ids,
-                           camera_floors=camera_floors, generated_at="queue",
-                           progress_cb=progress_cb, cancel_cb=cancel_cb)
+    if report is None:
+        report = analyse_pilot(conn, library_id=library_id,
+                               directory_prefix=directory_prefix, file_ids=file_ids,
+                               camera_floors=camera_floors, generated_at="queue",
+                               progress_cb=progress_cb, cancel_cb=cancel_cb)
+    elif report.scope.library_id != library_id:
+        raise ValueError("supplied pilot report belongs to a different library")
     rel_by = _membership(report, report.reliability)
     priority_by = _membership(report, report.review_priority)
     conflict_kinds: dict[str, list[str]] = {}

@@ -387,3 +387,42 @@ class WorkerRegistry:
             handle.thread.quit()
             handle.thread.wait()
         self._handles.clear()
+
+class PilotAuditWorker(QObject):
+    """Build a Phase-7.2.7 pilot audit snapshot off the GUI thread."""
+
+    progress = Signal(str)
+    finished = Signal(object)  # PilotAuditSnapshot
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._library_id = library_id
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.pilot import PilotAnalysisCancelled
+            from ppa.pilot_audit import build_pilot_audit
+            conn = connect(self._db_path)
+            snap = build_pilot_audit(
+                conn, library_id=self._library_id,
+                progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(snap)
+        except PilotAnalysisCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()

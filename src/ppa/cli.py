@@ -147,6 +147,19 @@ def main(argv: list[str] | None = None) -> int:
                                   help="Relative directory prefix within the library")
     pilot_unresolved.add_argument("--json", dest="json_path", default=None,
                                   help="Write structured unresolved-memory JSON to this path")
+    pilot_audit = pilot_sub.add_parser(
+        "audit", help="Capture a read-only Phase-7 pilot audit snapshot")
+    pilot_audit.add_argument("library_id", type=int, help="Library id to audit")
+    pilot_audit.add_argument("--directory", default=None,
+                             help="Relative directory prefix within the library")
+    pilot_audit.add_argument("--json", dest="json_path", default=None,
+                             help="Write structured audit snapshot JSON to this path")
+    pilot_compare = pilot_sub.add_parser(
+        "audit-compare", help="Compare two explicit pilot audit JSON snapshots")
+    pilot_compare.add_argument("before", help="Earlier audit JSON path")
+    pilot_compare.add_argument("after", help="Later audit JSON path")
+    pilot_compare.add_argument("--json", dest="json_path", default=None,
+                               help="Write structured comparison JSON to this path")
 
     args = parser.parse_args(argv)
 
@@ -355,6 +368,35 @@ def main(argv: list[str] | None = None) -> int:
             print(unresolved_text(view))
             if args.json_path:
                 Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "audit":
+            from ppa.pilot_audit import build_pilot_audit, concise_text as audit_text
+            try:
+                snap = build_pilot_audit(conn, library_id=args.library_id,
+                                         directory_prefix=args.directory)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(audit_text(snap))
+            if args.json_path:
+                Path(args.json_path).write_text(snap.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "audit-compare":
+            import json
+            from ppa.pilot_audit import (snapshot_from_dict, compare_pilot_audits,
+                                         comparison_text)
+            try:
+                before = snapshot_from_dict(json.loads(Path(args.before).read_text(encoding="utf-8")))
+                after = snapshot_from_dict(json.loads(Path(args.after).read_text(encoding="utf-8")))
+                comparison = compare_pilot_audits(before, after)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(comparison_text(comparison))
+            if args.json_path:
+                Path(args.json_path).write_text(comparison.to_json() + "\n", encoding="utf-8")
                 print(f"\nWrote {args.json_path}")
             return 0
         return 1

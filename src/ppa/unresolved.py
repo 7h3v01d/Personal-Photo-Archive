@@ -107,17 +107,21 @@ def build_unresolved_memories(conn: Connection, *, library_id: int,
                               file_ids: Collection[str] | None = None,
                               camera_floors=None,
                               progress_cb: Callable[[str], None] | None = None,
-                              cancel_cb: Callable[[], bool] | None = None) -> UnresolvedMemories:
+                              cancel_cb: Callable[[], bool] | None = None,
+                              report=None) -> UnresolvedMemories:
     """Return a deterministic, read-only unresolved-memory view.
 
     Exactly one primary category is assigned to each photo without a fresh
     confirmed reconstruction.  Category precedence favours states requiring
     human attention (stale/conflicting) over merely low-information states.
     """
-    report = analyse_pilot(conn, library_id=library_id,
-                           directory_prefix=directory_prefix, file_ids=file_ids,
-                           camera_floors=camera_floors, generated_at="unresolved",
-                           progress_cb=progress_cb, cancel_cb=cancel_cb)
+    if report is None:
+        report = analyse_pilot(conn, library_id=library_id,
+                               directory_prefix=directory_prefix, file_ids=file_ids,
+                               camera_floors=camera_floors, generated_at="unresolved",
+                               progress_cb=progress_cb, cancel_cb=cancel_cb)
+    elif report.scope.library_id != library_id:
+        raise ValueError("supplied pilot report belongs to a different library")
     recs = {r.file_id: r for r in list_reconstructions(conn, camera_floors=camera_floors)}
     selected = set().union(*(b.file_ids for b in report.reliability.values()))
 

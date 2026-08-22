@@ -240,3 +240,10 @@ decision runs fail closed. See `docs/PHASE7_2_5_CONTROLLED_BATCH_CONFIRMATION.md
 ### Phase 7.2.6 — Unresolved Memories
 
 The desktop **Unresolved Memories** action and `ppa pilot unresolved` classify photos PPA cannot responsibly date into explicit, traceable categories rather than fabricating precision. Classification is read-only and runs off the GUI thread. See `docs/PHASE7_2_6_UNRESOLVED_MEMORIES.md`.
+
+## Phase 7.2.7 — Pilot Audit
+
+The desktop **Pilot Audit** action and `ppa pilot audit` CLI capture a read-only,
+traceable chronology snapshot. Save snapshots as JSON and compare two explicit
+same-scope runs with `ppa pilot audit-compare before.json after.json`. PPA never
+fabricates a historical “before” state from the current catalogue.

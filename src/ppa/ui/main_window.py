@@ -46,6 +46,7 @@ from ppa.ui.models import FILE_ID_ROLE, PhotoGridModel
 from ppa.ui.workers import (
     DateReviewQueueWorker,
     UnresolvedMemoriesWorker,
+    PilotAuditWorker,
     MetadataWorker,
     ScanWorker,
     ThumbnailWorker,
@@ -281,6 +282,10 @@ class MainWindow(QMainWindow):
         self._act_unresolved = QAction("Unresolved Memories", self)
         self._act_unresolved.triggered.connect(self._on_unresolved_memories)
         tb.addAction(self._act_unresolved)
+
+        self._act_pilot_audit = QAction("Pilot Audit", self)
+        self._act_pilot_audit.triggered.connect(self._on_pilot_audit)
+        tb.addAction(self._act_pilot_audit)
 
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
@@ -621,6 +626,76 @@ class MainWindow(QMainWindow):
         self._warn(f"Unresolved Memories failed: {message}")
         self._status.showMessage("Unresolved Memories failed.")
 
+    def _on_pilot_audit(self) -> None:
+        """Build the read-only Phase-7 audit snapshot off-thread."""
+        if self._busy:
+            return
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Pilot Audit",
+                                    "Select or scan a library before running the audit.")
+            return
+        self._set_busy(True)
+        self._status.showMessage("Pilot Audit: analysing…")
+        progress = QProgressDialog("Building Phase 7 pilot audit…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Pilot Audit")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._pilot_audit_progress = progress
+        worker = PilotAuditWorker(self._config.db_path, library_id)
+        self._pilot_audit_worker = worker
+        worker.progress.connect(self._on_pilot_audit_progress)
+        worker.finished.connect(self._on_pilot_audit_ready)
+        worker.failed.connect(self._on_pilot_audit_failed)
+        worker.cancelled.connect(self._on_pilot_audit_cancelled)
+        progress.canceled.connect(worker.cancel)
+        self._registry.start(worker)
+
+    def _on_pilot_audit_progress(self, message: str) -> None:
+        self._status.showMessage(message)
+        progress = getattr(self, "_pilot_audit_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
+
+    def _finish_pilot_audit_progress(self) -> None:
+        progress = getattr(self, "_pilot_audit_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater()
+            self._pilot_audit_progress = None
+        self._pilot_audit_worker = None
+        self._set_busy(False)
+
+    def _on_pilot_audit_ready(self, snapshot) -> None:
+        from ppa.pilot_audit import concise_text
+        self._finish_pilot_audit_progress()
+        text = concise_text(snapshot)
+        box = QMessageBox(self)
+        box.setWindowTitle("Phase 7 Pilot Audit")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Phase 7 pilot audit complete")
+        box.setInformativeText(
+            f"Usable chronology: {snapshot.usable_chronology.count} / {snapshot.total_files}\n"
+            f"Confirmed current: {snapshot.confirmed_current.count}\n"
+            f"Unresolved: {snapshot.unresolved.count}\n"
+            f"Stale decisions: {snapshot.stale_decisions.count}")
+        box.setDetailedText(text)
+        box.exec()
+        self._status.showMessage(
+            f"Pilot Audit — {snapshot.usable_chronology.count}/{snapshot.total_files} usable; "
+            f"{snapshot.unresolved.count} unresolved")
+
+    def _on_pilot_audit_cancelled(self) -> None:
+        self._finish_pilot_audit_progress()
+        self._status.showMessage("Pilot Audit cancelled.")
+
+    def _on_pilot_audit_failed(self, message: str) -> None:
+        self._finish_pilot_audit_progress()
+        self._warn(f"Pilot Audit failed: {message}")
+        self._status.showMessage("Pilot Audit failed.")
+
     # --- thumbnails ---------------------------------------------------------
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
@@ -629,7 +704,8 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
-                    self._act_extract, self._act_date_review, self._act_unresolved, self._act_refresh):
+                    self._act_extract, self._act_date_review, self._act_unresolved,
+                    self._act_pilot_audit, self._act_refresh):
             act.setEnabled(not busy)
 
     def _on_add_library(self) -> None:
