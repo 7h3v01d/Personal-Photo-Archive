@@ -247,3 +247,18 @@ The desktop **Pilot Audit** action and `ppa pilot audit` CLI capture a read-only
 traceable chronology snapshot. Save snapshots as JSON and compare two explicit
 same-scope runs with `ppa pilot audit-compare before.json after.json`. PPA never
 fabricates a historical “before” state from the current catalogue.
+
+### Phase 7.3 — real-collection pilot sessions
+
+A durable pilot harness can now capture a truthful baseline, append checkpoints,
+and close with a final Phase-7 audit comparison without modifying source photos or
+chronology evidence:
+
+```bash
+python -m ppa.cli pilot session-start 1 pilot.json --directory 2001-2006
+python -m ppa.cli pilot session-checkpoint pilot.json --label "after review session 1"
+python -m ppa.cli pilot session-status pilot.json
+python -m ppa.cli pilot session-close pilot.json
+```
+
+See `docs/PHASE7_3_REAL_COLLECTION_PILOT.md`.

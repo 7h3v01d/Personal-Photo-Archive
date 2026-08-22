@@ -160,6 +160,22 @@ def main(argv: list[str] | None = None) -> int:
     pilot_compare.add_argument("after", help="Later audit JSON path")
     pilot_compare.add_argument("--json", dest="json_path", default=None,
                                help="Write structured comparison JSON to this path")
+    pilot_session_start = pilot_sub.add_parser(
+        "session-start", help="Start a durable real-collection pilot session")
+    pilot_session_start.add_argument("library_id", type=int, help="Library id to pilot")
+    pilot_session_start.add_argument("session_path", help="Pilot session JSON path")
+    pilot_session_start.add_argument("--directory", default=None,
+                                     help="Relative directory prefix within the library")
+    pilot_session_checkpoint = pilot_sub.add_parser(
+        "session-checkpoint", help="Append a current audit checkpoint to an open pilot session")
+    pilot_session_checkpoint.add_argument("session_path", help="Pilot session JSON path")
+    pilot_session_checkpoint.add_argument("--label", default=None, help="Optional checkpoint label")
+    pilot_session_status = pilot_sub.add_parser(
+        "session-status", help="Show a saved pilot session without changing it")
+    pilot_session_status.add_argument("session_path", help="Pilot session JSON path")
+    pilot_session_close = pilot_sub.add_parser(
+        "session-close", help="Close a pilot session with a final audit and comparison")
+    pilot_session_close.add_argument("session_path", help="Pilot session JSON path")
 
     args = parser.parse_args(argv)
 
@@ -398,6 +414,59 @@ def main(argv: list[str] | None = None) -> int:
             if args.json_path:
                 Path(args.json_path).write_text(comparison.to_json() + "\n", encoding="utf-8")
                 print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "session-start":
+            from ppa.pilot_session import start_pilot_session, save_pilot_session, concise_text
+            path = Path(args.session_path)
+            if path.exists():
+                print(f"pilot session already exists: {path}", file=sys.stderr)
+                return 1
+            try:
+                session = start_pilot_session(conn, library_id=args.library_id,
+                                              directory_prefix=args.directory)
+                save_pilot_session(session, path)
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(concise_text(session))
+            print(f"\nSaved {path}")
+            return 0
+        if args.pilot_command == "session-checkpoint":
+            from ppa.pilot_session import (load_pilot_session, checkpoint_pilot_session,
+                                           save_pilot_session, concise_text)
+            path = Path(args.session_path)
+            try:
+                session = load_pilot_session(path)
+                session = checkpoint_pilot_session(conn, session, label=args.label)
+                save_pilot_session(session, path)
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(concise_text(session))
+            print(f"\nUpdated {path}")
+            return 0
+        if args.pilot_command == "session-status":
+            from ppa.pilot_session import load_pilot_session, concise_text
+            try:
+                session = load_pilot_session(Path(args.session_path))
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(concise_text(session))
+            return 0
+        if args.pilot_command == "session-close":
+            from ppa.pilot_session import (load_pilot_session, close_pilot_session,
+                                           save_pilot_session, concise_text)
+            path = Path(args.session_path)
+            try:
+                session = load_pilot_session(path)
+                session = close_pilot_session(conn, session)
+                save_pilot_session(session, path)
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(concise_text(session))
+            print(f"\nClosed {path}")
             return 0
         return 1
 
