@@ -33,19 +33,63 @@ from ppa.ui import theme
 _CACHE_LIMIT = 6
 
 
-def _caption(detail: catalogue.FileDetail) -> str:
+_RELIABILITY_LABEL = {
+    "TRUSTED": "trusted", "PROBABLY_VALID": "probably valid",
+    "QUESTIONABLE": "questionable", "LIKELY_WRONG": "likely wrong", "UNKNOWN": "unknown",
+}
+
+# The reconstruction confidence enum includes "confirmed"/"proposed", which would
+# collide with the review STATUS words in the caption; show clearer labels.
+_CONFIDENCE_LABEL = {
+    "confirmed": "exact", "strong": "strong", "range": "range", "proposed": "tentative",
+}
+
+
+def _stale_reason(rec) -> str:
+    if rec.content_stale and rec.evidence_stale:
+        return "photo and evidence changed"
+    if rec.content_stale:
+        return "photo changed"
+    if rec.evidence_stale:
+        return "evidence changed"
+    return ""
+
+
+def _date_line(summary) -> str:
+    """A provenance-aware date line: what the camera recorded and how trustworthy,
+    plus any interpreted (reconstructed) date with its review state and freshness."""
+    parts: list[str] = []
+    if summary.recorded is not None:
+        rating = _RELIABILITY_LABEL.get(summary.recorded_reliability, "")
+        parts.append(f"Recorded {summary.recorded.isoformat()}"
+                     + (f" ({rating})" if rating else ""))
+    else:
+        parts.append("Recorded date unknown")
+
+    rec = summary.reconstruction
+    if rec is not None and rec.status != "rejected":
+        span = (rec.start_date.isoformat() if rec.end_date is None
+                else f"{rec.start_date.isoformat()}…{rec.end_date.isoformat()}")
+        verb = {"confirmed": "Confirmed", "proposed": "Proposed"}.get(rec.status, rec.status)
+        conf = _CONFIDENCE_LABEL.get(rec.confidence, rec.confidence)
+        line = f"{verb} {span} ({conf})"
+        reason = _stale_reason(rec)
+        if reason:
+            line += f" — STALE: {reason}"
+        parts.append(line)
+    return "      ·      ".join(parts)
+
+
+def _caption(detail: catalogue.FileDetail, date_line: str) -> str:
     bits: list[str] = [detail.filename]
     if detail.width_px and detail.height_px:
         bits.append(f"{detail.width_px}×{detail.height_px}")
-    date = next((v for (k, v) in detail.observed_metadata
-                 if "date" in k.lower() or "taken" in k.lower()), None)
-    if date:
-        bits.append(date)
     if detail.camera:
         bits.append(detail.camera)
     if detail.copy_count > 1:
         bits.append(f"{detail.copy_count} copies")
-    return "   ·   ".join(bits)
+    head = "   ·   ".join(bits)
+    return f"{head}\n{date_line}" if date_line else head
 
 
 class PreviewDialog(QDialog):
@@ -60,6 +104,7 @@ class PreviewDialog(QDialog):
         self._original: QPixmap | None = None
         self._cache: "OrderedDict[str, QPixmap]" = OrderedDict()
         self._load_token = 0
+        self._staleness = self._compute_staleness()
 
         self.setWindowTitle("Preview")
         self.setModal(False)
@@ -86,6 +131,26 @@ class PreviewDialog(QDialog):
         self._image.setMinimumSize(1, 1)
         root.addWidget(self._image, 1)
 
+        # Review row — confirm/reject/reopen the reconstruction for this photo.
+        review = QHBoxLayout()
+        review.setContentsMargins(10, 8, 10, 0)
+        review.addStretch(1)
+        self._review_status = QLabel("")
+        self._review_status.setStyleSheet(f"color: {theme.TEXT_DIM};")
+        review.addWidget(self._review_status)
+        self._confirm_btn = QPushButton("Confirm date")
+        self._confirm_btn.clicked.connect(lambda: self._decide("confirm"))
+        self._reject_btn = QPushButton("Reject")
+        self._reject_btn.clicked.connect(lambda: self._decide("reject"))
+        self._reopen_btn = QPushButton("Reopen")
+        self._reopen_btn.clicked.connect(self._reopen)
+        self._refresh_btn = QPushButton("Refresh proposal")
+        self._refresh_btn.clicked.connect(self._refresh)
+        for b in (self._confirm_btn, self._reject_btn, self._reopen_btn, self._refresh_btn):
+            review.addWidget(b)
+        review.addStretch(1)
+        root.addLayout(review)
+
         bar = QHBoxLayout()
         bar.setContentsMargins(10, 6, 10, 8)
         self._prev = QPushButton("‹ Prev")
@@ -94,7 +159,7 @@ class PreviewDialog(QDialog):
         self._next.clicked.connect(self._go_next)
         self._caption = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
         self._caption.setStyleSheet(f"color: {theme.TEXT};")
-        self._caption.setWordWrap(False)
+        self._caption.setWordWrap(True)
         bar.addWidget(self._prev)
         bar.addWidget(self._caption, 1)
         bar.addWidget(self._next)
@@ -121,6 +186,89 @@ class PreviewDialog(QDialog):
         else:
             super().keyPressEvent(event)
 
+    # --- review -------------------------------------------------------------
+    def _compute_staleness(self):
+        # One library-wide pass, cached for the session and refreshed after any
+        # action, so navigation stays cheap while the UI still tells the same
+        # freshness truth as the persistence layer. Skipped when nothing is stored.
+        from ppa.reconstruct_catalogue import evaluate_staleness
+        if self._conn.execute("SELECT 1 FROM reconstructions LIMIT 1").fetchone() is None:
+            return {}
+        return evaluate_staleness(self._conn)
+
+    def _current_file_id(self) -> str | None:
+        return self._ids[self._pos] if self._ids else None
+
+    def _summary(self, file_id: str):
+        from ppa.reconstruct_catalogue import file_date_summary
+        return file_date_summary(self._conn, file_id, staleness=self._staleness)
+
+    def _sync_review(self, summary) -> None:
+        rec = summary.reconstruction
+        if rec is None:
+            for b in (self._confirm_btn, self._reject_btn, self._reopen_btn,
+                      self._refresh_btn):
+                b.setVisible(False)
+            self._review_status.setText("")
+            return
+
+        stale = rec.stale
+        reason = _stale_reason(rec)
+        proposed = rec.status == "proposed"
+        decided = rec.status in ("confirmed", "rejected")
+
+        # A stale row is never actionable as if fresh: offer Refresh (proposed) or
+        # Reopen & refresh (decided) instead of Confirm/Reject.
+        self._confirm_btn.setVisible(proposed and not stale)
+        self._reject_btn.setVisible(proposed and not stale)
+        self._refresh_btn.setVisible(proposed and stale)
+        self._reopen_btn.setVisible(decided)
+        self._reopen_btn.setText("Reopen && refresh" if (decided and stale) else "Reopen")
+
+        if proposed and stale:
+            self._review_status.setText(f"Proposed but STALE ({reason}) — refresh to review:")
+        elif proposed:
+            self._review_status.setText("Reconstruction proposed — review:")
+        elif rec.status == "confirmed":
+            self._review_status.setText(
+                f"Confirmed — STALE: {reason}" if stale else "Date confirmed")
+        elif rec.status == "rejected":
+            self._review_status.setText(
+                f"Rejected — STALE: {reason}" if stale else "Reconstruction rejected")
+
+    def _after_action(self) -> None:
+        self._staleness = self._compute_staleness()
+        self._load()
+
+    def _decide(self, which: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from ppa.reconstruct_catalogue import confirm_reconstruction, reject_reconstruction
+        fid = self._current_file_id()
+        if fid is None:
+            return
+        fn = confirm_reconstruction if which == "confirm" else reject_reconstruction
+        try:
+            fn(self._conn, fid)
+        except ValueError as exc:
+            QMessageBox.information(self, "Review", str(exc))
+        self._after_action()
+
+    def _refresh(self) -> None:
+        # Recompute proposals to today's bytes+evidence so the row is fresh to review.
+        from ppa.reconstruct_catalogue import store_reconstructions
+        store_reconstructions(self._conn)
+        self._after_action()
+
+    def _reopen(self) -> None:
+        # Reopen returns a decision to 'proposed'; immediately recompute so the
+        # user never reviews a stale row that merely looks fresh.
+        from ppa.reconstruct_catalogue import reopen_reconstruction, store_reconstructions
+        fid = self._current_file_id()
+        if fid is not None:
+            reopen_reconstruction(self._conn, fid)
+            store_reconstructions(self._conn)
+            self._after_action()
+
     # --- loading ------------------------------------------------------------
     def _load(self) -> None:
         if not self._ids:
@@ -140,7 +288,10 @@ class PreviewDialog(QDialog):
             return
 
         self.setWindowTitle(f"Preview — {detail.filename}")
-        self._caption.setText(f"{_caption(detail)}      ({counter})")
+        summary = self._summary(detail.file_id)
+        self._caption.setText(f"{_caption(detail, _date_line(summary))}"
+                              f"      ({counter})")
+        self._sync_review(summary)
 
         file_id = detail.file_id
         cached = self._cache.get(file_id)

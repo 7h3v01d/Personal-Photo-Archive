@@ -600,3 +600,47 @@ from `_canon_input`; group participation is carried only by the sorted
 group-member payload (the real semantic fact), so renumbering is inert while a
 genuine member evidence change still re-fingerprints the whole run.
 Test: `test_reset_group_renumbering_does_not_change_fingerprint`.
+
+## UI — Phase 6/7 date review in the preview
+
+`ui/preview_dialog.py` + `reconstruct_catalogue.file_date_summary`. The full-size
+preview now shows a provenance-aware date line instead of the first date-ish
+metadata field:
+
+  Recorded 2001-01-01 (questionable)   ·   Proposed 2004-12-25 (exact)
+
+"Recorded" is the camera's date with its Phase-6 intrinsic reliability;
+"Reconstructed" (Proposed/Confirmed) is the Phase-7 interpreted date/range with a
+display confidence label (confidence 'confirmed' shown as "exact" to avoid
+colliding with the review status word). A confirm/reject/reopen row lets the
+person review the reconstruction against the actual photo:
+  proposed -> [Confirm date] [Reject];  confirmed/rejected -> [Reopen].
+Decisions go through the revision- and evidence-bound guards (a stale proposal
+raises and the UI shows the "re-run reconstruction" reason).
+
+`file_date_summary` is intentionally cheap (per-file intrinsic assess + a single
+reconstruction-row read + a cheap content-stale check); it does NOT run the
+library-wide pass, so opening the preview stays fast. Full cross-photo/evidence
+staleness remains the job of `ppa reconcile` / `ppa reconstruct`.
+
+Tests: caption shows recorded+reconstructed; confirm→reopen flow via the preview.
+
+## Date Review UI 1.1 — UI freshness matches the backend
+
+The preview now consumes the FULL staleness model (content + evidence), so it
+tells the same truth as the persistence layer at the point of human review.
+
+- `file_date_summary` populates both `content_stale` and `evidence_stale` from
+  `evaluate_staleness`; the preview computes that map ONCE per open (skipped if
+  no reconstructions exist) and refreshes it after any action, so navigation
+  stays cheap while freshness stays correct.
+- The date line shows the stale reason: `Confirmed 2004-12-25 (exact) — STALE:
+  evidence changed` (photo changed / evidence changed / photo and evidence
+  changed). A stale confirmed row is never shown as plain "Date confirmed".
+- A stale PROPOSED row hides Confirm/Reject and offers **Refresh proposal**
+  (re-runs `store_reconstructions`); a stale decided row's button becomes
+  **Reopen & refresh**, which reopens AND recomputes so the user never reviews a
+  row that merely looks fresh. Backend guards remain as defence-in-depth.
+
+Tests: evidence-stale confirmed shows STALE; stale proposal offers Refresh not
+Confirm and becomes confirmable after refresh.

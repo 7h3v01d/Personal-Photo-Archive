@@ -111,6 +111,16 @@ def main(argv: list[str] | None = None) -> int:
         "reopen", help="Return a confirmed/rejected reconstruction to proposed")
     rc_reopen.add_argument("file_id")
 
+    pilot_parser = subparsers.add_parser(
+        "pilot", help="Read-only collection-level pilot analysis report")
+    pilot_sub = pilot_parser.add_subparsers(dest="pilot_command", required=True)
+    pilot_report = pilot_sub.add_parser("report", help="Analyse one library/subset")
+    pilot_report.add_argument("library_id", type=int, help="Library id to analyse")
+    pilot_report.add_argument("--directory", default=None,
+                              help="Relative directory prefix within the library")
+    pilot_report.add_argument("--json", dest="json_path", default=None,
+                              help="Write the structured report JSON to this path")
+
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -254,6 +264,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(changed)} photo(s) re-rated by independent calendar evidence.")
         print("(Read-only; no photo, observation, or stored date was modified.)")
         return 0
+
+    if args.command == "pilot":
+        from ppa.pilot import analyse_pilot, concise_text
+        if args.pilot_command == "report":
+            try:
+                report = analyse_pilot(conn, library_id=args.library_id,
+                                       directory_prefix=args.directory)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(concise_text(report))
+            if args.json_path:
+                Path(args.json_path).write_text(report.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        return 1
 
     if args.command == "reconstruct":
         from ppa import reconstruct_catalogue as rc

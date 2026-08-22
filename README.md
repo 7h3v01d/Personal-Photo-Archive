@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN. Phase 7.1.2 — reconstructions bound to revision AND an evidence fingerprint (schema v12): a confirmation goes stale if the bytes OR the evidence (e.g. a newer anchor) change. 240 tests, 0 xfails.**
+Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.1.2b FROZEN; Date Review UI 1.1 ACCEPTED. NEW: Phase 7.2.1 Pilot Analysis Report — read-only, traceable collection-level chronology reporting with deterministic JSON and high-leverage review opportunities.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls
@@ -76,6 +76,20 @@ treated as the photo's true capture date. Extraction is idempotent and
 hash-aware: a file is only re-read when its content changes, and stale
 observations are replaced rather than accumulated. The desktop app runs
 this automatically after each scan.
+
+## Pilot analysis report (Phase 7.2.1)
+
+```bash
+python -m ppa.cli pilot report 1
+python -m ppa.cli pilot report 1 --directory 2001-2006
+python -m ppa.cli pilot report 1 --json pilot-report.json
+```
+
+The pilot report is **read-only**. It aggregates the accepted date-reliability,
+sequence, independent-evidence, reconstruction and staleness layers without
+creating anchors, proposals, decisions or new chronology claims. Every aggregate
+contains the exact file IDs behind it, and JSON output is versioned as
+`ppa-pilot-report/1` for repeatable before/after pilot comparisons.
 
 ## Verify integrity (detect silent corruption)
 

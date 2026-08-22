@@ -339,6 +339,55 @@ def reject_reconstruction(conn: Connection, file_id: str, *, camera_floors=None)
     return _decide(conn, file_id, "rejected", camera_floors)
 
 
+@dataclass(frozen=True)
+class DateSummary:
+    """A file's date picture for display: what the camera recorded and how much to
+    trust it, plus any reconstruction (interpreted date) and its FULL review
+    freshness (both content and evidence staleness), so the review UI tells the
+    same truth as the persistence layer.
+
+    ``staleness`` may be supplied (a precomputed ``evaluate_staleness`` map) so a
+    caller paging through photos doesn't re-run the library-wide pass per file; if
+    omitted it is computed here."""
+    recorded: date | None
+    recorded_reliability: str          # TRUSTED/PROBABLY_VALID/QUESTIONABLE/…
+    reconstruction: StoredReconstruction | None
+
+
+def file_date_summary(conn: Connection, file_id: str, *,
+                      staleness: dict[str, tuple[bool, bool]] | None = None) -> DateSummary:
+    from datetime import timezone as _tz
+
+    from ppa.dating import DateObservation, assess
+
+    obs_rows = conn.execute(
+        "SELECT source, key, value FROM metadata_observations WHERE file_id = ? "
+        "AND file_revision_id = (SELECT current_revision_id FROM files WHERE id = ?)",
+        (file_id, file_id)).fetchall()
+    intrinsic = assess([DateObservation(o["source"], o["key"], o["value"])
+                        for o in obs_rows], now=datetime.now(_tz.utc))
+    recorded = intrinsic.candidate_date.date() if intrinsic.candidate_date else None
+
+    row = conn.execute(
+        "SELECT id, file_id, start_date, end_date, confidence, method, evidence, "
+        "status, created_at, decided_at, source_revision_id, engine_version, "
+        "updated_at, evidence_fingerprint FROM reconstructions WHERE file_id = ?",
+        (file_id,)).fetchone()
+    reconstruction = None
+    if row is not None:
+        if staleness is None:
+            staleness = evaluate_staleness(conn)
+        content_stale, evidence_stale = staleness.get(file_id, (True, True))
+        reconstruction = StoredReconstruction(
+            row["id"], row["file_id"], _parse_date(row["start_date"]),
+            _parse_date(row["end_date"]) if row["end_date"] else None,
+            row["confidence"], row["method"], row["evidence"], row["status"],
+            row["created_at"], row["decided_at"], row["source_revision_id"],
+            row["engine_version"], row["updated_at"], row["evidence_fingerprint"],
+            content_stale, evidence_stale)
+    return DateSummary(recorded, intrinsic.reliability.value, reconstruction)
+
+
 def reopen_reconstruction(conn: Connection, file_id: str) -> bool:
     """Return a confirmed/rejected reconstruction to 'proposed' so it can be
     revisited (e.g. after the bytes changed and the old decision went stale). The
