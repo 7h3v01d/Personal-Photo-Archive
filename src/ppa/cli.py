@@ -140,6 +140,13 @@ def main(argv: list[str] | None = None) -> int:
     pilot_explain.add_argument("file_id", help="Catalogued file id to explain")
     pilot_explain.add_argument("--json", dest="json_path", default=None,
                                help="Write structured evidence-trace JSON to this path")
+    pilot_unresolved = pilot_sub.add_parser(
+        "unresolved", help="Classify photos whose dates remain unresolved (read-only)")
+    pilot_unresolved.add_argument("library_id", type=int, help="Library id to analyse")
+    pilot_unresolved.add_argument("--directory", default=None,
+                                  help="Relative directory prefix within the library")
+    pilot_unresolved.add_argument("--json", dest="json_path", default=None,
+                                  help="Write structured unresolved-memory JSON to this path")
 
     args = parser.parse_args(argv)
 
@@ -335,6 +342,19 @@ def main(argv: list[str] | None = None) -> int:
             print(evidence_text(trace))
             if args.json_path:
                 Path(args.json_path).write_text(trace.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "unresolved":
+            from ppa.unresolved import build_unresolved_memories, concise_text as unresolved_text
+            try:
+                view = build_unresolved_memories(conn, library_id=args.library_id,
+                                                 directory_prefix=args.directory)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(unresolved_text(view))
+            if args.json_path:
+                Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
                 print(f"\nWrote {args.json_path}")
             return 0
         return 1

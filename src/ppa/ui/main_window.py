@@ -45,6 +45,7 @@ from ppa.ui.gpsmap import GpsMiniMap
 from ppa.ui.models import FILE_ID_ROLE, PhotoGridModel
 from ppa.ui.workers import (
     DateReviewQueueWorker,
+    UnresolvedMemoriesWorker,
     MetadataWorker,
     ScanWorker,
     ThumbnailWorker,
@@ -276,6 +277,10 @@ class MainWindow(QMainWindow):
         self._act_date_review = QAction("Date Review", self)
         self._act_date_review.triggered.connect(self._on_date_review)
         tb.addAction(self._act_date_review)
+
+        self._act_unresolved = QAction("Unresolved Memories", self)
+        self._act_unresolved.triggered.connect(self._on_unresolved_memories)
+        tb.addAction(self._act_unresolved)
 
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
@@ -544,6 +549,78 @@ class MainWindow(QMainWindow):
         self._warn(f"Date Review failed: {message}")
         self._status.showMessage("Date Review failed.")
 
+    def _on_unresolved_memories(self) -> None:
+        """Build the read-only unresolved-memory view off-thread."""
+        if self._busy:
+            return
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Unresolved Memories",
+                                    "Select or scan a library before browsing unresolved memories.")
+            return
+        self._set_busy(True)
+        self._status.showMessage("Unresolved Memories: analysing…")
+        progress = QProgressDialog("Analysing unresolved memories…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Unresolved Memories")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._unresolved_progress = progress
+        worker = UnresolvedMemoriesWorker(self._config.db_path, library_id)
+        self._unresolved_worker = worker
+        worker.progress.connect(self._on_unresolved_progress)
+        worker.finished.connect(self._on_unresolved_ready)
+        worker.failed.connect(self._on_unresolved_failed)
+        worker.cancelled.connect(self._on_unresolved_cancelled)
+        progress.canceled.connect(worker.cancel)
+        self._registry.start(worker)
+
+    def _on_unresolved_progress(self, message: str) -> None:
+        self._status.showMessage(message)
+        progress = getattr(self, "_unresolved_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
+
+    def _finish_unresolved_progress(self) -> None:
+        progress = getattr(self, "_unresolved_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater()
+            self._unresolved_progress = None
+        self._unresolved_worker = None
+        self._set_busy(False)
+
+    def _on_unresolved_ready(self, view) -> None:
+        from ppa.ui.preview_dialog import PreviewDialog
+        self._finish_unresolved_progress()
+        if not view.items:
+            self._status.showMessage("Unresolved Memories: nothing unresolved.")
+            QMessageBox.information(self, "Unresolved Memories",
+                                    "No unresolved date memories in this library.")
+            return
+        ids = [i.file_id for i in view.items]
+        model = PhotoGridModel()
+        model.set_items(catalogue.grid_items_for_files(self._conn, ids))
+        notes = {i.file_id: f"{i.label} · {i.reason}" for i in view.items}
+        dialog = PreviewDialog(self._conn, model, 0, self, review_notes=notes,
+                               window_title="Unresolved Memories")
+        dialog._queue_model = model
+        dialog.show()
+        summary = ", ".join(f"{c.count} {c.label.lower()}" for c in view.categories[:3])
+        self._status.showMessage(
+            f"Unresolved Memories — {view.unresolved_count} photo(s) intentionally unresolved"
+            + (f" · {summary}" if summary else ""))
+
+    def _on_unresolved_cancelled(self) -> None:
+        self._finish_unresolved_progress()
+        self._status.showMessage("Unresolved Memories cancelled.")
+
+    def _on_unresolved_failed(self, message: str) -> None:
+        self._finish_unresolved_progress()
+        self._warn(f"Unresolved Memories failed: {message}")
+        self._status.showMessage("Unresolved Memories failed.")
+
     # --- thumbnails ---------------------------------------------------------
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
@@ -552,7 +629,7 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
-                    self._act_extract, self._act_date_review, self._act_refresh):
+                    self._act_extract, self._act_date_review, self._act_unresolved, self._act_refresh):
             act.setEnabled(not busy)
 
     def _on_add_library(self) -> None:

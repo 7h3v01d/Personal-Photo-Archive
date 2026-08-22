@@ -146,6 +146,46 @@ class DateReviewQueueWorker(QObject):
                 conn.close()
 
 
+class UnresolvedMemoriesWorker(QObject):
+    """Build the Phase-7.2.6 unresolved-memory view off the GUI thread."""
+
+    progress = Signal(str)
+    finished = Signal(object)  # UnresolvedMemories
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._library_id = library_id
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.pilot import PilotAnalysisCancelled
+            from ppa.unresolved import build_unresolved_memories
+            conn = connect(self._db_path)
+            view = build_unresolved_memories(
+                conn, library_id=self._library_id,
+                progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(view)
+        except PilotAnalysisCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 class EvidenceTraceWorker(QObject):
     """Build one Phase-7 evidence trace off the GUI thread."""
 

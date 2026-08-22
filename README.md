@@ -236,3 +236,7 @@ clock-reset run. PPA shows distributed visual spot-checks, requires explicit hum
 acknowledgement, then revalidates the complete revision/evidence-bound plan and
 confirms every member atomically. Stale, partial, ambiguous, range/bracket, or mixed-
 decision runs fail closed. See `docs/PHASE7_2_5_CONTROLLED_BATCH_CONFIRMATION.md`.
+
+### Phase 7.2.6 — Unresolved Memories
+
+The desktop **Unresolved Memories** action and `ppa pilot unresolved` classify photos PPA cannot responsibly date into explicit, traceable categories rather than fabricating precision. Classification is read-only and runs off the GUI thread. See `docs/PHASE7_2_6_UNRESOLVED_MEMORIES.md`.
