@@ -93,6 +93,21 @@ def main(argv: list[str] | None = None) -> int:
                             "this for directory anchors so removal can clean them)")
     anchor_sub.add_parser("list", help="List anchors")
 
+    rc_parser = subparsers.add_parser(
+        "reconstruct",
+        help="Historical date reconstruction: propose/confirm/reject interpreted "
+             "capture dates (never overwrites the recorded date)")
+    rc_sub = rc_parser.add_subparsers(dest="reconstruct_command", required=True)
+    rc_run = rc_sub.add_parser("run", help="Compute and store reconstruction proposals")
+    rc_run.add_argument("--floors", default=None, help="Camera manufacture-floor JSON")
+    rc_list = rc_sub.add_parser("list", help="List stored reconstructions")
+    rc_list.add_argument("--status", default=None,
+                         choices=["proposed", "confirmed", "rejected"])
+    rc_confirm = rc_sub.add_parser("confirm", help="Confirm a file's reconstruction")
+    rc_confirm.add_argument("file_id")
+    rc_reject = rc_sub.add_parser("reject", help="Reject a file's reconstruction")
+    rc_reject.add_argument("file_id")
+
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -236,6 +251,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(changed)} photo(s) re-rated by independent calendar evidence.")
         print("(Read-only; no photo, observation, or stored date was modified.)")
         return 0
+
+    if args.command == "reconstruct":
+        from ppa import reconstruct_catalogue as rc
+        if args.reconstruct_command == "run":
+            from ppa.camera_floors import CameraFloors
+            floors = CameraFloors.load(args.floors) if args.floors else None
+            counts = rc.store_reconstructions(conn, camera_floors=floors)
+            print(f"Reconstruction proposals: {counts['proposed']} written, "
+                  f"{counts['skipped_decided']} left as decided, "
+                  f"{counts['cleared']} stale cleared.")
+            print("(Interpretation only; the recorded date and observations are "
+                  "unchanged.)")
+            return 0
+        if args.reconstruct_command == "list":
+            rows = rc.list_reconstructions(conn, status=args.status)
+            for r in rows:
+                span = r.start_date if r.end_date is None else f"{r.start_date}…{r.end_date}"
+                print(f"  {r.status:9} {r.confidence:9} {span:23} {r.method:12} "
+                      f"{r.file_id[:12]}  {r.evidence or ''}")
+            print(f"\n{len(rows)} reconstruction(s).")
+            return 0
+        if args.reconstruct_command == "confirm":
+            ok = rc.confirm_reconstruction(conn, args.file_id)
+            print("Confirmed." if ok else "No reconstruction for that file.")
+            return 0 if ok else 1
+        if args.reconstruct_command == "reject":
+            ok = rc.reject_reconstruction(conn, args.file_id)
+            print("Rejected." if ok else "No reconstruction for that file.")
+            return 0 if ok else 1
+        return 1
 
     return 1
 

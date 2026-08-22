@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.0.1 engine. Anchor ownership fail-closed (schema v9): ownership mandatory & verified; unowned anchors never resolve; deterministic legacy backfill. 216 tests, 0 xfails.**
+Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN. Phase 7.1 — historical date reconstruction PERSISTED: reconstructions table (schema v10), `ppa reconstruct run/list/confirm/reject`, sticky human decisions, never overwrites recorded dates. 224 tests, 0 xfails.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls

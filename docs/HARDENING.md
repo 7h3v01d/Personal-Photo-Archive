@@ -514,3 +514,24 @@ Closes the remaining gap: with ownership added, a NULL owner must NOT mean
 
 Tests: unowned-directory rejected, nonexistent-file rejected, nonexistent-library
 rejected, legacy NULL-owner directory anchor not applied, and the 009 backfill.
+
+## Phase 7.1 — reconstruction persistence & confirm/reject flow
+
+`reconstructions` table (migration 010, schema v10) + `reconstruct_catalogue.py`.
+Runs the pure Phase 7 engine against the catalogue, stores proposals, and lets a
+human confirm/reject them into authoritative interpretations.
+
+- **Separate interpretation layer.** Reconstruction writes ONLY to its own table;
+  it never touches observations or the recorded date (verified read-only).
+- **Sticky decisions.** `store_reconstructions` refreshes only 'proposed' rows;
+  'confirmed'/'rejected' are never overwritten on re-run (`ON CONFLICT … WHERE
+  status='proposed'`, plus a pre-scan of decided file_ids). Stale proposals for
+  files that no longer reconstruct are cleared; decisions are kept.
+- **One current reconstruction per file** (`UNIQUE(file_id)`); `ON DELETE CASCADE`
+  so forgetting a library cleans its reconstructions too.
+- **CLI:** `ppa reconstruct run [--floors f.json]`, `list [--status S]`,
+  `confirm <file_id>`, `reject <file_id>`.
+
+Reuses Phase 6 evidence gathering and the fail-closed anchor ownership rules.
+Tests: `tests/test_reconstruct_catalogue.py` (7) — table, offset-run proposals,
+sticky decisions, read-only, status filter, cascade-on-forget.
