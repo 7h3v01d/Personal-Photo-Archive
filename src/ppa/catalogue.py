@@ -284,6 +284,27 @@ def grid_items(conn: Connection, view: str = VIEW_ALL, limit: int | None = None)
     return [_grid_item(r) for r in conn.execute(sql).fetchall()]
 
 
+def grid_items_for_files(conn: Connection, file_ids: list[str] | tuple[str, ...]) -> list[GridItem]:
+    """Return present GridItems in the caller-supplied file-id order.
+
+    Read-only helper for workflow views such as the date-review queue. Unknown or
+    non-present ids are omitted; no broad catalogue query can leak extra files.
+    """
+    if not file_ids:
+        return []
+    wanted = list(dict.fromkeys(file_ids))
+    marks = ",".join("?" for _ in wanted)
+    rows = conn.execute(
+        "WITH counts AS (SELECT photo_id, COUNT(*) AS c FROM files GROUP BY photo_id) "
+        "SELECT f.*, counts.c AS copy_count FROM files f "
+        "JOIN counts ON counts.photo_id=f.photo_id "
+        f"WHERE f.presence_status='present' AND f.id IN ({marks})",
+        wanted,
+    ).fetchall()
+    by_id = {r["id"]: _grid_item(r) for r in rows}
+    return [by_id[fid] for fid in wanted if fid in by_id]
+
+
 def file_detail(conn: Connection, file_id: str) -> FileDetail | None:
     row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
     if row is None:

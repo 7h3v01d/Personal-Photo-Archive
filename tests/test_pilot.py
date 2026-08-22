@@ -111,3 +111,22 @@ def test_json_is_stable_except_generated_at(tmp_path):
 def test_unknown_library_fails_closed(tmp_path):
     conn=connect(tmp_path/"c.sqlite3")
     with pytest.raises(ValueError): analyse_pilot(conn,library_id=999)
+
+
+def test_pilot_progress_hooks_report_stages(tmp_path):
+    conn,_,lid=_library(tmp_path,n=2)
+    seen=[]
+    analyse_pilot(conn,library_id=lid,generated_at="fixed",progress_cb=seen.append)
+    assert seen[0].startswith("Date Review:")
+    assert any("chronology" in s.lower() for s in seen)
+    assert any("reconstruction freshness" in s.lower() for s in seen)
+    assert any("metadata quality" in s.lower() for s in seen)
+
+
+def test_pilot_cancellation_fails_without_writes(tmp_path):
+    from ppa.pilot import PilotAnalysisCancelled
+    conn,_,lid=_library(tmp_path,n=2)
+    before=conn.total_changes
+    with pytest.raises(PilotAnalysisCancelled):
+        analyse_pilot(conn,library_id=lid,generated_at="fixed",cancel_cb=lambda: True)
+    assert conn.total_changes==before

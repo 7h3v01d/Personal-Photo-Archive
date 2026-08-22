@@ -17,8 +17,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QImageReader, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
+    QGridLayout,
     QHBoxLayout,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressDialog,
     QLabel,
     QPushButton,
     QSizePolicy,
@@ -27,6 +32,9 @@ from PySide6.QtWidgets import (
 
 from ppa import catalogue
 from ppa.ui import theme
+from ppa.ui.workers import (
+    BatchConfirmWorker, BatchPlanWorker, BatchSamplesWorker, EvidenceTraceWorker, WorkerRegistry,
+)
 
 # Keep a few recently-viewed decoded images so navigation is instant without
 # holding the whole library in memory.
@@ -95,7 +103,9 @@ def _caption(detail: catalogue.FileDetail, date_line: str) -> str:
 class PreviewDialog(QDialog):
     """Full-size viewer over the current grid contents, starting at ``start_row``."""
 
-    def __init__(self, conn, model, start_row: int, parent=None) -> None:
+    def __init__(self, conn, model, start_row: int, parent=None, *,
+                 review_notes: dict[str, str] | None = None,
+                 window_title: str = "Preview") -> None:
         super().__init__(parent)
         self._conn = conn
         self._model = model
@@ -105,8 +115,13 @@ class PreviewDialog(QDialog):
         self._cache: "OrderedDict[str, QPixmap]" = OrderedDict()
         self._load_token = 0
         self._staleness = self._compute_staleness()
+        self._review_notes = review_notes or {}
+        self._window_title = window_title
+        self._workers = WorkerRegistry()
+        dbrow = conn.execute("PRAGMA database_list").fetchone()
+        self._db_path = Path(dbrow["file"] if hasattr(dbrow, "keys") else dbrow[2])
 
-        self.setWindowTitle("Preview")
+        self.setWindowTitle(window_title)
         self.setModal(False)
         # Open at a comfortable fraction of the screen.
         screen = QGuiApplication.primaryScreen()
@@ -131,6 +146,13 @@ class PreviewDialog(QDialog):
         self._image.setMinimumSize(1, 1)
         root.addWidget(self._image, 1)
 
+        self._queue_note = QLabel("")
+        self._queue_note.setWordWrap(True)
+        self._queue_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._queue_note.setStyleSheet(f"color: {theme.AMBER}; padding: 6px 12px;")
+        self._queue_note.hide()
+        root.addWidget(self._queue_note)
+
         # Review row — confirm/reject/reopen the reconstruction for this photo.
         review = QHBoxLayout()
         review.setContentsMargins(10, 8, 10, 0)
@@ -146,7 +168,14 @@ class PreviewDialog(QDialog):
         self._reopen_btn.clicked.connect(self._reopen)
         self._refresh_btn = QPushButton("Refresh proposal")
         self._refresh_btn.clicked.connect(self._refresh)
-        for b in (self._confirm_btn, self._reject_btn, self._reopen_btn, self._refresh_btn):
+        self._why_btn = QPushButton("Why?")
+        self._why_btn.setToolTip("Inspect the evidence and reasoning behind this date")
+        self._why_btn.clicked.connect(self._show_why)
+        self._batch_btn = QPushButton("Review batch…")
+        self._batch_btn.setToolTip("Review a strictly eligible reconstructed reset run as one batch")
+        self._batch_btn.clicked.connect(self._prepare_batch)
+        for b in (self._confirm_btn, self._reject_btn, self._reopen_btn, self._refresh_btn,
+                  self._why_btn, self._batch_btn):
             review.addWidget(b)
         review.addStretch(1)
         root.addLayout(review)
@@ -207,7 +236,7 @@ class PreviewDialog(QDialog):
         rec = summary.reconstruction
         if rec is None:
             for b in (self._confirm_btn, self._reject_btn, self._reopen_btn,
-                      self._refresh_btn):
+                      self._refresh_btn, self._batch_btn):
                 b.setVisible(False)
             self._review_status.setText("")
             return
@@ -224,6 +253,9 @@ class PreviewDialog(QDialog):
         self._refresh_btn.setVisible(proposed and stale)
         self._reopen_btn.setVisible(decided)
         self._reopen_btn.setText("Reopen && refresh" if (decided and stale) else "Reopen")
+        # Batch planning is itself strict and revalidates everything. Showing the
+        # entry point only on fresh offset proposals keeps ordinary review uncluttered.
+        self._batch_btn.setVisible(proposed and not stale and rec.method == "offset")
 
         if proposed and stale:
             self._review_status.setText(f"Proposed but STALE ({reason}) — refresh to review:")
@@ -269,6 +301,157 @@ class PreviewDialog(QDialog):
             store_reconstructions(self._conn)
             self._after_action()
 
+    def _prepare_batch(self) -> None:
+        fid = self._current_file_id()
+        if fid is None:
+            return
+        progress = QProgressDialog("Checking batch eligibility…", "", 0, 0, self)
+        progress.setWindowTitle("Controlled batch review")
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._batch_progress = progress
+        worker = BatchPlanWorker(self._db_path, fid)
+        worker.finished.connect(self._on_batch_plan_ready)
+        worker.failed.connect(self._on_batch_failed)
+        self._workers.start(worker)
+
+    def _finish_batch_progress(self) -> None:
+        progress = getattr(self, "_batch_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater(); self._batch_progress = None
+
+    def _on_batch_plan_ready(self, plan) -> None:
+        self._finish_batch_progress()
+        if plan is None:
+            QMessageBox.information(
+                self, "Controlled batch review",
+                "This reconstruction is not currently eligible for batch confirmation. "
+                "Batch review requires a complete fresh point-date run, strong single-device "
+                "identity, and one exact human-anchor basis.")
+            return
+        progress = QProgressDialog("Preparing visual samples…", "", 0, 0, self)
+        progress.setWindowTitle("Controlled batch review")
+        progress.setCancelButton(None); progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._batch_progress = progress
+        worker = BatchSamplesWorker(self._db_path, plan)
+        worker.finished.connect(lambda images, p=plan: self._on_batch_samples_ready(p, images))
+        worker.failed.connect(self._on_batch_failed)
+        self._workers.start(worker)
+
+    def _on_batch_samples_ready(self, plan, images) -> None:
+        self._finish_batch_progress()
+        self._show_batch_samples(plan, dict(images))
+
+    def _show_batch_samples(self, plan, images) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Controlled batch review — {plan.member_count} photos")
+        dialog.resize(1050, 650)
+        root = QVBoxLayout(dialog)
+        intro = QLabel(
+            f"Review these distributed samples before confirming all {plan.member_count} photos.\n"
+            f"Clock offset: {plan.day_offset:+d} days.  No source photo or EXIF will be changed.\n"
+            f"{plan.reason}")
+        intro.setWordWrap(True); root.addWidget(intro)
+        grid = QGridLayout(); root.addLayout(grid, 1)
+        by_id = {m.file_id: m for m in plan.members}
+        for col, fid in enumerate(plan.sample_file_ids):
+            m = by_id[fid]
+            card = QVBoxLayout()
+            image = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
+            image.setMinimumSize(170, 130); image.setStyleSheet(f"background: {theme.OBSIDIAN};")
+            qimg = images.get(fid)
+            if qimg is not None and not qimg.isNull():
+                image.setPixmap(QPixmap.fromImage(qimg))
+            else:
+                image.setText("Unavailable / unreadable")
+            text = QLabel(f"{m.filename}\n→ {m.start_date}\n{m.method} / {m.confidence}")
+            text.setAlignment(Qt.AlignmentFlag.AlignCenter); text.setWordWrap(True)
+            card.addWidget(image); card.addWidget(text)
+            holder = QVBoxLayout(); holder.addLayout(card)
+            grid.addLayout(holder, 0, col)
+        ack = QCheckBox(
+            f"I reviewed the distributed samples and want to confirm all {plan.member_count} proposed dates.")
+        root.addWidget(ack)
+        row = QHBoxLayout(); row.addStretch(1)
+        cancel = QPushButton("Cancel"); confirm = QPushButton(f"Confirm all {plan.member_count}")
+        confirm.setEnabled(False); ack.toggled.connect(confirm.setEnabled)
+        cancel.clicked.connect(dialog.reject); confirm.clicked.connect(dialog.accept)
+        row.addWidget(cancel); row.addWidget(confirm); root.addLayout(row)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._commit_batch(plan)
+
+    def _commit_batch(self, plan) -> None:
+        progress = QProgressDialog("Revalidating and confirming batch…", "", 0, 0, self)
+        progress.setWindowTitle("Controlled batch confirmation")
+        progress.setCancelButton(None); progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._batch_progress = progress
+        worker = BatchConfirmWorker(self._db_path, plan)
+        worker.finished.connect(self._on_batch_confirmed)
+        worker.failed.connect(self._on_batch_failed)
+        self._workers.start(worker)
+
+    def _on_batch_confirmed(self, count: int) -> None:
+        self._finish_batch_progress()
+        QMessageBox.information(self, "Batch confirmed",
+                                f"Confirmed {count} reconstruction(s). Each decision remains "
+                                "individually provenance-bound to its reviewed bytes and evidence.")
+        self._after_action()
+
+    def _on_batch_failed(self, message: str) -> None:
+        self._finish_batch_progress()
+        QMessageBox.warning(self, "Controlled batch review", message)
+        self._after_action()
+
+    def _show_why(self) -> None:
+        fid = self._current_file_id()
+        if fid is None:
+            return
+        progress = QProgressDialog("Building evidence trace…", "", 0, 0, self)
+        progress.setWindowTitle("Why this date?")
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._why_progress = progress
+
+        worker = EvidenceTraceWorker(self._db_path, fid)
+        worker.progress.connect(progress.setLabelText)
+        worker.finished.connect(self._on_why_ready)
+        worker.failed.connect(self._on_why_failed)
+        self._workers.start(worker)
+
+    def _finish_why_progress(self) -> None:
+        progress = getattr(self, "_why_progress", None)
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+            self._why_progress = None
+
+    def _on_why_ready(self, trace) -> None:
+        from ppa.evidence_inspector import concise_text
+        self._finish_why_progress()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Why this date? — {trace.filename}")
+        dialog.resize(780, 650)
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(concise_text(trace))
+        layout.addWidget(text, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        row = QHBoxLayout(); row.addStretch(1); row.addWidget(close)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def _on_why_failed(self, message: str) -> None:
+        self._finish_why_progress()
+        QMessageBox.warning(self, "Evidence Inspector", f"Could not build evidence trace: {message}")
+
     # --- loading ------------------------------------------------------------
     def _load(self) -> None:
         if not self._ids:
@@ -278,7 +461,11 @@ class PreviewDialog(QDialog):
         self._prev.setEnabled(self._pos > 0)
         self._next.setEnabled(self._pos < len(self._ids) - 1)
 
-        detail = catalogue.file_detail(self._conn, self._ids[self._pos])
+        fid = self._ids[self._pos]
+        note = self._review_notes.get(fid, "")
+        self._queue_note.setText(note)
+        self._queue_note.setVisible(bool(note))
+        detail = catalogue.file_detail(self._conn, fid)
         counter = f"{self._pos + 1} / {len(self._ids)}"
         if detail is None:
             self._original = None
@@ -287,7 +474,7 @@ class PreviewDialog(QDialog):
             self._caption.setText(counter)
             return
 
-        self.setWindowTitle(f"Preview — {detail.filename}")
+        self.setWindowTitle(f"{self._window_title} — {detail.filename}")
         summary = self._summary(detail.file_id)
         self._caption.setText(f"{_caption(detail, _date_line(summary))}"
                               f"      ({counter})")
@@ -363,6 +550,14 @@ class PreviewDialog(QDialog):
             target, Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
 
+    def closeEvent(self, event) -> None:
+        self._workers.shutdown()
+        super().closeEvent(event)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._rescale()
+
+
+# Evidence-inspector workers are owned by each PreviewDialog and are shut down
+# with the dialog; source-photo decoding remains read-only.

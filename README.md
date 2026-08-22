@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.1.2b FROZEN; Date Review UI 1.1 ACCEPTED. NEW: Phase 7.2.1 Pilot Analysis Report — read-only, traceable collection-level chronology reporting with deterministic JSON and high-leverage review opportunities.**
+Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.1.2b FROZEN; Date Review UI 1.1 ACCEPTED. Phase 7.2.1 Pilot Analysis, 7.2.2a responsive Prioritised Date Review Queue, 7.2.3 Anchor Opportunities, and 7.2.4 Evidence Inspector implemented.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls
@@ -90,6 +90,29 @@ sequence, independent-evidence, reconstruction and staleness layers without
 creating anchors, proposals, decisions or new chronology claims. Every aggregate
 contains the exact file IDs behind it, and JSON output is versioned as
 `ppa-pilot-report/1` for repeatable before/after pilot comparisons.
+
+## Prioritised date review queue (Phase 7.2.2)
+
+```bash
+python -m ppa.cli pilot queue 1
+python -m ppa.cli pilot queue 1 --directory 2001-2006
+python -m ppa.cli pilot queue 1 --json date-review-queue.json
+python -m ppa.cli pilot queue 1 --all
+```
+
+The queue is also available from **Date Review** in the desktop toolbar. It is a
+read-only prioritisation layer: Priority A/B/C items are presented in deterministic
+order with an explicit reason, while all confirm/reject/reopen/refresh actions still
+go through the hardened Phase-7 persistence API. Priority D files are omitted from
+the normal interactive queue so low-information photos do not bury useful review
+work. Queue JSON is versioned as `ppa-date-review-queue/1`.
+
+On a real library the chronology/evidence/freshness pass can be substantial. Desktop
+queue construction therefore runs on a dedicated worker with its own SQLite
+connection; an indeterminate progress dialog and status messages keep the UI live,
+and cancellation is checked cooperatively throughout the reporting pass. The pilot
+metadata-quality summary uses one library-scoped observation query rather than a
+per-photo SQL loop.
 
 ## Verify integrity (detect silent corruption)
 
@@ -182,3 +205,34 @@ knowable until the whole tree has been walked. Pass 1 inventories and
 hashes; Pass 2 reconciles. Every path change is written to
 `file_path_history` and every notable transition to `integrity_events`,
 so nothing is silently overwritten.
+
+### Phase 7.2.3 — Anchor opportunities
+
+PPA can now rank the highest-value human date question in a library or historical subset. The planner is deterministic/read-only and only uses strong-device reset groups where one exact human clue could constrain other unresolved frames.
+
+```text
+python -m ppa.cli pilot questions 1
+python -m ppa.cli pilot questions 1 --json anchor-opportunities.json
+```
+
+The desktop **Date Review** workflow uses the same ranking and labels the leading high-leverage frame as **Best date question**, including how many other photographs the answer could help.
+
+
+### Phase 7.2.4 — Evidence Inspector
+
+Date Review now has a **Why?** action that builds a read-only, structured trace of the current Phase-6/7 reasoning on a background worker: recorded timestamp, reliability reasons, chronology findings, independent anchors/GPS evidence, reset-run/device basis, reconstruction method, derivation, and stale state.
+
+```text
+python -m ppa.cli pilot explain <file-id>
+python -m ppa.cli pilot explain <file-id> --json evidence.json
+```
+
+See `docs/PHASE7_2_4_EVIDENCE_INSPECTOR.md`.
+
+### Phase 7.2.5 — controlled batch confirmation
+
+Date Review can now offer **Review batch…** for a strictly eligible strong-device
+clock-reset run. PPA shows distributed visual spot-checks, requires explicit human
+acknowledgement, then revalidates the complete revision/evidence-bound plan and
+confirms every member atomically. Stale, partial, ambiguous, range/bracket, or mixed-
+decision runs fail closed. See `docs/PHASE7_2_5_CONTROLLED_BATCH_CONFIRMATION.md`.

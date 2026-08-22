@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -43,6 +44,7 @@ from ppa.ui.delegate import PhotoTileDelegate
 from ppa.ui.gpsmap import GpsMiniMap
 from ppa.ui.models import FILE_ID_ROLE, PhotoGridModel
 from ppa.ui.workers import (
+    DateReviewQueueWorker,
     MetadataWorker,
     ScanWorker,
     ThumbnailWorker,
@@ -271,6 +273,10 @@ class MainWindow(QMainWindow):
         self._act_extract.triggered.connect(lambda: self._start_metadata(auto=False))
         tb.addAction(self._act_extract)
 
+        self._act_date_review = QAction("Date Review", self)
+        self._act_date_review.triggered.connect(self._on_date_review)
+        tb.addAction(self._act_date_review)
+
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
         tb.addAction(self._act_refresh)
@@ -436,6 +442,108 @@ class MainWindow(QMainWindow):
         dialog = PreviewDialog(self._conn, self._model, index.row(), self)
         dialog.show()
 
+    def _current_library_id(self) -> int | None:
+        libs = catalogue.list_libraries(self._conn)
+        if not libs:
+            return None
+        if self._current_library is not None:
+            try:
+                wanted = str(self._current_library.resolve())
+            except OSError:
+                wanted = str(self._current_library)
+            for lib in libs:
+                if lib.canonical_path == wanted or lib.display_path == str(self._current_library):
+                    return lib.id
+        return libs[0].id if len(libs) == 1 else None
+
+    def _on_date_review(self) -> None:
+        """Build the Phase-7 review queue off-thread, then open the safe viewer.
+
+        Real libraries can require a full chronology/reconciliation/freshness pass;
+        none of that is allowed to block Qt's GUI event loop.
+        """
+        if self._busy:
+            return
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Date Review",
+                                    "Select or scan a library before starting date review.")
+            return
+
+        self._set_busy(True)
+        self._status.showMessage("Date Review: preparing analysis…")
+        progress = QProgressDialog("Preparing Date Review…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Date Review")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._date_review_progress = progress
+
+        worker = DateReviewQueueWorker(self._config.db_path, library_id)
+        self._date_review_worker = worker
+        worker.progress.connect(self._on_date_review_progress)
+        worker.finished.connect(self._on_date_review_ready)
+        worker.failed.connect(self._on_date_review_failed)
+        worker.cancelled.connect(self._on_date_review_cancelled)
+        progress.canceled.connect(worker.cancel)
+        self._registry.start(worker)
+
+    def _on_date_review_progress(self, message: str) -> None:
+        self._status.showMessage(message)
+        progress = getattr(self, "_date_review_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
+
+    def _finish_date_review_progress(self) -> None:
+        progress = getattr(self, "_date_review_progress", None)
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+            self._date_review_progress = None
+        self._date_review_worker = None
+        self._set_busy(False)
+
+    def _on_date_review_ready(self, queue) -> None:
+        from ppa.ui.preview_dialog import PreviewDialog
+
+        self._finish_date_review_progress()
+        items = queue.actionable()
+        if not items:
+            self._status.showMessage("Date Review: no actionable items.")
+            QMessageBox.information(self, "Date Review",
+                                    "No actionable date-review items in this library.")
+            return
+        ids = [i.file_id for i in items]
+        qmodel = PhotoGridModel()
+        qmodel.set_items(catalogue.grid_items_for_files(self._conn, ids))
+        notes = {}
+        for i in items:
+            prefix = "Best date question" if i.action == "HIGH_LEVERAGE_ANCHOR" else f"Priority {i.priority}"
+            leverage = f" · could help {i.affected_count} other photo(s)" if i.affected_count else ""
+            notes[i.file_id] = f"{prefix}{leverage} · {i.reason}"
+        dialog = PreviewDialog(self._conn, qmodel, 0, self, review_notes=notes,
+                               window_title="Date Review")
+        dialog._queue_model = qmodel
+        dialog.show()
+        best = items[0]
+        if best.action == "HIGH_LEVERAGE_ANCHOR":
+            self._status.showMessage(
+                f"Date Review ready — best question could help {best.affected_count} other photo(s).")
+        else:
+            self._status.showMessage(
+                f"Date Review ready — {len(items)} actionable item(s) prioritised.")
+
+    def _on_date_review_cancelled(self) -> None:
+        self._finish_date_review_progress()
+        self._status.showMessage("Date Review cancelled.")
+
+    def _on_date_review_failed(self, message: str) -> None:
+        self._finish_date_review_progress()
+        self._warn(f"Date Review failed: {message}")
+        self._status.showMessage("Date Review failed.")
+
     # --- thumbnails ---------------------------------------------------------
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
@@ -444,7 +552,7 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
-                    self._act_extract, self._act_refresh):
+                    self._act_extract, self._act_date_review, self._act_refresh):
             act.setEnabled(not busy)
 
     def _on_add_library(self) -> None:

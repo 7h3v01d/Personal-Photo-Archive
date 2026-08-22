@@ -15,13 +15,25 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from sqlite3 import Connection
-from typing import Collection
+from typing import Callable, Collection
 
 from ppa.chronology import _is_strong_serial, analyse_library as analyse_chronology
 from ppa.reconcile import EvidenceEffect, analyse_library_reconciled
 from ppa.reconstruct_catalogue import list_reconstructions
 
 REPORT_SCHEMA = "ppa-pilot-report/1"
+
+
+class PilotAnalysisCancelled(RuntimeError):
+    """Raised when a caller cancels a long-running read-only pilot analysis."""
+
+
+def _checkpoint(progress_cb: Callable[[str], None] | None,
+                cancel_cb: Callable[[], bool] | None, message: str) -> None:
+    if cancel_cb is not None and cancel_cb():
+        raise PilotAnalysisCancelled()
+    if progress_cb is not None:
+        progress_cb(message)
 
 
 @dataclass(frozen=True)
@@ -161,14 +173,26 @@ def analyse_pilot(conn: Connection, *, library_id: int,
                   directory_prefix: str | None = None,
                   file_ids: Collection[str] | None = None,
                   camera_floors=None,
-                  generated_at: str | None = None) -> PilotReport:
-    """Build a deterministic, read-only analysis report for one pilot scope."""
+                  generated_at: str | None = None,
+                  progress_cb: Callable[[str], None] | None = None,
+                  cancel_cb: Callable[[], bool] | None = None) -> PilotReport:
+    """Build a deterministic, read-only analysis report for one pilot scope.
+
+    ``progress_cb``/``cancel_cb`` are optional workflow hooks only; they do not
+    alter analysis semantics or persistence.  They let the desktop UI keep a
+    large real-library analysis visible and cancellable while it runs off-thread.
+    """
+    _checkpoint(progress_cb, cancel_cb, "Date Review: selecting library scope…")
     selected, scope = _scope_ids(conn, library_id, directory_prefix, file_ids)
 
     # Accepted engines only; no persistence calls.
+    _checkpoint(progress_cb, cancel_cb, "Date Review: analysing chronology…")
     findings, chron = analyse_chronology(conn)
+    _checkpoint(progress_cb, cancel_cb, "Date Review: reconciling date evidence…")
     _, final = analyse_library_reconciled(conn, camera_floors=camera_floors)
+    _checkpoint(progress_cb, cancel_cb, "Date Review: checking reconstruction freshness…")
     stored = {r.file_id: r for r in list_reconstructions(conn, camera_floors=camera_floors)}
+    _checkpoint(progress_cb, cancel_cb, "Date Review: assembling report…")
 
     rows = conn.execute(
         "SELECT f.id, f.photo_id, f.filename, f.relative_path, f.camera_id, "
@@ -294,13 +318,26 @@ def analyse_pilot(conn: Connection, *, library_id: int,
                     f"up to {len(affected)} other unresolved frame(s).",
                     "A" if len(affected) >= 10 else "B"))
 
-    # Metadata-quality counts from current observations.
+    # Metadata-quality counts from current observations. Fetch once for the
+    # selected library rather than issuing one SQL query per photo (critical on
+    # real 10k+ collections).
+    _checkpoint(progress_cb, cancel_cb, "Date Review: summarising metadata quality…")
     meta_ids: dict[str, list[str]] = defaultdict(list)
-    for fid in sorted(selected):
-        obs = conn.execute(
-            "SELECT source,key,value FROM metadata_observations WHERE file_id=? AND "
-            "file_revision_id=(SELECT current_revision_id FROM files WHERE id=?)",
-            (fid, fid)).fetchall()
+    obs_by_file: dict[str, list] = defaultdict(list)
+    if selected:
+        for o in conn.execute(
+            "SELECT m.file_id, m.source, m.key, m.value "
+            "FROM metadata_observations m "
+            "JOIN files f ON f.id=m.file_id AND f.current_revision_id=m.file_revision_id "
+            "WHERE f.library_id=? AND f.presence_status='present'",
+            (library_id,),
+        ).fetchall():
+            if o["file_id"] in selected:
+                obs_by_file[o["file_id"]].append(o)
+    for n, fid in enumerate(sorted(selected)):
+        if n % 250 == 0 and cancel_cb is not None and cancel_cb():
+            raise PilotAnalysisCancelled()
+        obs = obs_by_file.get(fid, ())
         pairs = {(o["source"], o["key"]): o["value"] for o in obs}
         if ("exif", "DateTimeOriginal") not in pairs:
             meta_ids["NO_DATETIMEORIGINAL"].append(fid)
@@ -310,8 +347,6 @@ def analyse_pilot(conn: Connection, *, library_id: int,
             meta_ids["MODEL_ONLY_CAMERA_IDENTITY"].append(fid)
         if ("exif-gps", "GPSDateStamp") in pairs:
             meta_ids["GPS_AVAILABLE"].append(fid)
-        # malformed DateTimeOriginal is reflected by Slice 1 as questionable, but
-        # preserve a direct audit category here using the raw parser result.
         if ("exif", "DateTimeOriginal") in pairs:
             from ppa.dating import DateObservation, assess
             a = assess([DateObservation("exif", "DateTimeOriginal", pairs[("exif", "DateTimeOriginal")])])

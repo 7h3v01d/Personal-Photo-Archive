@@ -120,6 +120,26 @@ def main(argv: list[str] | None = None) -> int:
                               help="Relative directory prefix within the library")
     pilot_report.add_argument("--json", dest="json_path", default=None,
                               help="Write the structured report JSON to this path")
+    pilot_queue = pilot_sub.add_parser("queue", help="Build prioritised date-review queue")
+    pilot_queue.add_argument("library_id", type=int, help="Library id to review")
+    pilot_queue.add_argument("--directory", default=None,
+                             help="Relative directory prefix within the library")
+    pilot_queue.add_argument("--all", action="store_true",
+                             help="Include Priority D / currently non-actionable files")
+    pilot_queue.add_argument("--json", dest="json_path", default=None,
+                             help="Write the structured queue JSON to this path")
+    pilot_questions = pilot_sub.add_parser(
+        "questions", help="Rank high-leverage human date questions")
+    pilot_questions.add_argument("library_id", type=int, help="Library id to analyse")
+    pilot_questions.add_argument("--directory", default=None,
+                                 help="Relative directory prefix within the library")
+    pilot_questions.add_argument("--json", dest="json_path", default=None,
+                                 help="Write structured opportunities JSON to this path")
+    pilot_explain = pilot_sub.add_parser(
+        "explain", help="Explain the Phase-6/7 date evidence for one file (read-only)")
+    pilot_explain.add_argument("file_id", help="Catalogued file id to explain")
+    pilot_explain.add_argument("--json", dest="json_path", default=None,
+                               help="Write structured evidence-trace JSON to this path")
 
     args = parser.parse_args(argv)
 
@@ -277,6 +297,44 @@ def main(argv: list[str] | None = None) -> int:
             print(concise_text(report))
             if args.json_path:
                 Path(args.json_path).write_text(report.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "queue":
+            from ppa.review_queue import build_review_queue, concise_text as queue_text
+            try:
+                queue = build_review_queue(conn, library_id=args.library_id,
+                                           directory_prefix=args.directory)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(queue_text(queue, include_d=args.all))
+            if args.json_path:
+                Path(args.json_path).write_text(queue.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "questions":
+            from ppa.anchor_opportunities import build_anchor_questions, concise_text as question_text
+            try:
+                questions = build_anchor_questions(conn, library_id=args.library_id,
+                                                    directory_prefix=args.directory)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(question_text(questions))
+            if args.json_path:
+                Path(args.json_path).write_text(questions.to_json() + "\n", encoding="utf-8")
+                print(f"\nWrote {args.json_path}")
+            return 0
+        if args.pilot_command == "explain":
+            from ppa.evidence_inspector import inspect_date_evidence, concise_text as evidence_text
+            try:
+                trace = inspect_date_evidence(conn, args.file_id)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(evidence_text(trace))
+            if args.json_path:
+                Path(args.json_path).write_text(trace.to_json() + "\n", encoding="utf-8")
                 print(f"\nWrote {args.json_path}")
             return 0
         return 1
