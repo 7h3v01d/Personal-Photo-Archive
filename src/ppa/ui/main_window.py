@@ -664,7 +664,7 @@ class MainWindow(QMainWindow):
                                     "Select or scan a library before starting a pilot session.")
             return
         from ppa.ui.pilot_dashboard_dialog import PilotDashboardDialog
-        dialog = PilotDashboardDialog(self._config.db_path, library_id, self._registry, self)
+        dialog = PilotDashboardDialog(self._config, library_id, self._registry, self)
         dialog.request_date_review.connect(self._start_date_review_scope)
         dialog.request_unresolved.connect(self._start_unresolved_scope)
         dialog.show()

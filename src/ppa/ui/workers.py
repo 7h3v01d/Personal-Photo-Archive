@@ -530,3 +530,26 @@ class PilotSessionWorker(QObject):
         finally:
             if conn is not None:
                 conn.close()
+
+class ReviewProgressExportWorker(QObject):
+    """Export a shareable Phase-7 progress bundle without blocking Qt."""
+
+    finished = Signal(object)  # Path
+    failed = Signal(str)
+
+    def __init__(self, config, session, current, destination: Path) -> None:
+        super().__init__()
+        self._config = config
+        self._session = session
+        self._current = current
+        self._destination = Path(destination)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from ppa.review_report import export_review_progress
+            path = export_review_progress(
+                self._config, self._session, self._current, self._destination)
+            self.finished.emit(path)
+        except Exception as exc:
+            self.failed.emit(str(exc))

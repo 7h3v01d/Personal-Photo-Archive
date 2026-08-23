@@ -282,3 +282,11 @@ python -m ppa.cli diagnostics export ppa-diagnostics.zip
 The desktop **Activity Runs…** view groups Phase-7 operations by run ID with start,
 progress, terminal outcome, and duration. Use `ppa diagnostics runs` and
 `ppa diagnostics run-export <run-id> <file.json>` for CLI monitoring/sharing.
+
+### Phase 7.7 — shareable review progress
+
+From **Pilot Session…**, use **Share progress…** to export a sanitized ZIP containing baseline→current
+chronology metrics, checkpoint progression, integrity status, and matching scoped operational-run summaries.
+No photos, catalogue database, raw paths, photo IDs, or raw log messages are included.
+
+CLI: `python -m ppa.cli pilot session-report pilot.json progress.zip`

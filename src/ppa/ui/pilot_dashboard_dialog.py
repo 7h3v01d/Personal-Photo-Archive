@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from ppa.pilot_dashboard import build_dashboard_view
 from ppa.pilot_session import load_pilot_session
-from ppa.ui.workers import PilotSessionWorker
+from ppa.ui.workers import PilotSessionWorker, ReviewProgressExportWorker
 
 
 class PilotDashboardDialog(QDialog):
@@ -20,9 +20,10 @@ class PilotDashboardDialog(QDialog):
     request_date_review = Signal(int, object, object)
     request_unresolved = Signal(int, object, object)
 
-    def __init__(self, db_path: Path, library_id: int, registry, parent=None) -> None:
+    def __init__(self, config, library_id: int, registry, parent=None) -> None:
         super().__init__(parent)
-        self._db_path = Path(db_path)
+        self._config = config
+        self._db_path = Path(config.db_path)
         self._library_id = library_id
         self._registry = registry
         self._session_path: Path | None = None
@@ -68,14 +69,17 @@ class PilotDashboardDialog(QDialog):
         self._unresolved = QPushButton("Browse Unresolved Memories")
         self._checkpoint = QPushButton("Capture checkpoint…")
         self._close_pilot = QPushButton("Close pilot")
+        self._share = QPushButton("Share progress…")
         self._date.clicked.connect(self._launch_date_review)
         self._unresolved.clicked.connect(self._launch_unresolved)
         self._checkpoint.clicked.connect(self._checkpoint_now)
         self._close_pilot.clicked.connect(self._close_now)
+        self._share.clicked.connect(self._share_progress)
         actions.addWidget(self._date, 0, 0)
         actions.addWidget(self._unresolved, 0, 1)
         actions.addWidget(self._checkpoint, 1, 0)
         actions.addWidget(self._close_pilot, 1, 1)
+        actions.addWidget(self._share, 2, 0, 1, 2)
         root.addLayout(actions)
 
         bottom = QHBoxLayout(); bottom.addStretch(1)
@@ -88,7 +92,7 @@ class PilotDashboardDialog(QDialog):
                 "No pilot session loaded.\n\nStart a new session to capture an immutable baseline, "
                 "or load an existing .json pilot artifact."
             )
-            for w in (self._refresh, self._date, self._unresolved, self._checkpoint, self._close_pilot):
+            for w in (self._refresh, self._date, self._unresolved, self._checkpoint, self._close_pilot, self._share):
                 w.setEnabled(False)
             return
 
@@ -119,6 +123,7 @@ class PilotDashboardDialog(QDialog):
         self._unresolved.setEnabled(open_session and validated)
         self._checkpoint.setEnabled(open_session and validated)
         self._close_pilot.setEnabled(open_session and validated)
+        self._share.setEnabled(validated or (self._session.status == "closed" and self._session.final is not None))
 
     def _start_new(self) -> None:
         default_dir = self._db_path.parent / "pilots"
@@ -186,7 +191,7 @@ class PilotDashboardDialog(QDialog):
         if enabled:
             self._render()
         else:
-            for w in (self._refresh, self._date, self._unresolved, self._checkpoint, self._close_pilot):
+            for w in (self._refresh, self._date, self._unresolved, self._checkpoint, self._close_pilot, self._share):
                 w.setEnabled(False)
 
     def _operation_ready(self, session, current) -> None:
@@ -214,6 +219,46 @@ class PilotDashboardDialog(QDialog):
             "The baseline and checkpoints will be preserved in the session artifact.")
         if answer == QMessageBox.StandardButton.Yes:
             self._run("close")
+
+
+    def _share_progress(self) -> None:
+        if self._session is None:
+            return
+        current = self._current if self._current is not None else self._session.final
+        if current is None:
+            QMessageBox.information(self, "Share progress",
+                                    "Refresh the pilot first so its current scope is validated.")
+            return
+        default_dir = self._db_path.parent / "reports"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export shareable progress report",
+            str(default_dir / f"ppa-review-progress-{self._session.session_id[:8]}.zip"),
+            "ZIP files (*.zip)")
+        if not filename:
+            return
+        self._set_controls(False)
+        progress = QProgressDialog("Building shareable progress report…", "", 0, 0, self)
+        progress.setWindowTitle("Share progress")
+        progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._progress = progress
+        worker = ReviewProgressExportWorker(self._config, self._session, current, Path(filename))
+        self._worker = worker
+        worker.finished.connect(self._share_ready)
+        worker.failed.connect(self._share_failed)
+        self._registry.start(worker)
+
+    def _share_ready(self, path) -> None:
+        self._finish_progress()
+        QMessageBox.information(
+            self, "Progress report exported",
+            f"Created:\n{path}\n\nThe bundle contains aggregate progress and scoped run summaries only; "
+            "no photos, catalogue database, raw paths, photo IDs, or raw log messages are included.")
+
+    def _share_failed(self, message: str) -> None:
+        self._finish_progress()
+        QMessageBox.critical(self, "Share progress", f"Could not export report:\n{message}")
 
     def _launch_date_review(self) -> None:
         s = self._session

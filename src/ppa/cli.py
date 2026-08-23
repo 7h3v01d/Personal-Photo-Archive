@@ -176,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
     pilot_session_close = pilot_sub.add_parser(
         "session-close", help="Close a pilot session with a final audit and comparison")
     pilot_session_close.add_argument("session_path", help="Pilot session JSON path")
+    pilot_session_report = pilot_sub.add_parser(
+        "session-report", help="Export a shareable Phase-7 pilot progress ZIP")
+    pilot_session_report.add_argument("session_path", help="Pilot session JSON path")
+    pilot_session_report.add_argument("output", help="Destination ZIP path")
 
     diag_parser = subparsers.add_parser(
         "diagnostics", help="Monitor or export operational diagnostics")
@@ -510,6 +514,28 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(concise_text(session))
             print(f"\nClosed {path}")
+            return 0
+        if args.pilot_command == "session-report":
+            from ppa.pilot_audit import build_pilot_audit
+            from ppa.pilot_session import load_pilot_session
+            from ppa.review_report import export_review_progress
+            try:
+                session = load_pilot_session(Path(args.session_path))
+                if session.status == "closed":
+                    current = session.final
+                else:
+                    current = build_pilot_audit(
+                        conn, library_id=session.library_id,
+                        directory_prefix=session.directory_prefix,
+                        file_ids=session.explicit_file_ids)
+                    if (current.library_root, current.directory_prefix, current.explicit_file_ids) != (
+                            session.library_root, session.directory_prefix, session.explicit_file_ids):
+                        raise ValueError("pilot scope no longer resolves to the original library/root")
+                path = export_review_progress(config, session, current, Path(args.output))
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(f"Shareable review progress report: {path}")
             return 0
         return 1
 
