@@ -287,6 +287,18 @@ class MainWindow(QMainWindow):
         self._act_pilot_audit.triggered.connect(self._on_pilot_audit)
         tb.addAction(self._act_pilot_audit)
 
+        self._act_pilot_session = QAction("Pilot Session…", self)
+        self._act_pilot_session.triggered.connect(self._on_pilot_session)
+        tb.addAction(self._act_pilot_session)
+
+        self._act_activity_log = QAction("Activity Log…", self)
+        self._act_activity_log.triggered.connect(self._on_activity_log)
+        tb.addAction(self._act_activity_log)
+
+        self._act_export_diagnostics = QAction("Export Diagnostics…", self)
+        self._act_export_diagnostics.triggered.connect(self._on_export_diagnostics)
+        tb.addAction(self._act_export_diagnostics)
+
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
         tb.addAction(self._act_refresh)
@@ -467,19 +479,18 @@ class MainWindow(QMainWindow):
         return libs[0].id if len(libs) == 1 else None
 
     def _on_date_review(self) -> None:
-        """Build the Phase-7 review queue off-thread, then open the safe viewer.
-
-        Real libraries can require a full chronology/reconciliation/freshness pass;
-        none of that is allowed to block Qt's GUI event loop.
-        """
-        if self._busy:
-            return
         library_id = self._current_library_id()
         if library_id is None:
             QMessageBox.information(self, "Date Review",
                                     "Select or scan a library before starting date review.")
             return
+        self._start_date_review_scope(library_id)
 
+    def _start_date_review_scope(self, library_id: int, directory_prefix=None, file_ids=None) -> None:
+        """Build a Phase-7 review queue for an explicit, already-validated scope."""
+        if self._busy:
+            return
+        log.info("Date Review requested: library_id=%s directory=%s explicit_files=%s", library_id, directory_prefix, None if file_ids is None else len(file_ids))
         self._set_busy(True)
         self._status.showMessage("Date Review: preparing analysis…")
         progress = QProgressDialog("Preparing Date Review…", "Cancel", 0, 0, self)
@@ -491,7 +502,7 @@ class MainWindow(QMainWindow):
         progress.show()
         self._date_review_progress = progress
 
-        worker = DateReviewQueueWorker(self._config.db_path, library_id)
+        worker = DateReviewQueueWorker(self._config.db_path, library_id, directory_prefix=directory_prefix, file_ids=file_ids)
         self._date_review_worker = worker
         worker.progress.connect(self._on_date_review_progress)
         worker.finished.connect(self._on_date_review_ready)
@@ -520,6 +531,7 @@ class MainWindow(QMainWindow):
 
         self._finish_date_review_progress()
         items = queue.actionable()
+        log.info("Date Review ready: %d actionable item(s)", len(items))
         if not items:
             self._status.showMessage("Date Review: no actionable items.")
             QMessageBox.information(self, "Date Review",
@@ -547,22 +559,28 @@ class MainWindow(QMainWindow):
 
     def _on_date_review_cancelled(self) -> None:
         self._finish_date_review_progress()
+        log.info("Date Review cancelled")
         self._status.showMessage("Date Review cancelled.")
 
     def _on_date_review_failed(self, message: str) -> None:
         self._finish_date_review_progress()
+        log.error("Date Review failed: %s", message)
         self._warn(f"Date Review failed: {message}")
         self._status.showMessage("Date Review failed.")
 
     def _on_unresolved_memories(self) -> None:
-        """Build the read-only unresolved-memory view off-thread."""
-        if self._busy:
-            return
         library_id = self._current_library_id()
         if library_id is None:
             QMessageBox.information(self, "Unresolved Memories",
                                     "Select or scan a library before browsing unresolved memories.")
             return
+        self._start_unresolved_scope(library_id)
+
+    def _start_unresolved_scope(self, library_id: int, directory_prefix=None, file_ids=None) -> None:
+        """Build the read-only unresolved view for an explicit validated pilot scope."""
+        if self._busy:
+            return
+        log.info("Unresolved Memories requested: library_id=%s directory=%s explicit_files=%s", library_id, directory_prefix, None if file_ids is None else len(file_ids))
         self._set_busy(True)
         self._status.showMessage("Unresolved Memories: analysing…")
         progress = QProgressDialog("Analysing unresolved memories…", "Cancel", 0, 0, self)
@@ -573,7 +591,7 @@ class MainWindow(QMainWindow):
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.show()
         self._unresolved_progress = progress
-        worker = UnresolvedMemoriesWorker(self._config.db_path, library_id)
+        worker = UnresolvedMemoriesWorker(self._config.db_path, library_id, directory_prefix=directory_prefix, file_ids=file_ids)
         self._unresolved_worker = worker
         worker.progress.connect(self._on_unresolved_progress)
         worker.finished.connect(self._on_unresolved_ready)
@@ -599,6 +617,7 @@ class MainWindow(QMainWindow):
     def _on_unresolved_ready(self, view) -> None:
         from ppa.ui.preview_dialog import PreviewDialog
         self._finish_unresolved_progress()
+        log.info("Unresolved Memories ready: %d unresolved item(s)", len(view.items))
         if not view.items:
             self._status.showMessage("Unresolved Memories: nothing unresolved.")
             QMessageBox.information(self, "Unresolved Memories",
@@ -619,12 +638,57 @@ class MainWindow(QMainWindow):
 
     def _on_unresolved_cancelled(self) -> None:
         self._finish_unresolved_progress()
+        log.info("Unresolved Memories cancelled")
         self._status.showMessage("Unresolved Memories cancelled.")
 
     def _on_unresolved_failed(self, message: str) -> None:
         self._finish_unresolved_progress()
+        log.error("Unresolved Memories failed: %s", message)
         self._warn(f"Unresolved Memories failed: {message}")
         self._status.showMessage("Unresolved Memories failed.")
+
+    def _on_pilot_session(self) -> None:
+        if self._busy:
+            return
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Pilot Session",
+                                    "Select or scan a library before starting a pilot session.")
+            return
+        from ppa.ui.pilot_dashboard_dialog import PilotDashboardDialog
+        dialog = PilotDashboardDialog(self._config.db_path, library_id, self._registry, self)
+        dialog.request_date_review.connect(self._start_date_review_scope)
+        dialog.request_unresolved.connect(self._start_unresolved_scope)
+        dialog.show()
+        self._pilot_dashboard_dialog = dialog
+
+
+    def _on_activity_log(self) -> None:
+        """Open the live, auto-refreshing human-readable operational log."""
+        from ppa.ui.log_dialog import LogDialog
+        log.info("Activity Log opened")
+        dialog = LogDialog(self._config, self)
+        dialog.show()
+        self._activity_log_dialog = dialog
+
+    def _on_export_diagnostics(self) -> None:
+        """Create a sanitized shareable diagnostics ZIP; never include photos/DB."""
+        from datetime import datetime
+        from ppa.diagnostics import export_diagnostics
+        default = f"ppa-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export shareable diagnostics", default, "ZIP files (*.zip)")
+        if not filename:
+            return
+        try:
+            path = export_diagnostics(self._config, Path(filename))
+            log.info("Sanitized diagnostics exported to %s", path)
+            QMessageBox.information(
+                self, "Diagnostics exported",
+                f"Created:\n{path}\n\nNo catalogue database or photo files are included.")
+        except Exception as exc:
+            log.exception("Diagnostics export failed")
+            self._warn(f"Diagnostics export failed: {exc}")
 
     def _on_pilot_audit(self) -> None:
         """Build the read-only Phase-7 audit snapshot off-thread."""
@@ -635,6 +699,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Pilot Audit",
                                     "Select or scan a library before running the audit.")
             return
+        log.info("Pilot Audit requested: library_id=%s", library_id)
         self._set_busy(True)
         self._status.showMessage("Pilot Audit: analysing…")
         progress = QProgressDialog("Building Phase 7 pilot audit…", "Cancel", 0, 0, self)
@@ -671,6 +736,7 @@ class MainWindow(QMainWindow):
     def _on_pilot_audit_ready(self, snapshot) -> None:
         from ppa.pilot_audit import concise_text
         self._finish_pilot_audit_progress()
+        log.info("Pilot Audit ready: usable=%s unresolved=%s stale=%s", snapshot.usable_chronology.count, snapshot.unresolved.count, snapshot.stale_decisions.count)
         text = concise_text(snapshot)
         box = QMessageBox(self)
         box.setWindowTitle("Phase 7 Pilot Audit")
@@ -689,10 +755,12 @@ class MainWindow(QMainWindow):
 
     def _on_pilot_audit_cancelled(self) -> None:
         self._finish_pilot_audit_progress()
+        log.info("Pilot Audit cancelled")
         self._status.showMessage("Pilot Audit cancelled.")
 
     def _on_pilot_audit_failed(self, message: str) -> None:
         self._finish_pilot_audit_progress()
+        log.error("Pilot Audit failed: %s", message)
         self._warn(f"Pilot Audit failed: {message}")
         self._status.showMessage("Pilot Audit failed.")
 
@@ -705,7 +773,7 @@ class MainWindow(QMainWindow):
         self._busy = busy
         for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
                     self._act_extract, self._act_date_review, self._act_unresolved,
-                    self._act_pilot_audit, self._act_refresh):
+                    self._act_pilot_audit, self._act_pilot_session, self._act_refresh):
             act.setEnabled(not busy)
 
     def _on_add_library(self) -> None:
@@ -742,6 +810,7 @@ class MainWindow(QMainWindow):
             self._warn(f"Not a directory: {self._current_library}")
             return
 
+        log.info("Scan requested for %s", self._current_library)
         self._set_busy(True)
         self._status.showMessage("Starting scan…")
         data_dir = self._config.db_path.parent

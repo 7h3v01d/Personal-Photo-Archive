@@ -109,10 +109,12 @@ class DateReviewQueueWorker(QObject):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, db_path: Path, library_id: int) -> None:
+    def __init__(self, db_path: Path, library_id: int, *, directory_prefix: str | None = None, file_ids=None) -> None:
         super().__init__()
         self._db_path = db_path
         self._library_id = library_id
+        self._directory_prefix = directory_prefix
+        self._file_ids = tuple(file_ids) if file_ids is not None else None
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -130,6 +132,7 @@ class DateReviewQueueWorker(QObject):
             queue = build_review_queue(
                 conn,
                 library_id=self._library_id,
+                directory_prefix=self._directory_prefix, file_ids=self._file_ids,
                 progress_cb=self.progress.emit,
                 cancel_cb=self._cancel.is_set,
             )
@@ -154,10 +157,12 @@ class UnresolvedMemoriesWorker(QObject):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, db_path: Path, library_id: int) -> None:
+    def __init__(self, db_path: Path, library_id: int, *, directory_prefix: str | None = None, file_ids=None) -> None:
         super().__init__()
         self._db_path = db_path
         self._library_id = library_id
+        self._directory_prefix = directory_prefix
+        self._file_ids = tuple(file_ids) if file_ids is not None else None
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -172,6 +177,7 @@ class UnresolvedMemoriesWorker(QObject):
             conn = connect(self._db_path)
             view = build_unresolved_memories(
                 conn, library_id=self._library_id,
+                directory_prefix=self._directory_prefix, file_ids=self._file_ids,
                 progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
             if self._cancel.is_set():
                 self.cancelled.emit()
@@ -419,6 +425,104 @@ class PilotAuditWorker(QObject):
                 self.cancelled.emit()
             else:
                 self.finished.emit(snap)
+        except PilotAnalysisCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+class PilotSessionWorker(QObject):
+    """Run integrity-checked pilot-session operations off the GUI thread.
+
+    Operations are intentionally narrow: ``start``, ``refresh``, ``checkpoint`` and
+    ``close``.  Mutating operations save the external session JSON atomically only
+    after the new session object has been completely built and validated.
+    """
+
+    progress = Signal(str)
+    finished = Signal(object, object)  # PilotSession, current PilotAuditSnapshot | None
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_path: Path, operation: str, session_path: Path, *,
+                 library_id: int | None = None, directory_prefix: str | None = None,
+                 file_ids=None, label: str | None = None) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._operation = operation
+        self._session_path = Path(session_path)
+        self._library_id = library_id
+        self._directory_prefix = directory_prefix
+        self._file_ids = tuple(file_ids) if file_ids is not None else None
+        self._label = label
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.pilot import PilotAnalysisCancelled
+            from ppa.pilot_audit import build_pilot_audit
+            from ppa.pilot_session import (
+                checkpoint_pilot_session, close_pilot_session, load_pilot_session,
+                save_pilot_session, start_pilot_session,
+            )
+            conn = connect(self._db_path)
+            op = self._operation
+            if op == "start":
+                if self._library_id is None:
+                    raise ValueError("library_id is required to start a pilot")
+                if self._session_path.exists():
+                    raise ValueError("pilot session file already exists")
+                session = start_pilot_session(
+                    conn, library_id=self._library_id, directory_prefix=self._directory_prefix,
+                    file_ids=self._file_ids, progress_cb=self.progress.emit,
+                    cancel_cb=self._cancel.is_set)
+                if self._cancel.is_set():
+                    self.cancelled.emit(); return
+                save_pilot_session(session, self._session_path)
+                self.finished.emit(session, session.baseline)
+                return
+
+            session = load_pilot_session(self._session_path)
+            if op == "refresh":
+                self.progress.emit("Pilot Dashboard: refreshing current audit…")
+                current = build_pilot_audit(
+                    conn, library_id=session.library_id,
+                    directory_prefix=session.directory_prefix,
+                    file_ids=session.explicit_file_ids,
+                    progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
+                if (current.library_root, current.directory_prefix, current.explicit_file_ids) != (
+                        session.library_root, session.directory_prefix, session.explicit_file_ids):
+                    raise ValueError("pilot scope no longer resolves to the original library/root")
+                if self._cancel.is_set():
+                    self.cancelled.emit(); return
+                self.finished.emit(session, current)
+                return
+            if op == "checkpoint":
+                updated = checkpoint_pilot_session(
+                    conn, session, label=self._label,
+                    progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
+                if self._cancel.is_set():
+                    self.cancelled.emit(); return
+                save_pilot_session(updated, self._session_path)
+                self.finished.emit(updated, updated.checkpoints[-1].snapshot)
+                return
+            if op == "close":
+                updated = close_pilot_session(
+                    conn, session, progress_cb=self.progress.emit,
+                    cancel_cb=self._cancel.is_set)
+                if self._cancel.is_set():
+                    self.cancelled.emit(); return
+                save_pilot_session(updated, self._session_path)
+                self.finished.emit(updated, updated.final)
+                return
+            raise ValueError(f"unknown pilot-session operation: {op}")
         except PilotAnalysisCancelled:
             self.cancelled.emit()
         except Exception as exc:

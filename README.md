@@ -262,3 +262,18 @@ python -m ppa.cli pilot session-close pilot.json
 ```
 
 See `docs/PHASE7_3_REAL_COLLECTION_PILOT.md`.
+
+### Phase 7.4 — Pilot Session Dashboard
+
+The desktop toolbar now includes **Pilot Session…**, a guided operator surface for Phase 7.3 sessions. It can start/load a session, refresh baseline-relative progress, launch Date Review or Unresolved Memories inside the session's exact validated scope, capture named checkpoints, and close the pilot with a final comparison. Collection-wide work runs off the Qt GUI thread. See `docs/PHASE7_4_PILOT_DASHBOARD.md`.
+
+## Phase 7.5 — activity log and shareable diagnostics
+
+PPA now writes a human-readable rotating `ppa.log` and a structured `ppa.jsonl` companion. Use **Activity Log…** in the desktop toolbar to watch recent activity live, or **Export Diagnostics…** to create a sanitized ZIP suitable for sharing while troubleshooting. The diagnostics export excludes the catalogue database, photos, thumbnails, pilot-session artifacts, and raw configuration paths.
+
+CLI equivalents:
+
+```text
+python -m ppa.cli diagnostics tail --lines 200
+python -m ppa.cli diagnostics export ppa-diagnostics.zip
+```

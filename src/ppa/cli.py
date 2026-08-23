@@ -177,6 +177,14 @@ def main(argv: list[str] | None = None) -> int:
         "session-close", help="Close a pilot session with a final audit and comparison")
     pilot_session_close.add_argument("session_path", help="Pilot session JSON path")
 
+    diag_parser = subparsers.add_parser(
+        "diagnostics", help="Monitor or export operational diagnostics")
+    diag_sub = diag_parser.add_subparsers(dest="diagnostics_command", required=True)
+    diag_tail = diag_sub.add_parser("tail", help="Show the latest human-readable log entries")
+    diag_tail.add_argument("--lines", type=int, default=120, help="Number of log lines to show")
+    diag_export = diag_sub.add_parser("export", help="Create a sanitized shareable diagnostics ZIP")
+    diag_export.add_argument("path", help="Destination ZIP path")
+
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -184,6 +192,23 @@ def main(argv: list[str] | None = None) -> int:
     log = get_logger("cli")
 
     conn = connect(config.db_path)
+
+    if args.command == "diagnostics":
+        from ppa.diagnostics import export_diagnostics, tail_text
+        if args.diagnostics_command == "tail":
+            print(tail_text(config.log_path, lines=max(1, args.lines)), end="")
+            return 0
+        if args.diagnostics_command == "export":
+            try:
+                path = export_diagnostics(config, Path(args.path))
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            log.info("Sanitized diagnostics exported to %s", path)
+            print(f"Wrote {path}")
+            print("No catalogue database or photo files are included.")
+            return 0
+        return 1
 
     if args.command == "scan":
         if not args.path.is_dir():
