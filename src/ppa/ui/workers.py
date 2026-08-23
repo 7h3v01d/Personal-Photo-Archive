@@ -553,3 +553,46 @@ class ReviewProgressExportWorker(QObject):
             self.finished.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class TimelineWorker(QObject):
+    """Build the Phase-8 timeline projection off the GUI thread."""
+
+    progress = Signal(str)
+    finished = Signal(object)  # TimelineView
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_path: Path, library_id: int, *, directory_prefix: str | None = None, file_ids=None) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._library_id = library_id
+        self._directory_prefix = directory_prefix
+        self._file_ids = tuple(file_ids) if file_ids is not None else None
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.pilot import PilotAnalysisCancelled
+            from ppa.timeline import build_timeline
+            conn = connect(self._db_path)
+            view = build_timeline(
+                conn, library_id=self._library_id,
+                directory_prefix=self._directory_prefix, file_ids=self._file_ids,
+                progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(view)
+        except PilotAnalysisCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()

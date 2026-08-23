@@ -111,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
         "reopen", help="Return a confirmed/rejected reconstruction to proposed")
     rc_reopen.add_argument("file_id")
 
+    timeline_parser = subparsers.add_parser(
+        "timeline", help="Build the read-only provenance-aware chronology timeline")
+    timeline_parser.add_argument("library_id", type=int, help="Library id to view")
+    timeline_parser.add_argument("--directory", default=None,
+                                 help="Relative directory prefix within the library")
+    timeline_parser.add_argument("--json", dest="json_path", default=None,
+                                 help="Write structured timeline JSON to this path")
+
     pilot_parser = subparsers.add_parser(
         "pilot", help="Read-only collection-level pilot analysis report")
     pilot_sub = pilot_parser.add_subparsers(dest="pilot_command", required=True)
@@ -366,6 +374,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {rating:15} {counts[rating]}")
         print(f"\n{len(changed)} photo(s) re-rated by independent calendar evidence.")
         print("(Read-only; no photo, observation, or stored date was modified.)")
+        return 0
+
+    if args.command == "timeline":
+        from ppa.timeline import build_timeline, concise_text as timeline_text
+        try:
+            view = build_timeline(conn, library_id=args.library_id,
+                                  directory_prefix=args.directory)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(timeline_text(view))
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
         return 0
 
     if args.command == "pilot":

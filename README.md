@@ -290,3 +290,10 @@ chronology metrics, checkpoint progression, integrity status, and matching scope
 No photos, catalogue database, raw paths, photo IDs, or raw log messages are included.
 
 CLI: `python -m ppa.cli pilot session-report pilot.json progress.zip`
+
+
+## Phase 8.0 — Chronology Timeline Foundation
+
+The desktop **Timeline** action builds a read-only, provenance-aware chronology view in the background. Photos are separated into **Placed**, **Ranges**, **Tentative**, and **Unplaced** lanes. Fresh human-confirmed reconstructions take precedence; otherwise current TRUSTED/PROBABLY_VALID reconciled chronology may place a photo. Fresh proposals are tentative only, and stale decisions never anchor the timeline. Date ranges remain ranges.
+
+CLI: `python -m ppa.cli timeline <library_id>` with optional `--directory` and `--json`.

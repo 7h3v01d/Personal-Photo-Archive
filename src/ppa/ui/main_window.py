@@ -53,6 +53,7 @@ from ppa.ui.workers import (
     ScanWorker,
     ThumbnailWorker,
     VerifyWorker,
+    TimelineWorker,
     WorkerRegistry,
 )
 
@@ -277,6 +278,10 @@ class MainWindow(QMainWindow):
         self._act_extract.triggered.connect(lambda: self._start_metadata(auto=False))
         tb.addAction(self._act_extract)
 
+        self._act_timeline = QAction("Timeline", self)
+        self._act_timeline.triggered.connect(self._on_timeline)
+        tb.addAction(self._act_timeline)
+
         self._act_date_review = QAction("Date Review", self)
         self._act_date_review.triggered.connect(self._on_date_review)
         tb.addAction(self._act_date_review)
@@ -483,6 +488,78 @@ class MainWindow(QMainWindow):
                 if lib.canonical_path == wanted or lib.display_path == str(self._current_library):
                     return lib.id
         return libs[0].id if len(libs) == 1 else None
+
+    def _on_timeline(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Timeline",
+                                    "Select or scan a library before opening the timeline.")
+            return
+        if self._busy:
+            return
+        self._run_begin("timeline", "timeline", "Timeline requested", {"library_id": library_id})
+        self._set_busy(True)
+        self._status.showMessage("Timeline: analysing chronology…")
+        progress = QProgressDialog("Building chronology timeline…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Timeline")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._timeline_progress = progress
+        worker = TimelineWorker(self._config.db_path, library_id)
+        self._timeline_worker = worker
+        worker.progress.connect(self._on_timeline_progress)
+        worker.finished.connect(self._on_timeline_ready)
+        worker.failed.connect(self._on_timeline_failed)
+        worker.cancelled.connect(self._on_timeline_cancelled)
+        progress.canceled.connect(worker.cancel)
+        self._registry.start(worker)
+
+    def _on_timeline_progress(self, message: str) -> None:
+        self._run_progress("timeline", message)
+        self._status.showMessage(message)
+        progress = getattr(self, "_timeline_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
+
+    def _finish_timeline_progress(self) -> None:
+        progress = getattr(self, "_timeline_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater()
+            self._timeline_progress = None
+        self._timeline_worker = None
+        self._set_busy(False)
+
+    def _on_timeline_ready(self, view) -> None:
+        from ppa.ui.timeline_dialog import TimelineDialog
+        self._finish_timeline_progress()
+        self._run_end("timeline", "success", "Timeline ready", {
+            "placed": view.lanes["placed"].count,
+            "range": view.lanes["range"].count,
+            "tentative": view.lanes["tentative"].count,
+            "unplaced": view.lanes["unplaced"].count,
+        })
+        dialog = TimelineDialog(self._conn, view, self)
+        dialog.show()
+        self._timeline_dialog = dialog
+        self._status.showMessage(
+            f"Timeline ready — {view.lanes['placed'].count} placed, "
+            f"{view.lanes['range'].count} ranges, "
+            f"{view.lanes['tentative'].count} tentative, "
+            f"{view.lanes['unplaced'].count} unplaced.")
+
+    def _on_timeline_cancelled(self) -> None:
+        self._finish_timeline_progress()
+        self._run_end("timeline", "cancelled", "Timeline cancelled")
+        self._status.showMessage("Timeline cancelled.")
+
+    def _on_timeline_failed(self, message: str) -> None:
+        self._finish_timeline_progress()
+        self._run_end("timeline", "failed", f"Timeline failed: {message}")
+        self._warn(f"Timeline failed: {message}")
+        self._status.showMessage("Timeline failed.")
 
     def _on_date_review(self) -> None:
         library_id = self._current_library_id()
