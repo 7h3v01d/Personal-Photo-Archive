@@ -9,6 +9,7 @@ verifies run off-thread so a 10,000-photo library never freezes the UI.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
@@ -39,6 +40,7 @@ from ppa import catalogue
 from ppa.config import Config
 from ppa.db import connect
 from ppa.logging_setup import get_logger
+from ppa.activity_runs import new_run_id, run_extra
 from ppa.ui import theme
 from ppa.ui.delegate import PhotoTileDelegate
 from ppa.ui.gpsmap import GpsMiniMap
@@ -295,6 +297,10 @@ class MainWindow(QMainWindow):
         self._act_activity_log.triggered.connect(self._on_activity_log)
         tb.addAction(self._act_activity_log)
 
+        self._act_activity_runs = QAction("Activity Runs…", self)
+        self._act_activity_runs.triggered.connect(self._on_activity_runs)
+        tb.addAction(self._act_activity_runs)
+
         self._act_export_diagnostics = QAction("Export Diagnostics…", self)
         self._act_export_diagnostics.triggered.connect(self._on_export_diagnostics)
         tb.addAction(self._act_export_diagnostics)
@@ -490,7 +496,7 @@ class MainWindow(QMainWindow):
         """Build a Phase-7 review queue for an explicit, already-validated scope."""
         if self._busy:
             return
-        log.info("Date Review requested: library_id=%s directory=%s explicit_files=%s", library_id, directory_prefix, None if file_ids is None else len(file_ids))
+        self._run_begin("date_review", "date_review", "Date Review requested", {"library_id": library_id, "directory": directory_prefix, "explicit_files": None if file_ids is None else len(file_ids)})
         self._set_busy(True)
         self._status.showMessage("Date Review: preparing analysis…")
         progress = QProgressDialog("Preparing Date Review…", "Cancel", 0, 0, self)
@@ -512,6 +518,7 @@ class MainWindow(QMainWindow):
         self._registry.start(worker)
 
     def _on_date_review_progress(self, message: str) -> None:
+        self._run_progress("date_review", message)
         self._status.showMessage(message)
         progress = getattr(self, "_date_review_progress", None)
         if progress is not None:
@@ -531,7 +538,7 @@ class MainWindow(QMainWindow):
 
         self._finish_date_review_progress()
         items = queue.actionable()
-        log.info("Date Review ready: %d actionable item(s)", len(items))
+        self._run_end("date_review", "success", "Date Review ready", {"actionable_items": len(items)})
         if not items:
             self._status.showMessage("Date Review: no actionable items.")
             QMessageBox.information(self, "Date Review",
@@ -559,12 +566,12 @@ class MainWindow(QMainWindow):
 
     def _on_date_review_cancelled(self) -> None:
         self._finish_date_review_progress()
-        log.info("Date Review cancelled")
+        self._run_end("date_review", "cancelled", "Date Review cancelled")
         self._status.showMessage("Date Review cancelled.")
 
     def _on_date_review_failed(self, message: str) -> None:
         self._finish_date_review_progress()
-        log.error("Date Review failed: %s", message)
+        self._run_end("date_review", "failed", f"Date Review failed: {message}")
         self._warn(f"Date Review failed: {message}")
         self._status.showMessage("Date Review failed.")
 
@@ -580,7 +587,7 @@ class MainWindow(QMainWindow):
         """Build the read-only unresolved view for an explicit validated pilot scope."""
         if self._busy:
             return
-        log.info("Unresolved Memories requested: library_id=%s directory=%s explicit_files=%s", library_id, directory_prefix, None if file_ids is None else len(file_ids))
+        self._run_begin("unresolved", "unresolved_memories", "Unresolved Memories requested", {"library_id": library_id, "directory": directory_prefix, "explicit_files": None if file_ids is None else len(file_ids)})
         self._set_busy(True)
         self._status.showMessage("Unresolved Memories: analysing…")
         progress = QProgressDialog("Analysing unresolved memories…", "Cancel", 0, 0, self)
@@ -601,6 +608,7 @@ class MainWindow(QMainWindow):
         self._registry.start(worker)
 
     def _on_unresolved_progress(self, message: str) -> None:
+        self._run_progress("unresolved", message)
         self._status.showMessage(message)
         progress = getattr(self, "_unresolved_progress", None)
         if progress is not None:
@@ -617,7 +625,7 @@ class MainWindow(QMainWindow):
     def _on_unresolved_ready(self, view) -> None:
         from ppa.ui.preview_dialog import PreviewDialog
         self._finish_unresolved_progress()
-        log.info("Unresolved Memories ready: %d unresolved item(s)", len(view.items))
+        self._run_end("unresolved", "success", "Unresolved Memories ready", {"unresolved_items": len(view.items)})
         if not view.items:
             self._status.showMessage("Unresolved Memories: nothing unresolved.")
             QMessageBox.information(self, "Unresolved Memories",
@@ -638,12 +646,12 @@ class MainWindow(QMainWindow):
 
     def _on_unresolved_cancelled(self) -> None:
         self._finish_unresolved_progress()
-        log.info("Unresolved Memories cancelled")
+        self._run_end("unresolved", "cancelled", "Unresolved Memories cancelled")
         self._status.showMessage("Unresolved Memories cancelled.")
 
     def _on_unresolved_failed(self, message: str) -> None:
         self._finish_unresolved_progress()
-        log.error("Unresolved Memories failed: %s", message)
+        self._run_end("unresolved", "failed", f"Unresolved Memories failed: {message}")
         self._warn(f"Unresolved Memories failed: {message}")
         self._status.showMessage("Unresolved Memories failed.")
 
@@ -662,6 +670,34 @@ class MainWindow(QMainWindow):
         dialog.show()
         self._pilot_dashboard_dialog = dialog
 
+
+    def _run_begin(self, key: str, operation: str, message: str, detail=None) -> str:
+        if not hasattr(self, "_activity_runs"):
+            self._activity_runs = {}
+        run_id = new_run_id()
+        self._activity_runs[key] = (run_id, operation, time.monotonic())
+        log.info(message, extra=run_extra(run_id, operation, "start", detail=detail))
+        return run_id
+
+    def _run_progress(self, key: str, message: str) -> None:
+        item = getattr(self, "_activity_runs", {}).get(key)
+        if item:
+            run_id, operation, _started = item
+            log.info(message, extra=run_extra(run_id, operation, "progress"))
+
+    def _run_end(self, key: str, outcome: str, message: str, detail=None) -> None:
+        item = getattr(self, "_activity_runs", {}).pop(key, None)
+        if item:
+            run_id, operation, started = item
+            elapsed = int((time.monotonic() - started) * 1000)
+            level = log.error if outcome == "failed" else log.info
+            level(message, extra=run_extra(run_id, operation, "end", outcome=outcome, elapsed_ms=elapsed, detail=detail))
+
+    def _on_activity_runs(self) -> None:
+        from ppa.ui.runs_dialog import RunsDialog
+        dialog = RunsDialog(self._config, self)
+        dialog.show()
+        self._activity_runs_dialog = dialog
 
     def _on_activity_log(self) -> None:
         """Open the live, auto-refreshing human-readable operational log."""
@@ -699,7 +735,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Pilot Audit",
                                     "Select or scan a library before running the audit.")
             return
-        log.info("Pilot Audit requested: library_id=%s", library_id)
+        self._run_begin("pilot_audit", "pilot_audit", "Pilot Audit requested", {"library_id": library_id})
         self._set_busy(True)
         self._status.showMessage("Pilot Audit: analysing…")
         progress = QProgressDialog("Building Phase 7 pilot audit…", "Cancel", 0, 0, self)
@@ -720,6 +756,7 @@ class MainWindow(QMainWindow):
         self._registry.start(worker)
 
     def _on_pilot_audit_progress(self, message: str) -> None:
+        self._run_progress("pilot_audit", message)
         self._status.showMessage(message)
         progress = getattr(self, "_pilot_audit_progress", None)
         if progress is not None:
@@ -736,7 +773,7 @@ class MainWindow(QMainWindow):
     def _on_pilot_audit_ready(self, snapshot) -> None:
         from ppa.pilot_audit import concise_text
         self._finish_pilot_audit_progress()
-        log.info("Pilot Audit ready: usable=%s unresolved=%s stale=%s", snapshot.usable_chronology.count, snapshot.unresolved.count, snapshot.stale_decisions.count)
+        self._run_end("pilot_audit", "success", "Pilot Audit ready", {"usable": snapshot.usable_chronology.count, "unresolved": snapshot.unresolved.count, "stale": snapshot.stale_decisions.count})
         text = concise_text(snapshot)
         box = QMessageBox(self)
         box.setWindowTitle("Phase 7 Pilot Audit")
@@ -755,12 +792,12 @@ class MainWindow(QMainWindow):
 
     def _on_pilot_audit_cancelled(self) -> None:
         self._finish_pilot_audit_progress()
-        log.info("Pilot Audit cancelled")
+        self._run_end("pilot_audit", "cancelled", "Pilot Audit cancelled")
         self._status.showMessage("Pilot Audit cancelled.")
 
     def _on_pilot_audit_failed(self, message: str) -> None:
         self._finish_pilot_audit_progress()
-        log.error("Pilot Audit failed: %s", message)
+        self._run_end("pilot_audit", "failed", f"Pilot Audit failed: {message}")
         self._warn(f"Pilot Audit failed: {message}")
         self._status.showMessage("Pilot Audit failed.")
 
@@ -810,7 +847,7 @@ class MainWindow(QMainWindow):
             self._warn(f"Not a directory: {self._current_library}")
             return
 
-        log.info("Scan requested for %s", self._current_library)
+        self._run_begin("scan", "scan", "Scan requested", {"library": str(self._current_library)})
         self._set_busy(True)
         self._status.showMessage("Starting scan…")
         data_dir = self._config.db_path.parent
@@ -818,12 +855,21 @@ class MainWindow(QMainWindow):
         worker = ScanWorker(
             self._config.db_path, self._current_library, protected_paths=protected
         )
-        worker.progress.connect(self._status.showMessage)
+        worker.progress.connect(self._on_scan_progress)
         worker.finished.connect(self._on_scan_done)
-        worker.failed.connect(self._on_worker_failed)
+        worker.failed.connect(self._on_scan_failed)
         self._registry.start(worker)
 
+    def _on_scan_progress(self, message: str) -> None:
+        self._run_progress("scan", message)
+        self._status.showMessage(message)
+
+    def _on_scan_failed(self, message: str) -> None:
+        self._run_end("scan", "failed", f"Scan failed: {message}")
+        self._on_worker_failed(message)
+
     def _on_scan_done(self, report) -> None:
+        self._run_end("scan", "success", "Scan complete", {"new_files": report.new_files, "moved_files": report.moved_files, "duplicates": report.duplicate_files, "missing": report.missing_files})
         self.refresh()
         self._status.showMessage(
             f"Scan complete — {report.new_files} new, {report.moved_files} moved, "

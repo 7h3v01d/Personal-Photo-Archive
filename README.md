@@ -277,3 +277,8 @@ CLI equivalents:
 python -m ppa.cli diagnostics tail --lines 200
 python -m ppa.cli diagnostics export ppa-diagnostics.zip
 ```
+
+### Phase 7.6 — correlated activity runs
+The desktop **Activity Runs…** view groups Phase-7 operations by run ID with start,
+progress, terminal outcome, and duration. Use `ppa diagnostics runs` and
+`ppa diagnostics run-export <run-id> <file.json>` for CLI monitoring/sharing.

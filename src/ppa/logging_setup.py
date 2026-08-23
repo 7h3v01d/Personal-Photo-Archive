@@ -25,6 +25,10 @@ class JsonLinesFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        for attr in ("run_id", "operation", "run_phase", "run_outcome", "elapsed_ms", "run_detail"):
+            value = getattr(record, attr, None)
+            if value is not None:
+                payload[attr] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)

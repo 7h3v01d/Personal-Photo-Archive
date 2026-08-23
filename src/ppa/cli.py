@@ -184,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     diag_tail.add_argument("--lines", type=int, default=120, help="Number of log lines to show")
     diag_export = diag_sub.add_parser("export", help="Create a sanitized shareable diagnostics ZIP")
     diag_export.add_argument("path", help="Destination ZIP path")
+    diag_runs = diag_sub.add_parser("runs", help="List recent correlated operational runs")
+    diag_runs.add_argument("--limit", type=int, default=30, help="Maximum runs to show")
+    diag_run_export = diag_sub.add_parser("run-export", help="Export one sanitized run transcript")
+    diag_run_export.add_argument("run_id", help="Run id from 'diagnostics runs'")
+    diag_run_export.add_argument("path", help="Destination JSON path")
 
     args = parser.parse_args(argv)
 
@@ -205,6 +210,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(str(exc), file=sys.stderr)
                 return 1
             log.info("Sanitized diagnostics exported to %s", path)
+            print(f"Wrote {path}")
+            print("No catalogue database or photo files are included.")
+            return 0
+        if args.diagnostics_command == "runs":
+            from ppa.activity_runs import concise_runs_text, load_activity_runs
+            print(concise_runs_text(load_activity_runs(config.log_path, limit=max(1, args.limit))))
+            return 0
+        if args.diagnostics_command == "run-export":
+            from ppa.activity_runs import export_run_transcript
+            try:
+                path = export_run_transcript(config, args.run_id, Path(args.path))
+            except (OSError, ValueError) as exc:
+                print(str(exc), file=sys.stderr); return 1
             print(f"Wrote {path}")
             print("No catalogue database or photo files are included.")
             return 0
