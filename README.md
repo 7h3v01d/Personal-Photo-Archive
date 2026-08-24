@@ -561,3 +561,38 @@ CLI: `organization-views list|save|run|delete`.
 ## Phase 9.8 — Organisation Health & Curation Gaps
 
 Adds a read-only organisation-quality projection for unorganised Photos, no-Album/no-Tag gaps, empty Albums, unused Tags, missing-only memberships, and broken saved discovery recipes. The desktop **Organisation Health** surface can open photo-level gaps in the existing logical-Photo browser. No organisation-health indicator is evidence or chronology authority.
+
+### Phase 9.9 — Assisted Organisation Suggestions
+
+PPA can now surface conservative, review-only Tag-gap suggestions from existing
+human curation. If an Album or named Event has at least 5 logical Photos and an
+existing Tag covers at least 80% of them with at least 4 explicit examples, PPA
+may offer the untagged remainder for review. Nothing is auto-applied: accepted
+suggestions are revalidated for freshness and then use the normal audited Tag
+membership API. No chronology/evidence/source-photo authority is introduced.
+
+CLI example:
+
+```text
+python -m ppa.cli organization-suggestions 1
+python -m ppa.cli organization-suggestions 1 --json suggestions.json
+```
+
+Schema: `ppa-organization-suggestions/1`.
+
+### Phase 9.10 — Suggestion Review History & Dismissal
+
+Assisted Organisation now remembers explicit human review decisions. A dismissed recommendation is suppressed only while its exact peer/support fingerprint remains unchanged; changing the Album/Event peer composition produces a new fingerprint that may surface again. Accepted suggestions and dismiss/restore actions are audited separately from Album/Tag truth. Schema v22.
+
+### Phase 9.11 — Organisation Activity & Change History
+
+The desktop **Organisation Activity** view exposes recent Album/Tag curation changes from the append-only audit ledger. Direct membership adds/removals can be undone only when the current state still proves the exact inverse is safe; stale or ambiguous history remains review-only. Undo itself is append-audited and never rewrites prior history.
+
+### Phase 9.12 — Shareable Organisation Report
+
+Use **Export Organisation Report…** to create a sanitized ZIP summarising Albums,
+Tags, organisation health, saved discovery views, assisted-suggestion review
+state, and recent curation activity. Source paths, IDs, hashes, thumbnails,
+database details and source-photo content are deliberately excluded.
+
+CLI: `python -m ppa.cli organization-report <library_id> organisation-report.zip`
