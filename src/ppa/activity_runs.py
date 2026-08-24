@@ -128,12 +128,12 @@ def get_activity_run(log_path: Path, run_id: str) -> ActivityRun:
 
 def export_run_transcript(config, run_id: str, destination: Path) -> Path:
     """Export one sanitized run transcript as JSON; no DB/photo content."""
-    from ppa.diagnostics import _redaction_pairs, sanitize_text
+    from ppa.diagnostics import _redaction_pairs, sanitize_data
 
     run = get_activity_run(config.log_path, run_id)
     pairs = _redaction_pairs(config)
     payload = asdict(run)
-    payload = json.loads(sanitize_text(json.dumps(payload, ensure_ascii=False), pairs))
+    payload = sanitize_data(payload, pairs)
     envelope = {
         "schema": RUN_TRANSCRIPT_SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(),

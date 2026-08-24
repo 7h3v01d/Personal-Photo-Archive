@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QGuiApplication, QImageReader, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -313,8 +313,8 @@ class PreviewDialog(QDialog):
         progress.show()
         self._batch_progress = progress
         worker = BatchPlanWorker(self._db_path, fid)
-        worker.finished.connect(self._on_batch_plan_ready)
-        worker.failed.connect(self._on_batch_failed)
+        worker.finished.connect(self._on_batch_plan_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_batch_failed, Qt.ConnectionType.QueuedConnection)
         self._workers.start(worker)
 
     def _finish_batch_progress(self) -> None:
@@ -322,6 +322,7 @@ class PreviewDialog(QDialog):
         if progress is not None:
             progress.close(); progress.deleteLater(); self._batch_progress = None
 
+    @Slot(object)
     def _on_batch_plan_ready(self, plan) -> None:
         self._finish_batch_progress()
         if plan is None:
@@ -336,14 +337,19 @@ class PreviewDialog(QDialog):
         progress.setCancelButton(None); progress.setMinimumDuration(0)
         progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
         self._batch_progress = progress
+        self._pending_batch_plan = plan
         worker = BatchSamplesWorker(self._db_path, plan)
-        worker.finished.connect(lambda images, p=plan: self._on_batch_samples_ready(p, images))
-        worker.failed.connect(self._on_batch_failed)
+        worker.finished.connect(self._on_batch_samples_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_batch_failed, Qt.ConnectionType.QueuedConnection)
         self._workers.start(worker)
 
-    def _on_batch_samples_ready(self, plan, images) -> None:
+    @Slot(object)
+    def _on_batch_samples_ready(self, images) -> None:
+        plan = getattr(self, "_pending_batch_plan", None)
+        self._pending_batch_plan = None
         self._finish_batch_progress()
-        self._show_batch_samples(plan, dict(images))
+        if plan is not None:
+            self._show_batch_samples(plan, dict(images))
 
     def _show_batch_samples(self, plan, images) -> None:
         dialog = QDialog(self)
@@ -390,10 +396,11 @@ class PreviewDialog(QDialog):
         progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
         self._batch_progress = progress
         worker = BatchConfirmWorker(self._db_path, plan)
-        worker.finished.connect(self._on_batch_confirmed)
-        worker.failed.connect(self._on_batch_failed)
+        worker.finished.connect(self._on_batch_confirmed, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_batch_failed, Qt.ConnectionType.QueuedConnection)
         self._workers.start(worker)
 
+    @Slot(int)
     def _on_batch_confirmed(self, count: int) -> None:
         self._finish_batch_progress()
         QMessageBox.information(self, "Batch confirmed",
@@ -401,6 +408,7 @@ class PreviewDialog(QDialog):
                                 "individually provenance-bound to its reviewed bytes and evidence.")
         self._after_action()
 
+    @Slot(str)
     def _on_batch_failed(self, message: str) -> None:
         self._finish_batch_progress()
         QMessageBox.warning(self, "Controlled batch review", message)
@@ -419,10 +427,16 @@ class PreviewDialog(QDialog):
         self._why_progress = progress
 
         worker = EvidenceTraceWorker(self._db_path, fid)
-        worker.progress.connect(progress.setLabelText)
-        worker.finished.connect(self._on_why_ready)
-        worker.failed.connect(self._on_why_failed)
+        worker.progress.connect(self._on_why_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_why_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_why_failed, Qt.ConnectionType.QueuedConnection)
         self._workers.start(worker)
+
+    @Slot(str)
+    def _on_why_progress(self, message: str) -> None:
+        progress = getattr(self, "_why_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
 
     def _finish_why_progress(self) -> None:
         progress = getattr(self, "_why_progress", None)
@@ -431,6 +445,7 @@ class PreviewDialog(QDialog):
             progress.deleteLater()
             self._why_progress = None
 
+    @Slot(object)
     def _on_why_ready(self, trace) -> None:
         from ppa.evidence_inspector import concise_text
         self._finish_why_progress()
@@ -448,6 +463,7 @@ class PreviewDialog(QDialog):
         layout.addLayout(row)
         dialog.exec()
 
+    @Slot(str)
     def _on_why_failed(self, message: str) -> None:
         self._finish_why_progress()
         QMessageBox.warning(self, "Evidence Inspector", f"Could not build evidence trace: {message}")

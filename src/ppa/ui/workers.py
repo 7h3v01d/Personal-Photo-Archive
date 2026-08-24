@@ -18,7 +18,13 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QMetaObject
+
+try:
+    from shiboken6 import isValid as _qt_object_is_valid
+except ImportError:  # pragma: no cover - supplied with PySide6
+    def _qt_object_is_valid(obj):
+        return obj is not None
 from PySide6.QtGui import QImage
 
 from ppa.db import connect
@@ -42,6 +48,7 @@ class ScanWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        conn = None
         try:
             conn = connect(self._db_path)  # own connection, this thread
             report = scan_library(
@@ -49,10 +56,12 @@ class ScanWorker(QObject):
                 progress_cb=self.progress.emit,
                 protected_paths=self._protected_paths,
             )
-            conn.close()
             self.finished.emit(report)
         except Exception as exc:  # surfaced to the UI, never swallowed
             self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 class VerifyWorker(QObject):
@@ -66,13 +75,16 @@ class VerifyWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        conn = None
         try:
             conn = connect(self._db_path)
             report = verify_library(conn, progress_cb=self.progress.emit)
-            conn.close()
             self.finished.emit(report)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 class MetadataWorker(QObject):
@@ -86,13 +98,16 @@ class MetadataWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        conn = None
         try:
             conn = connect(self._db_path)
             count = extract_stale(conn, progress_cb=self.progress.emit)
-            conn.close()
             self.finished.emit(count)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 class DateReviewQueueWorker(QObject):
@@ -337,6 +352,56 @@ class ThumbnailWorker(QObject):
             self.ready.emit(file_id, img)
 
 
+class EventHomeWorker(QObject):
+    """Build Phase-8.9 Timeline + Family History projection off-thread."""
+    progress = Signal(str)
+    finished = Signal(object, object, object, object)  # TimelineView, EventHomeView, EventSearchIndex, EventHealthView
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._library_id = library_id
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.event_home import build_event_home
+            from ppa.event_search import build_event_search_index
+            from ppa.timeline import build_timeline
+            self.progress.emit("Family History: building chronology projection…")
+            conn = connect(self._db_path)
+            view = build_timeline(conn, library_id=self._library_id)
+            if self._cancel.is_set():
+                self.cancelled.emit(); return
+            self.progress.emit("Family History: assembling Event cards…")
+            home = build_event_home(conn, view)
+            if self._cancel.is_set():
+                self.cancelled.emit(); return
+            self.progress.emit("Family History: building search index…")
+            search_index = build_event_search_index(conn, home)
+            if self._cancel.is_set():
+                self.cancelled.emit(); return
+            self.progress.emit("Family History: evaluating curation health…")
+            from ppa.event_health import build_event_health_view
+            health = build_event_health_view(conn, view)
+            if self._cancel.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(view, home, search_index, health)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 class WorkerHandle:
     """Owns a (worker, thread) pair and keeps both alive until done."""
 
@@ -345,13 +410,17 @@ class WorkerHandle:
         self.thread = thread
 
 
-class WorkerRegistry:
-    """Keeps strong references to in-flight workers/threads (GC-safety) and
-    tears them down cleanly when they finish. This is the explicit form of
-    the usual ``self._worker_refs`` list.
+class WorkerRegistry(QObject):
+    """Own background workers and retire them on the registry's QObject thread.
+
+    Terminal worker signals only request ``QThread.quit``.  Actual cleanup is
+    performed from the decorated ``thread.finished`` receiver below.  This
+    deliberately avoids un-affined Python lambdas running in a worker context
+    and potentially asking a QThread to wait for itself.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
         self._handles: list[WorkerHandle] = []
 
     def start(self, worker: QObject, *, run_slot: str = "run") -> WorkerHandle:
@@ -360,38 +429,60 @@ class WorkerRegistry:
         handle = WorkerHandle(worker, thread)
         self._handles.append(handle)
 
-        thread.started.connect(getattr(worker, run_slot))
+        thread.started.connect(getattr(worker, run_slot), Qt.ConnectionType.QueuedConnection)
 
-        # When the worker signals completion, quit the thread and drop refs.
+        # Every terminal path requests a normal QThread event-loop exit.  The
+        # thread.finished signal is emitted after the worker thread has stopped;
+        # the registry then drops strong references on its own QObject thread.
         for sig_name in ("finished", "failed", "cancelled"):
             sig = getattr(worker, sig_name, None)
             if sig is not None:
-                sig.connect(lambda *_, h=handle: self._retire(h))
+                # Standard worker-object lifecycle: schedule deletion on the
+                # worker's own thread, then request that thread to exit.
+                sig.connect(worker.deleteLater)
+                sig.connect(thread.quit, Qt.ConnectionType.QueuedConnection)
+        thread.finished.connect(self._on_thread_finished, Qt.ConnectionType.QueuedConnection)
 
         thread.start()
         return handle
 
     def start_persistent(self, worker: QObject) -> WorkerHandle:
-        """Start a worker with no run slot (it reacts to queued signals) and
-        keep it alive for the app's lifetime.
-        """
+        """Start a worker with no run slot and keep it until shutdown."""
         thread = QThread()
         worker.moveToThread(thread)
         handle = WorkerHandle(worker, thread)
         self._handles.append(handle)
+        thread.finished.connect(self._on_thread_finished, Qt.ConnectionType.QueuedConnection)
         thread.start()
         return handle
 
-    def _retire(self, handle: WorkerHandle) -> None:
-        handle.thread.quit()
-        handle.thread.wait()
-        if handle in self._handles:
-            self._handles.remove(handle)
-
-    def shutdown(self) -> None:
+    @Slot()
+    def _on_thread_finished(self) -> None:
+        thread = self.sender()
         for handle in list(self._handles):
-            handle.thread.quit()
-            handle.thread.wait()
+            if handle.thread is thread:
+                self._handles.remove(handle)
+                handle.thread.deleteLater()
+                break
+
+    @Slot()
+    def shutdown(self) -> None:
+        # Called from the owning/UI thread. A terminal worker may already have
+        # executed deleteLater() while the registry's queued thread.finished
+        # cleanup has not yet run. Never invoke a method through an invalid
+        # Shiboken wrapper in that window.
+        handles = list(self._handles)
+        for handle in handles:
+            if handle.thread.isRunning():
+                if _qt_object_is_valid(handle.worker):
+                    QMetaObject.invokeMethod(
+                        handle.worker, "deleteLater", Qt.ConnectionType.QueuedConnection)
+                handle.thread.quit()
+        for handle in handles:
+            if QThread.currentThread() is not handle.thread and handle.thread.isRunning():
+                handle.thread.wait()
+            if _qt_object_is_valid(handle.thread):
+                handle.thread.deleteLater()
         self._handles.clear()
 
 class PilotAuditWorker(QObject):

@@ -98,6 +98,26 @@ def sanitize_text(text: str, pairs: Iterable[tuple[str, str]]) -> str:
     return out
 
 
+def sanitize_data(value, pairs: Iterable[tuple[str, str]]):
+    """Recursively sanitize strings in structured diagnostic data.
+
+    Redaction belongs before JSON serialization.  Sanitizing an already-dumped
+    JSON string is representation-sensitive on Windows because backslashes are
+    escaped (``\\`` becomes ``\\\\``), which can let an otherwise known
+    private path survive.  This helper keeps redaction at the data boundary.
+    """
+    pairs = tuple(pairs)
+    if isinstance(value, str):
+        return sanitize_text(value, pairs)
+    if isinstance(value, dict):
+        return {sanitize_text(str(k), pairs): sanitize_data(v, pairs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_data(v, pairs) for v in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_data(v, pairs) for v in value)
+    return value
+
+
 def _candidate_log_files(log_path: Path) -> list[Path]:
     files: list[Path] = []
     for base in (log_path, structured_log_path(log_path)):

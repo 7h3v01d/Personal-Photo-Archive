@@ -119,6 +119,97 @@ def main(argv: list[str] | None = None) -> int:
     timeline_parser.add_argument("--json", dest="json_path", default=None,
                                  help="Write structured timeline JSON to this path")
 
+    cluster_parser = subparsers.add_parser(
+        "timeline-clusters", help="Detect provisional read-only chronological browsing clusters")
+    cluster_parser.add_argument("library_id", type=int, help="Library id to view")
+    cluster_parser.add_argument("--directory", default=None,
+                                help="Relative directory prefix within the library")
+    cluster_parser.add_argument("--json", dest="json_path", default=None,
+                                help="Write structured cluster JSON to this path")
+
+    story_parser = subparsers.add_parser(
+        "event-story", help="Render one durable human Event as a read-only story view")
+    story_parser.add_argument("event_id", help="Event UUID to render")
+    story_parser.add_argument("--json", dest="json_path", default=None,
+                              help="Write structured event-story JSON to this path")
+
+    event_browse_parser = subparsers.add_parser(
+        "event-browse", help="List durable human Events in deterministic story-reading order")
+    event_browse_parser.add_argument("library_id", type=int, help="Library id to browse")
+    event_browse_parser.add_argument("--json", dest="json_path", default=None,
+                                     help="Write structured event-browse JSON to this path")
+
+    event_home_parser = subparsers.add_parser(
+        "event-home", help="Build the read-only Family History Event-card landing view")
+    event_home_parser.add_argument("library_id", type=int, help="Library id to browse")
+    event_home_parser.add_argument("--json", dest="json_path", default=None,
+                                   help="Write structured Family History JSON to this path")
+
+    event_health_parser = subparsers.add_parser(
+        "event-health", help="Summarise read-only Event curation/chronology attention indicators")
+    event_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
+    event_health_parser.add_argument("--json", dest="json_path", default=None,
+                                     help="Write structured Event-health JSON to this path")
+
+    event_search_parser = subparsers.add_parser(
+        "event-search", help="Search human-authored Events and Story Context")
+    event_search_parser.add_argument("library_id", type=int, help="Library id to search")
+    event_search_parser.add_argument("query", nargs="?", default="", help="Search text; tokens use AND semantics")
+    event_search_parser.add_argument("--year", type=int, default=None, help="Restrict to Events starting in this year")
+    event_search_parser.add_argument("--from", dest="start_date", default=None, help="Inclusive Event-span start filter (YYYY-MM-DD)")
+    event_search_parser.add_argument("--to", dest="end_date", default=None, help="Inclusive Event-span end filter (YYYY-MM-DD)")
+    event_search_parser.add_argument("--occasion", default=None, help="Restrict to matching human occasion/context text")
+    event_search_parser.add_argument("--place", default=None, help="Restrict to matching remembered place text")
+    event_search_parser.add_argument("--person", default=None, help="Restrict to matching people notes")
+    event_search_parser.add_argument("--json", dest="json_path", default=None,
+                                     help="Write structured Event-search JSON to this path")
+
+    event_activity_parser = subparsers.add_parser(
+        "event-activity", help="Manage Event favourites and inspect recent Story navigation")
+    event_activity_sub = event_activity_parser.add_subparsers(dest="event_activity_command", required=True)
+    ea_fav = event_activity_sub.add_parser("favorite", help="Mark/unmark one Event as favourite")
+    ea_fav.add_argument("event_id"); ea_fav.add_argument("--off", action="store_true")
+    ea_recent = event_activity_sub.add_parser("recent", help="List recently viewed Events")
+    ea_recent.add_argument("library_id", type=int); ea_recent.add_argument("--limit", type=int, default=20)
+    ea_list = event_activity_sub.add_parser("favorites", help="List favourite Events")
+    ea_list.add_argument("library_id", type=int)
+
+    organize_parser = subparsers.add_parser(
+        "organize", help="Manage Phase-9 logical-photo Albums and Tags")
+    organize_sub = organize_parser.add_subparsers(dest="organize_command", required=True)
+    org_albums = organize_sub.add_parser("albums", help="List Albums in one Library")
+    org_albums.add_argument("library_id", type=int)
+    org_album_create = organize_sub.add_parser("album-create", help="Create an Album")
+    org_album_create.add_argument("library_id", type=int); org_album_create.add_argument("name")
+    org_album_create.add_argument("--description", default=None)
+    org_album_add = organize_sub.add_parser("album-add", help="Add a logical Photo to an Album")
+    org_album_add.add_argument("album_id"); org_album_add.add_argument("photo_id")
+    org_album_remove = organize_sub.add_parser("album-remove", help="Remove a logical Photo from an Album")
+    org_album_remove.add_argument("album_id"); org_album_remove.add_argument("photo_id")
+    org_tags = organize_sub.add_parser("tags", help="List Tags in one Library")
+    org_tags.add_argument("library_id", type=int)
+    org_tag_create = organize_sub.add_parser("tag-create", help="Create/reuse a Tag")
+    org_tag_create.add_argument("library_id", type=int); org_tag_create.add_argument("name")
+    org_tag_add = organize_sub.add_parser("tag-add", help="Apply a Tag to a logical Photo")
+    org_tag_add.add_argument("tag_id"); org_tag_add.add_argument("photo_id")
+    org_tag_remove = organize_sub.add_parser("tag-remove", help="Remove a Tag from a logical Photo")
+    org_tag_remove.add_argument("tag_id"); org_tag_remove.add_argument("photo_id")
+
+    event_views_parser = subparsers.add_parser(
+        "event-views", help="Manage durable saved Family History discovery views")
+    event_views_sub = event_views_parser.add_subparsers(dest="event_views_command", required=True)
+    ev_list = event_views_sub.add_parser("list", help="List saved views for one library")
+    ev_list.add_argument("library_id", type=int)
+    ev_save = event_views_sub.add_parser("save", help="Create/update a named saved discovery view")
+    ev_save.add_argument("library_id", type=int); ev_save.add_argument("name")
+    ev_save.add_argument("--query", default=""); ev_save.add_argument("--year", type=int, default=None)
+    ev_save.add_argument("--from", dest="start_date", default=None); ev_save.add_argument("--to", dest="end_date", default=None)
+    ev_save.add_argument("--occasion", default=None); ev_save.add_argument("--place", default=None); ev_save.add_argument("--person", default=None)
+    ev_delete = event_views_sub.add_parser("delete", help="Delete one saved view")
+    ev_delete.add_argument("view_id")
+    ev_run = event_views_sub.add_parser("run", help="Evaluate one saved view against current Events")
+    ev_run.add_argument("view_id"); ev_run.add_argument("--json", dest="json_path", default=None)
+
     pilot_parser = subparsers.add_parser(
         "pilot", help="Read-only collection-level pilot analysis report")
     pilot_sub = pilot_parser.add_subparsers(dest="pilot_command", required=True)
@@ -389,6 +480,192 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
             print(f"\nWrote {args.json_path}")
         return 0
+
+    if args.command == "timeline-clusters":
+        from ppa.timeline import build_timeline
+        from ppa.timeline_clusters import build_clusters, concise_text as cluster_text
+        try:
+            view = build_timeline(conn, library_id=args.library_id,
+                                  directory_prefix=args.directory)
+            result = build_clusters(view)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(cluster_text(result))
+        if args.json_path:
+            Path(args.json_path).write_text(result.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-story":
+        from ppa.events import get_event
+        from ppa.event_story import build_event_story, concise_text as story_text
+        from ppa.timeline import build_timeline
+        try:
+            event = get_event(conn, args.event_id)
+            view = build_timeline(conn, library_id=event.library_id)
+            story = build_event_story(conn, view, event.id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(story_text(story))
+        if args.json_path:
+            Path(args.json_path).write_text(story.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-browse":
+        from ppa.event_navigation import build_event_browse_index, concise_text as browse_text
+        try:
+            index = build_event_browse_index(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(browse_text(index))
+        if args.json_path:
+            Path(args.json_path).write_text(index.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-home":
+        from ppa.event_home import build_event_home, concise_text as home_text
+        from ppa.timeline import build_timeline
+        try:
+            view = build_timeline(conn, library_id=args.library_id)
+            home = build_event_home(conn, view)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(home_text(home))
+        if args.json_path:
+            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-health":
+        from ppa.event_health import build_event_health_view, concise_text as health_text
+        from ppa.timeline import build_timeline
+        try:
+            view = build_timeline(conn, library_id=args.library_id)
+            health = build_event_health_view(conn, view)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(health_text(health))
+        if args.json_path:
+            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-search":
+        from ppa.event_home import build_event_home
+        from ppa.event_search import build_event_search_index, search_event_index, concise_text as search_text
+        from ppa.timeline import build_timeline
+        try:
+            view = build_timeline(conn, library_id=args.library_id)
+            home = build_event_home(conn, view)
+            index = build_event_search_index(conn, home)
+            results = search_event_index(index, text=args.query, year=args.year,
+                                         start_date=args.start_date, end_date=args.end_date,
+                                         occasion=args.occasion, place=args.place, person=args.person)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(search_text(results))
+        if args.json_path:
+            Path(args.json_path).write_text(results.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "event-activity":
+        from ppa.event_activity import list_favorite_event_ids, list_recent_event_ids, set_event_favorite
+        from ppa.events import get_event
+        try:
+            if args.event_activity_command == "favorite":
+                state = set_event_favorite(conn, args.event_id, not args.off)
+                print(("Favourite" if state.favorite else "Not favourite") + f": {args.event_id}")
+                return 0
+            ids = (list_favorite_event_ids(conn, library_id=args.library_id)
+                   if args.event_activity_command == "favorites"
+                   else list_recent_event_ids(conn, library_id=args.library_id, limit=args.limit))
+            for eid in ids:
+                event = get_event(conn, eid)
+                print(f"{eid}  {event.start_date}  {event.name}")
+            return 0
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+
+    if args.command == "organize":
+        from ppa.organization import (add_photo_to_album, create_album, create_tag, list_albums, list_tags,
+                                      remove_photo_from_album, tag_photo, untag_photo)
+        try:
+            if args.organize_command == "albums":
+                for album in list_albums(conn, library_id=args.library_id):
+                    print(f"{album.id}  {album.name}  [{len(album.photo_ids)} photos]")
+                return 0
+            if args.organize_command == "album-create":
+                album = create_album(conn, library_id=args.library_id, name=args.name, description=args.description)
+                print(f"Created Album {album.name}: {album.id}"); return 0
+            if args.organize_command == "album-add":
+                album = add_photo_to_album(conn, args.album_id, args.photo_id)
+                print(f"Album {album.name}: {len(album.photo_ids)} photos"); return 0
+            if args.organize_command == "album-remove":
+                album = remove_photo_from_album(conn, args.album_id, args.photo_id)
+                print(f"Album {album.name}: {len(album.photo_ids)} photos"); return 0
+            if args.organize_command == "tags":
+                for tag in list_tags(conn, library_id=args.library_id):
+                    print(f"{tag.id}  {tag.name}  [{len(tag.photo_ids)} photos]")
+                return 0
+            if args.organize_command == "tag-create":
+                tag = create_tag(conn, library_id=args.library_id, name=args.name)
+                print(f"Tag {tag.name}: {tag.id}"); return 0
+            if args.organize_command == "tag-add":
+                tag = tag_photo(conn, args.tag_id, args.photo_id)
+                print(f"Tag {tag.name}: {len(tag.photo_ids)} photos"); return 0
+            if args.organize_command == "tag-remove":
+                tag = untag_photo(conn, args.tag_id, args.photo_id)
+                print(f"Tag {tag.name}: {len(tag.photo_ids)} photos"); return 0
+        except (ValueError, __import__('sqlite3').IntegrityError) as exc:
+            print(str(exc), file=sys.stderr); return 1
+
+    if args.command == "event-views":
+        from ppa.event_views import delete_event_view, evaluate_saved_view, get_event_view, list_event_views, save_event_view
+        if args.event_views_command == "list":
+            try: views = list_event_views(conn, library_id=args.library_id)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr); return 1
+            for v in views:
+                filters = [f"query={v.query_text!r}"] if v.query_text else []
+                for key, value in (("year", v.year), ("from", v.start_date), ("to", v.end_date), ("occasion", v.occasion_filter), ("place", v.place_filter), ("person", v.person_filter)):
+                    if value is not None: filters.append(f"{key}={value}")
+                print(f"{v.id}  {v.name}" + ("  [" + ", ".join(filters) + "]" if filters else ""))
+            return 0
+        if args.event_views_command == "save":
+            try:
+                v = save_event_view(conn, library_id=args.library_id, name=args.name, query_text=args.query,
+                                    year=args.year, start_date=args.start_date, end_date=args.end_date,
+                                    occasion_filter=args.occasion, place_filter=args.place, person_filter=args.person)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr); return 1
+            print(f"Saved {v.name}: {v.id}"); return 0
+        if args.event_views_command == "delete":
+            if not delete_event_view(conn, args.view_id):
+                print(f"saved Event view not found: {args.view_id}", file=sys.stderr); return 1
+            print("Deleted"); return 0
+        if args.event_views_command == "run":
+            from ppa.event_home import build_event_home
+            from ppa.event_search import build_event_search_index, concise_text as search_text
+            from ppa.timeline import build_timeline
+            try:
+                v = get_event_view(conn, args.view_id)
+                home = build_event_home(conn, build_timeline(conn, library_id=v.library_id))
+                results = evaluate_saved_view(build_event_search_index(conn, home), v)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr); return 1
+            print(search_text(results))
+            if args.json_path:
+                Path(args.json_path).write_text(results.to_json() + "\n", encoding="utf-8"); print(f"\nWrote {args.json_path}")
+            return 0
 
     if args.command == "pilot":
         from ppa.pilot import analyse_pilot, concise_text

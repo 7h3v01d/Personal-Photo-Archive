@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, Slot
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
     QMessageBox, QProgressDialog, QPushButton, QTextEdit, QVBoxLayout,
@@ -173,12 +173,17 @@ class PilotDashboardDialog(QDialog):
             library_id=self._library_id if operation == "start" else None,
             directory_prefix=directory_prefix, label=label)
         self._worker = worker
-        worker.progress.connect(progress.setLabelText)
-        worker.finished.connect(self._operation_ready)
-        worker.failed.connect(self._operation_failed)
-        worker.cancelled.connect(self._operation_cancelled)
+        worker.progress.connect(self._operation_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._operation_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._operation_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._operation_cancelled, Qt.ConnectionType.QueuedConnection)
         progress.canceled.connect(worker.cancel)
         self._registry.start(worker)
+
+    @Slot(str)
+    def _operation_progress(self, message: str) -> None:
+        if self._progress is not None:
+            self._progress.setLabelText(message)
 
     def _finish_progress(self) -> None:
         if self._progress is not None:
@@ -194,16 +199,19 @@ class PilotDashboardDialog(QDialog):
             for w in (self._refresh, self._date, self._unresolved, self._checkpoint, self._close_pilot, self._share):
                 w.setEnabled(False)
 
+    @Slot(object, object)
     def _operation_ready(self, session, current) -> None:
         self._finish_progress()
         self._session = session; self._current = current
         self._render()
 
+    @Slot(str)
     def _operation_failed(self, message: str) -> None:
         self._finish_progress()
         QMessageBox.critical(self, "Pilot Session", message)
         self._render()
 
+    @Slot()
     def _operation_cancelled(self) -> None:
         self._finish_progress(); self._render()
 
@@ -245,10 +253,11 @@ class PilotDashboardDialog(QDialog):
         self._progress = progress
         worker = ReviewProgressExportWorker(self._config, self._session, current, Path(filename))
         self._worker = worker
-        worker.finished.connect(self._share_ready)
-        worker.failed.connect(self._share_failed)
+        worker.finished.connect(self._share_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._share_failed, Qt.ConnectionType.QueuedConnection)
         self._registry.start(worker)
 
+    @Slot(object)
     def _share_ready(self, path) -> None:
         self._finish_progress()
         QMessageBox.information(
@@ -256,6 +265,7 @@ class PilotDashboardDialog(QDialog):
             f"Created:\n{path}\n\nThe bundle contains aggregate progress and scoped run summaries only; "
             "no photos, catalogue database, raw paths, photo IDs, or raw log messages are included.")
 
+    @Slot(str)
     def _share_failed(self, message: str) -> None:
         self._finish_progress()
         QMessageBox.critical(self, "Share progress", f"Could not export report:\n{message}")

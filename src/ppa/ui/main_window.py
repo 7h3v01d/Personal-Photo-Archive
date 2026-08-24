@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl
+from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -54,6 +54,7 @@ from ppa.ui.workers import (
     ThumbnailWorker,
     VerifyWorker,
     TimelineWorker,
+    EventHomeWorker,
     WorkerRegistry,
 )
 
@@ -282,6 +283,10 @@ class MainWindow(QMainWindow):
         self._act_timeline.triggered.connect(self._on_timeline)
         tb.addAction(self._act_timeline)
 
+        self._act_family_history = QAction("Family History", self)
+        self._act_family_history.triggered.connect(self._on_family_history)
+        tb.addAction(self._act_family_history)
+
         self._act_date_review = QAction("Date Review", self)
         self._act_date_review.triggered.connect(self._on_date_review)
         tb.addAction(self._act_date_review)
@@ -383,7 +388,7 @@ class MainWindow(QMainWindow):
 
     def _start_thumbnail_worker(self) -> None:
         self._thumb_worker = ThumbnailWorker(self._cache_dir, size=256)
-        self._thumb_worker.ready.connect(self._on_thumbnail_ready)
+        self._thumb_worker.ready.connect(self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(self._thumb_worker)
         # Genuine cross-thread dispatch: the model's request signal is
         # delivered to the worker's slot on the worker thread (queued), so the
@@ -510,13 +515,14 @@ class MainWindow(QMainWindow):
         self._timeline_progress = progress
         worker = TimelineWorker(self._config.db_path, library_id)
         self._timeline_worker = worker
-        worker.progress.connect(self._on_timeline_progress)
-        worker.finished.connect(self._on_timeline_ready)
-        worker.failed.connect(self._on_timeline_failed)
-        worker.cancelled.connect(self._on_timeline_cancelled)
+        worker.progress.connect(self._on_timeline_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_timeline_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_timeline_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._on_timeline_cancelled, Qt.ConnectionType.QueuedConnection)
         progress.canceled.connect(worker.cancel)
         self._registry.start(worker)
 
+    @Slot(str)
     def _on_timeline_progress(self, message: str) -> None:
         self._run_progress("timeline", message)
         self._status.showMessage(message)
@@ -532,6 +538,7 @@ class MainWindow(QMainWindow):
         self._timeline_worker = None
         self._set_busy(False)
 
+    @Slot(object)
     def _on_timeline_ready(self, view) -> None:
         from ppa.ui.timeline_dialog import TimelineDialog
         self._finish_timeline_progress()
@@ -541,7 +548,7 @@ class MainWindow(QMainWindow):
             "tentative": view.lanes["tentative"].count,
             "unplaced": view.lanes["unplaced"].count,
         })
-        dialog = TimelineDialog(self._conn, view, self)
+        dialog = TimelineDialog(self._conn, view, self, cache_dir=self._cache_dir)
         dialog.show()
         self._timeline_dialog = dialog
         self._status.showMessage(
@@ -550,16 +557,80 @@ class MainWindow(QMainWindow):
             f"{view.lanes['tentative'].count} tentative, "
             f"{view.lanes['unplaced'].count} unplaced.")
 
+    @Slot()
     def _on_timeline_cancelled(self) -> None:
         self._finish_timeline_progress()
         self._run_end("timeline", "cancelled", "Timeline cancelled")
         self._status.showMessage("Timeline cancelled.")
 
+    @Slot(str)
     def _on_timeline_failed(self, message: str) -> None:
         self._finish_timeline_progress()
         self._run_end("timeline", "failed", f"Timeline failed: {message}")
         self._warn(f"Timeline failed: {message}")
         self._status.showMessage("Timeline failed.")
+
+    def _on_family_history(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Family History",
+                                    "Select or scan a library before opening Family History.")
+            return
+        if self._busy:
+            return
+        self._run_begin("family_history", "family_history", "Family History requested", {"library_id": library_id})
+        self._set_busy(True)
+        self._status.showMessage("Family History: building Event index…")
+        progress = QProgressDialog("Building Family History…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Family History")
+        progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._family_history_progress = progress
+        worker = EventHomeWorker(self._config.db_path, library_id)
+        self._family_history_worker = worker
+        worker.progress.connect(self._on_family_history_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_family_history_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_family_history_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._on_family_history_cancelled, Qt.ConnectionType.QueuedConnection)
+        progress.canceled.connect(worker.cancel)
+        self._registry.start(worker)
+
+    @Slot(str)
+    def _on_family_history_progress(self, message: str) -> None:
+        self._run_progress("family_history", message)
+        self._status.showMessage(message)
+        progress = getattr(self, "_family_history_progress", None)
+        if progress is not None:
+            progress.setLabelText(message)
+
+    def _finish_family_history_progress(self) -> None:
+        progress = getattr(self, "_family_history_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater(); self._family_history_progress = None
+        self._family_history_worker = None
+        self._set_busy(False)
+
+    @Slot(object, object, object, object)
+    def _on_family_history_ready(self, view, home, search_index, health_view) -> None:
+        from ppa.ui.event_home_dialog import EventHomeDialog
+        self._finish_family_history_progress()
+        self._run_end("family_history", "success", "Family History ready", {"events": len(home.cards)})
+        dialog = EventHomeDialog(self._conn, view, home, search_index, health_view, self, cache_dir=self._cache_dir / "family-history")
+        dialog.show(); self._family_history_dialog = dialog
+        self._status.showMessage(f"Family History ready — {len(home.cards)} named event{'s' if len(home.cards) != 1 else ''}.")
+
+    @Slot()
+    def _on_family_history_cancelled(self) -> None:
+        self._finish_family_history_progress()
+        self._run_end("family_history", "cancelled", "Family History cancelled")
+        self._status.showMessage("Family History cancelled.")
+
+    @Slot(str)
+    def _on_family_history_failed(self, message: str) -> None:
+        self._finish_family_history_progress()
+        self._run_end("family_history", "failed", f"Family History failed: {message}")
+        self._warn(f"Family History failed: {message}")
+        self._status.showMessage("Family History failed.")
 
     def _on_date_review(self) -> None:
         library_id = self._current_library_id()
@@ -587,13 +658,14 @@ class MainWindow(QMainWindow):
 
         worker = DateReviewQueueWorker(self._config.db_path, library_id, directory_prefix=directory_prefix, file_ids=file_ids)
         self._date_review_worker = worker
-        worker.progress.connect(self._on_date_review_progress)
-        worker.finished.connect(self._on_date_review_ready)
-        worker.failed.connect(self._on_date_review_failed)
-        worker.cancelled.connect(self._on_date_review_cancelled)
+        worker.progress.connect(self._on_date_review_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_date_review_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_date_review_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._on_date_review_cancelled, Qt.ConnectionType.QueuedConnection)
         progress.canceled.connect(worker.cancel)
         self._registry.start(worker)
 
+    @Slot(str)
     def _on_date_review_progress(self, message: str) -> None:
         self._run_progress("date_review", message)
         self._status.showMessage(message)
@@ -610,6 +682,7 @@ class MainWindow(QMainWindow):
         self._date_review_worker = None
         self._set_busy(False)
 
+    @Slot(object)
     def _on_date_review_ready(self, queue) -> None:
         from ppa.ui.preview_dialog import PreviewDialog
 
@@ -641,11 +714,13 @@ class MainWindow(QMainWindow):
             self._status.showMessage(
                 f"Date Review ready — {len(items)} actionable item(s) prioritised.")
 
+    @Slot()
     def _on_date_review_cancelled(self) -> None:
         self._finish_date_review_progress()
         self._run_end("date_review", "cancelled", "Date Review cancelled")
         self._status.showMessage("Date Review cancelled.")
 
+    @Slot(str)
     def _on_date_review_failed(self, message: str) -> None:
         self._finish_date_review_progress()
         self._run_end("date_review", "failed", f"Date Review failed: {message}")
@@ -677,13 +752,14 @@ class MainWindow(QMainWindow):
         self._unresolved_progress = progress
         worker = UnresolvedMemoriesWorker(self._config.db_path, library_id, directory_prefix=directory_prefix, file_ids=file_ids)
         self._unresolved_worker = worker
-        worker.progress.connect(self._on_unresolved_progress)
-        worker.finished.connect(self._on_unresolved_ready)
-        worker.failed.connect(self._on_unresolved_failed)
-        worker.cancelled.connect(self._on_unresolved_cancelled)
+        worker.progress.connect(self._on_unresolved_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_unresolved_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_unresolved_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._on_unresolved_cancelled, Qt.ConnectionType.QueuedConnection)
         progress.canceled.connect(worker.cancel)
         self._registry.start(worker)
 
+    @Slot(str)
     def _on_unresolved_progress(self, message: str) -> None:
         self._run_progress("unresolved", message)
         self._status.showMessage(message)
@@ -699,6 +775,7 @@ class MainWindow(QMainWindow):
         self._unresolved_worker = None
         self._set_busy(False)
 
+    @Slot(object)
     def _on_unresolved_ready(self, view) -> None:
         from ppa.ui.preview_dialog import PreviewDialog
         self._finish_unresolved_progress()
@@ -721,11 +798,13 @@ class MainWindow(QMainWindow):
             f"Unresolved Memories — {view.unresolved_count} photo(s) intentionally unresolved"
             + (f" · {summary}" if summary else ""))
 
+    @Slot()
     def _on_unresolved_cancelled(self) -> None:
         self._finish_unresolved_progress()
         self._run_end("unresolved", "cancelled", "Unresolved Memories cancelled")
         self._status.showMessage("Unresolved Memories cancelled.")
 
+    @Slot(str)
     def _on_unresolved_failed(self, message: str) -> None:
         self._finish_unresolved_progress()
         self._run_end("unresolved", "failed", f"Unresolved Memories failed: {message}")
@@ -825,13 +904,14 @@ class MainWindow(QMainWindow):
         self._pilot_audit_progress = progress
         worker = PilotAuditWorker(self._config.db_path, library_id)
         self._pilot_audit_worker = worker
-        worker.progress.connect(self._on_pilot_audit_progress)
-        worker.finished.connect(self._on_pilot_audit_ready)
-        worker.failed.connect(self._on_pilot_audit_failed)
-        worker.cancelled.connect(self._on_pilot_audit_cancelled)
+        worker.progress.connect(self._on_pilot_audit_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_pilot_audit_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_pilot_audit_failed, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._on_pilot_audit_cancelled, Qt.ConnectionType.QueuedConnection)
         progress.canceled.connect(worker.cancel)
         self._registry.start(worker)
 
+    @Slot(str)
     def _on_pilot_audit_progress(self, message: str) -> None:
         self._run_progress("pilot_audit", message)
         self._status.showMessage(message)
@@ -847,6 +927,7 @@ class MainWindow(QMainWindow):
         self._pilot_audit_worker = None
         self._set_busy(False)
 
+    @Slot(object)
     def _on_pilot_audit_ready(self, snapshot) -> None:
         from ppa.pilot_audit import concise_text
         self._finish_pilot_audit_progress()
@@ -867,11 +948,13 @@ class MainWindow(QMainWindow):
             f"Pilot Audit — {snapshot.usable_chronology.count}/{snapshot.total_files} usable; "
             f"{snapshot.unresolved.count} unresolved")
 
+    @Slot()
     def _on_pilot_audit_cancelled(self) -> None:
         self._finish_pilot_audit_progress()
         self._run_end("pilot_audit", "cancelled", "Pilot Audit cancelled")
         self._status.showMessage("Pilot Audit cancelled.")
 
+    @Slot(str)
     def _on_pilot_audit_failed(self, message: str) -> None:
         self._finish_pilot_audit_progress()
         self._run_end("pilot_audit", "failed", f"Pilot Audit failed: {message}")
@@ -879,6 +962,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Pilot Audit failed.")
 
     # --- thumbnails ---------------------------------------------------------
+    @Slot(str, object)
     def _on_thumbnail_ready(self, file_id: str, image) -> None:
         self._model.set_thumbnail(file_id, QPixmap.fromImage(image))
 
@@ -932,19 +1016,22 @@ class MainWindow(QMainWindow):
         worker = ScanWorker(
             self._config.db_path, self._current_library, protected_paths=protected
         )
-        worker.progress.connect(self._on_scan_progress)
-        worker.finished.connect(self._on_scan_done)
-        worker.failed.connect(self._on_scan_failed)
+        worker.progress.connect(self._on_scan_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_scan_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_scan_failed, Qt.ConnectionType.QueuedConnection)
         self._registry.start(worker)
 
+    @Slot(str)
     def _on_scan_progress(self, message: str) -> None:
         self._run_progress("scan", message)
         self._status.showMessage(message)
 
+    @Slot(str)
     def _on_scan_failed(self, message: str) -> None:
         self._run_end("scan", "failed", f"Scan failed: {message}")
         self._on_worker_failed(message)
 
+    @Slot(object)
     def _on_scan_done(self, report) -> None:
         self._run_end("scan", "success", "Scan complete", {"new_files": report.new_files, "moved_files": report.moved_files, "duplicates": report.duplicate_files, "missing": report.missing_files})
         self.refresh()
@@ -963,11 +1050,16 @@ class MainWindow(QMainWindow):
         if not auto:
             self._status.showMessage("Reading metadata…")
         worker = MetadataWorker(self._config.db_path)
-        worker.progress.connect(self._status.showMessage)
-        worker.finished.connect(self._on_metadata_done)
-        worker.failed.connect(self._on_worker_failed)
+        worker.progress.connect(self._on_metadata_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_metadata_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
         self._registry.start(worker)
 
+    @Slot(str)
+    def _on_metadata_progress(self, message: str) -> None:
+        self._status.showMessage(message)
+
+    @Slot(int)
     def _on_metadata_done(self, count: int) -> None:
         self._set_busy(False)
         # Metadata doesn't change which files are in the grid, so don't rebuild
@@ -988,11 +1080,16 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self._status.showMessage("Starting integrity verification…")
         worker = VerifyWorker(self._config.db_path)
-        worker.progress.connect(self._status.showMessage)
-        worker.finished.connect(self._on_verify_done)
-        worker.failed.connect(self._on_worker_failed)
+        worker.progress.connect(self._on_verify_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_verify_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
         self._registry.start(worker)
 
+    @Slot(str)
+    def _on_verify_progress(self, message: str) -> None:
+        self._status.showMessage(message)
+
+    @Slot(object)
     def _on_verify_done(self, report) -> None:
         self._set_busy(False)
         self.refresh()
@@ -1004,6 +1101,7 @@ class MainWindow(QMainWindow):
         if report.mismatches or report.corrupt or report.now_missing:
             QMessageBox.warning(self, "Integrity issues found", msg)
 
+    @Slot(str)
     def _on_worker_failed(self, message: str) -> None:
         self._set_busy(False)
         self._warn(f"Operation failed: {message}")
@@ -1021,4 +1119,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._registry.shutdown()
-        super().closeEvent(event)
+        try:
+            self._conn.close()
+        finally:
+            super().closeEvent(event)
