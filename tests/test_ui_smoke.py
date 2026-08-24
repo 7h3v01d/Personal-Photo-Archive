@@ -262,3 +262,165 @@ def test_preview_stale_proposal_offers_refresh_not_confirm(app, tmp_path: Path) 
     assert dlg._confirm_btn.isVisibleTo(dlg)                   # refreshed -> confirmable
     assert "2005-12-25" in dlg._caption.text()                # now the current proposal
     conn.close()
+
+
+def test_phase8_needs_attention_includes_hidden_event_members(app, tmp_path: Path) -> None:
+    """Regression for 8.14: incomplete hidden-member Events must be actionable."""
+    from ppa import catalogue
+    from ppa.event_health import build_event_health_view
+    from ppa.event_home import build_event_home
+    from ppa.event_search import build_event_search_index
+    from ppa.events import create_event_from_cluster, update_event_context
+    from ppa.timeline import TimelineBucket, TimelineItem, TimelineView
+    from ppa.timeline_clusters import DayCount, TimelineCluster
+    from ppa.ui.event_home_dialog import EventHomeDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    rows = conn.execute("SELECT id,filename FROM files ORDER BY filename").fetchall()
+    ids = tuple(r["id"] for r in rows)
+    cluster = TimelineCluster(
+        "ui-hidden", "day_burst", "x", "2004-12-25", "2004-12-25",
+        len(ids), ids, (), (DayCount("2004-12-25", len(ids)),), "test")
+    event = create_event_from_cluster(conn, library_id=lib_id, cluster=cluster, name="Christmas")
+    update_event_context(conn, event.id, story_text="Family story")
+    one_cluster = TimelineCluster(
+        "ui-complete", "day_burst", "x", "2004-12-25", "2004-12-25",
+        1, (ids[0],), (), (DayCount("2004-12-25", 1),), "test")
+    complete_event = create_event_from_cluster(conn, library_id=lib_id, cluster=one_cluster, name="Lunch")
+    update_event_context(conn, complete_event.id, story_text="Lunch story")
+
+    # Deliberately project only one member. The other durable Christmas Event members are
+    # outside the current Timeline scope and must therefore trigger Attention.
+    item = TimelineItem(ids[0], rows[0]["filename"], "placed", "reconciled", "2004-12-25", None,
+                        "PROBABLY_VALID", None, None, None, False, False, "test")
+    scope = type("Scope", (), {"library_id": lib_id})()
+    lanes = {
+        "placed": TimelineBucket("placed", 1, (ids[0],)),
+        "range": TimelineBucket("range", 0, ()),
+        "tentative": TimelineBucket("tentative", 0, ()),
+        "unplaced": TimelineBucket("unplaced", 0, ()),
+    }
+    view = TimelineView("ppa-timeline/1", "x", True, scope, (item,), lanes, ())
+    home = build_event_home(conn, view)
+    search = build_event_search_index(conn, home)
+    health = build_event_health_view(conn, view)
+    assert health.event(event.id).hidden_members == 2
+    assert health.event(event.id).needs_attention
+
+    dlg = EventHomeDialog(conn, view, home, search, health, None, cache_dir=tmp_path / "thumbs")
+    try:
+        attention_index = dlg._activity_filter.findData("attention")
+        dlg._activity_filter.setCurrentIndex(attention_index)
+        app.processEvents()
+        assert [c.event_id for c in dlg._visible] == [event.id]
+        complete_index = dlg._activity_filter.findData("complete")
+        dlg._activity_filter.setCurrentIndex(complete_index)
+        app.processEvents()
+        assert [c.event_id for c in dlg._visible] == [complete_event.id]
+        dlg._search.setText("Lunch")
+        app.processEvents()
+        assert [c.event_id for c in dlg._visible] == [complete_event.id]
+    finally:
+        dlg._registry.shutdown()
+        dlg.close()
+        conn.close()
+
+
+def test_worker_registry_delivers_gui_receiver_on_main_qt_thread(app) -> None:
+    """Cross-thread regression: GUI receiver must execute on QApplication thread."""
+    from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer, Signal, Slot, Qt
+    from ppa.ui.workers import WorkerRegistry
+
+    class ProbeWorker(QObject):
+        finished = Signal(object)
+
+        @Slot()
+        def run(self):
+            self.finished.emit(QThread.currentThread())
+
+    class Receiver(QObject):
+        def __init__(self, loop):
+            super().__init__()
+            self.loop = loop
+            self.sender_thread = None
+            self.receiver_thread = None
+
+        @Slot(object)
+        def receive(self, sender_thread):
+            self.sender_thread = sender_thread
+            self.receiver_thread = QThread.currentThread()
+            self.loop.quit()
+
+    registry = WorkerRegistry()
+    loop = QEventLoop()
+    worker = ProbeWorker()
+    receiver = Receiver(loop)
+    worker.finished.connect(receiver.receive, Qt.ConnectionType.QueuedConnection)
+    registry.start(worker)
+    QTimer.singleShot(3000, loop.quit)
+    loop.exec()
+    try:
+        assert receiver.sender_thread is not None
+        assert receiver.sender_thread is not app.thread()
+        assert receiver.receiver_thread is app.thread()
+    finally:
+        registry.shutdown()
+
+
+def test_phase8_timeline_and_story_dialogs_construct(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.events import create_event_from_cluster, update_event_context
+    from ppa.timeline import build_timeline
+    from ppa.timeline_clusters import DayCount, TimelineCluster
+    from ppa.ui.event_story_dialog import EventStoryDialog
+    from ppa.ui.timeline_dialog import TimelineDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    view = build_timeline(conn, library_id=lib_id)
+    ids = tuple(i.file_id for i in view.items)
+    cluster = TimelineCluster(
+        "ui-story", "day_burst", "x", "2004-12-25", "2004-12-25",
+        len(ids), ids, (), (DayCount("2004-12-25", len(ids)),), "test")
+    event = create_event_from_cluster(conn, library_id=lib_id, cluster=cluster, name="Story Event")
+    update_event_context(conn, event.id, story_text="A human-authored story")
+
+    timeline = TimelineDialog(conn, view, None, cache_dir=tmp_path / "timeline-thumbs")
+    story = EventStoryDialog(conn, view, event.id, None, cache_dir=tmp_path / "story-thumbs")
+    try:
+        app.processEvents()
+        assert timeline.windowTitle() == "Chronology Timeline"
+        assert story.windowTitle() == "Story Event"
+        assert story._story.event.id == event.id
+    finally:
+        timeline._registry.shutdown(); timeline.close()
+        story._registry.shutdown(); story.close()
+        conn.close()
+
+
+def test_legacy_workers_close_sqlite_connection_on_failure(app, monkeypatch, tmp_path: Path) -> None:
+    """Scan/Verify/Metadata must close their worker-owned DB on exceptions."""
+    from ppa.ui import workers
+
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+        def close(self):
+            self.closed = True
+
+    cases = [
+        (workers.ScanWorker(tmp_path / "x.sqlite", tmp_path), "scan_library"),
+        (workers.VerifyWorker(tmp_path / "x.sqlite"), "verify_library"),
+        (workers.MetadataWorker(tmp_path / "x.sqlite"), "extract_stale"),
+    ]
+    for worker, operation_name in cases:
+        fake = FakeConnection()
+        monkeypatch.setattr(workers, "connect", lambda _path, f=fake: f)
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(workers, operation_name, boom)
+        worker.run()
+        assert fake.closed, operation_name

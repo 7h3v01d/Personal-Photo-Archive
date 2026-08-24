@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core Hardening ACCEPTED. Phase 6 FROZEN; Phase 7.1.2b FROZEN; Date Review UI 1.1 ACCEPTED. Phase 7.2.1 Pilot Analysis, 7.2.2a responsive Prioritised Date Review Queue, 7.2.3 Anchor Opportunities, and 7.2.4 Evidence Inspector implemented.**
+Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phase 7 complete; Phase 8.14 feature-complete. Phase 8.14.1 pre-Phase-9 hardening closes Event-health semantics, Family History projection performance, Qt worker/thread-affinity, and worker SQLite lifecycle findings from independent adversarial review.**
 
 The Library -> File -> FileRevision -> Observation model holds under attack;
 this slice closed the transaction/identity edges: a failed scan now rolls
@@ -16,8 +16,7 @@ extractor name/version so a version bump re-runs extraction. Catalogue reads
 now use presence_status; `status`/`files.sha256` remain maintained compat
 mirrors.
 
-See `docs/HARDENING.md` for the full findings -> fix -> test map (25 across
-Hardening 1-3.2). Per the reviewer, Phase 6 (Date Reliability Engine) can
+See `docs/HARDENING.md` for the Archive Core findings -> fix -> test map, and `docs/PHASE8_14_1_PRE_PHASE9_HARDENING.md` for the independent pre-Phase-9 UI/integration hardening pass. Per the reviewer, Phase 6 (Date Reliability Engine) can
 unblock once a confirming adversarial pass on this build comes back clean.
 Source-file safety was never implicated: no path writes to originals.
 
@@ -382,3 +381,137 @@ cover preference automatically.
 
 Schema v16 adds `event_presentation` and `event_presentation_history` plus a
 DB-level guard that prevents a non-member photo from becoming an Event cover.
+
+## Phase 8.11 — Event Search & Discovery
+
+**Family History** now supports deterministic read-only search across Event name,
+occasion, remembered place, people notes, description, story text, and the short
+curation note. Multiple search tokens use AND semantics and results report which
+human-authored fields matched. Name/context matches rank ahead of long-form story
+matches; an empty search preserves the existing chronological Event order.
+
+The Family History window also supports inclusive From/To date filters alongside
+the existing year navigator. Search/filtering happens in memory over a background-
+built Event index, so typing never reruns Timeline chronology or queries the DB per
+keystroke. Narrative matches remain discovery-only and cannot affect chronology,
+reconstruction, Event membership, EXIF, metadata observations, or source bytes.
+
+CLI: `python -m ppa.cli event-search <library_id> "query"` with optional `--year`,
+`--from`, `--to`, and `--json`.
+See `docs/PHASE8_11_EVENT_SEARCH_DISCOVERY.md`.
+
+## Phase 8.12 — Saved Event Views & Discovery Facets
+
+Family History now exposes deterministic occasion, remembered-place, and people/group
+facets alongside text/year/date search. Any current combination can be saved under a
+human name such as **Christmas Events**, **Sydney**, or **Mum & Dad** and restored later.
+A saved view stores the query/filter recipe only—not matching Event IDs—so it always
+re-evaluates against current Events and remains discovery metadata rather than archive
+truth. Saved views are Library-owned and schema v17 adds `saved_event_views`.
+
+CLI: `python -m ppa.cli event-views list|save|run|delete ...`; Phase 8.11
+`event-search` also accepts `--occasion`, `--place`, and `--person`.
+See `docs/PHASE8_12_SAVED_EVENT_VIEWS.md`.
+
+## Phase 8.13 — Favourites, Recently Viewed & Continue Reading
+
+Phase 8.13 adds lightweight personal navigation state around durable human Events.
+This state is intentionally **presentation-only** and never participates in
+chronology, Event membership, reconstruction, anchors, metadata, or source-photo
+writes.
+
+### Family History
+
+Family History now includes:
+
+- **All Events**
+- **★ Favourites**
+- **Recently Viewed**
+- **Continue where I left off…**
+
+Opening an Event Story records a recent-view timestamp and increments a view
+counter. The most recently opened Event becomes the Library's Continue target.
+Recent navigation is bounded to the newest 100 Events per Library; Favourites
+remain durable until explicitly removed.
+
+Inside Story View, **☆ Favourite / ★ Favourite** toggles the preference without
+changing the Event itself.
+
+### CLI
+
+```text
+python -m ppa.cli event-activity favorites 1
+python -m ppa.cli event-activity recent 1 --limit 20
+python -m ppa.cli event-activity favorite <event-uuid>
+python -m ppa.cli event-activity favorite <event-uuid> --off
+```
+
+### Schema v18
+
+`event_navigation_state` stores only Event navigation preferences/history:
+
+- favourite flag
+- last viewed timestamp
+- view count
+
+SQLite triggers enforce Event/Library ownership. Deleting an Event cascades its
+navigation state. No photographic evidence or chronology authority is stored in
+this table.
+
+## Phase 8.14 — Event Curation Health & Attention Indicators
+
+Phase 8.14 adds a read-only Event-health projection over the existing Event,
+Story Context, presentation preference, and Timeline state.  It does not create
+new chronology or Event semantics.
+
+Family History can now surface deterministic indicators including:
+
+- Curation complete
+- Has story / Needs story
+- Custom cover / Custom order
+- Contains ranges
+- Contains tentative photos
+- Contains unresolved photos
+- Contains stale chronology
+- Members outside the current Timeline scope
+- Needs chronology review
+
+`Curation complete` is deliberately narrow: the Event has human narrative
+(description or story), all members are visible in the current Timeline
+projection, and none are tentative, unplaced, or stale.  Custom presentation
+preferences are optional and are not required for completion.
+
+Family History adds `Needs Attention` and `Curation Complete` browse filters.
+The same read model is available from the CLI:
+
+```text
+python -m ppa.cli event-health <library-id>
+python -m ppa.cli event-health <library-id> --json event-health.json
+```
+
+Schema: `ppa-event-health/1`.
+
+These indicators are presentation/curation guidance only.  They never alter
+Timeline lanes, date reliability, reconstruction state, anchors, Event
+membership, EXIF, or source photos.
+
+## Phase 9.0 — Albums & Tags Foundation
+
+Phase 9 begins the archive's non-chronological organisation layer. Albums and
+Tags are durable, Library-owned, human-authored catalogue state attached to
+logical Photos rather than physical File copies. Schema v19 adds audited Album
+membership and Tag assignment with database-level cross-Library guards. These
+labels are never chronology evidence and never write source photos.
+
+CLI examples:
+
+```text
+python -m ppa.cli organize album-create 1 "Family Favourites"
+python -m ppa.cli organize albums 1
+python -m ppa.cli organize album-add <album-id> <photo-id>
+python -m ppa.cli organize tag-create 1 Family
+python -m ppa.cli organize tag-add <tag-id> <photo-id>
+python -m ppa.cli organize tags 1
+```
+
+See `docs/PHASE9_0_ALBUMS_TAGS_FOUNDATION.md`.
