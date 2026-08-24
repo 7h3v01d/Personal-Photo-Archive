@@ -559,3 +559,63 @@ def test_phase9_tag_home_constructs_and_intersects(app, tmp_path: Path) -> None:
         assert view.total_members==1
     finally:
         dialog.close(); conn.close()
+
+
+def test_phase9_unified_organization_discovery_constructs_and_selects(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.album_home import build_album_home
+    from ppa.tag_home import build_tag_home
+    from ppa.organization import create_album, add_photo_to_album, create_tag, tag_photo
+    from ppa.organization_views import save_organization_view
+    from ppa.ui.organization_discovery_dialog import OrganizationDiscoveryDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    items = catalogue.grid_items(conn)
+    pids = tuple(dict.fromkeys(i.photo_id for i in items[:2]))
+    album = create_album(conn, library_id=lib_id, name="Holiday")
+    tag = create_tag(conn, library_id=lib_id, name="Family")
+    for pid in pids:
+        add_photo_to_album(conn, album.id, pid); tag_photo(conn, tag.id, pid)
+    saved = save_organization_view(conn, library_id=lib_id, name="Holiday family", album_ids=[album.id], tag_ids=[tag.id])
+    dialog = OrganizationDiscoveryDialog(cfg.db_path, build_album_home(conn, library_id=lib_id),
+                                         build_tag_home(conn, library_id=lib_id), None,
+                                         cache_dir=tmp_path / "discover-thumbs")
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Organisational Discovery"
+        assert dialog._album_list.count() == 1 and dialog._tag_list.count() == 1
+        assert dialog._saved.count() == 2
+        dialog._saved.setCurrentIndex(dialog._saved.findData(saved.id)); app.processEvents()
+        assert dialog._album_list.item(0).isSelected() and dialog._tag_list.item(0).isSelected()
+        dialog._album_list.item(0).setSelected(True); dialog._tag_list.item(0).setSelected(True)
+        app.processEvents()
+        assert dialog._browse.isEnabled()
+        assert "Album: Holiday" in dialog._recipe.text() and "Tag: Family" in dialog._recipe.text()
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_organization_health_dialog_constructs(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, create_tag
+    from ppa.organization_health import build_organization_health
+    from ppa.ui.organization_health_dialog import OrganizationHealthDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    create_album(conn, library_id=lib_id, name="Empty")
+    create_tag(conn, library_id=lib_id, name="Unused")
+    health = build_organization_health(conn, library_id=lib_id)
+    dialog = OrganizationHealthDialog(conn, cfg.db_path, health, None,
+                                      cache_dir=tmp_path / "health-thumbs")
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Organisation Health"
+        assert health.unorganized_count > 0
+        assert len(health.empty_album_ids) == 1
+        assert len(health.unused_tag_ids) == 1
+    finally:
+        dialog.close(); conn.close()

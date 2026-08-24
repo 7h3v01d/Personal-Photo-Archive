@@ -535,3 +535,29 @@ The desktop now includes an **Albums** landing page with paged visual Album card
 ### Phase 9.5 — Tag Home & Organisational Discovery
 
 Tags now have a first-class visual landing page with bounded card paging, deterministic cover representatives, explicit present/missing counts, name search, and direct browsing. Selecting two or more Tags creates an exact logical-Photo set intersection (for example `Family + Beach`) and opens it through the existing bounded organisation browser. Intersections are read-only, same-Library only, and never influence chronology or evidence.
+
+### Phase 9.6 — Unified Organisation Discovery
+
+The desktop now includes **Discover**, a combined Album + Tag query surface.
+Any selected Albums and Tags are evaluated as an exact intersection over
+logical Photo IDs, e.g. `Album: Holidays ∩ Tag: Beach ∩ Tag: Family`.
+Selector indexes and result calculation both run off the GUI thread, while the
+result reuses the existing bounded organisation browser. The structured result
+schema is `ppa-organization-discovery/1`; no schema migration is required.
+See `docs/PHASE9_6_UNIFIED_ORGANIZATION_DISCOVERY.md`.
+
+### Phase 9.7 — Saved Organisation Views
+
+Unified Album/Tag discovery recipes can now be named and reopened. A saved
+view persists only the selected Album and Tag IDs; it never stores matching
+Photo IDs. Reopening the view reevaluates the exact intersection against the
+current organisation state. Saved views are Library-owned, case-insensitively
+unique by name, cross-Library selectors fail closed, and deleting a saved view
+does not alter Albums, Tags, membership, chronology, Events, metadata, or
+source photographs.
+
+CLI: `organization-views list|save|run|delete`.
+
+## Phase 9.8 — Organisation Health & Curation Gaps
+
+Adds a read-only organisation-quality projection for unorganised Photos, no-Album/no-Tag gaps, empty Albums, unused Tags, missing-only memberships, and broken saved discovery recipes. The desktop **Organisation Health** surface can open photo-level gaps in the existing logical-Photo browser. No organisation-health indicator is evidence or chronology authority.
