@@ -165,6 +165,33 @@ def main(argv: list[str] | None = None) -> int:
     tag_intersection_parser.add_argument("--json", dest="json_path", default=None,
                                          help="Write structured intersection JSON to this path")
 
+    org_discovery_parser = subparsers.add_parser(
+        "organization-discovery", help="Browse the explicit logical-Photo intersection of Albums and Tags")
+    org_discovery_parser.add_argument("library_id", type=int, help="Library id to browse")
+    org_discovery_parser.add_argument("--album", dest="album_ids", action="append", default=[], help="Album UUID; repeat for multiple Albums")
+    org_discovery_parser.add_argument("--tag", dest="tag_ids", action="append", default=[], help="Tag UUID; repeat for multiple Tags")
+    org_discovery_parser.add_argument("--json", dest="json_path", default=None, help="Write structured discovery JSON to this path")
+
+    org_views_parser = subparsers.add_parser(
+        "organization-views", help="Manage durable saved Album/Tag discovery recipes")
+    org_views_sub = org_views_parser.add_subparsers(dest="organization_views_command", required=True)
+    ov_list = org_views_sub.add_parser("list", help="List saved organisation views for one Library")
+    ov_list.add_argument("library_id", type=int)
+    ov_save = org_views_sub.add_parser("save", help="Create/update a named saved organisation view")
+    ov_save.add_argument("library_id", type=int); ov_save.add_argument("name")
+    ov_save.add_argument("--album", dest="album_ids", action="append", default=[])
+    ov_save.add_argument("--tag", dest="tag_ids", action="append", default=[])
+    ov_delete = org_views_sub.add_parser("delete", help="Delete one saved organisation view")
+    ov_delete.add_argument("view_id")
+    ov_run = org_views_sub.add_parser("run", help="Evaluate one saved organisation view against current membership")
+    ov_run.add_argument("view_id"); ov_run.add_argument("--json", dest="json_path", default=None)
+
+    organization_health_parser = subparsers.add_parser(
+        "organization-health", help="Summarise read-only Album/Tag curation gaps")
+    organization_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
+    organization_health_parser.add_argument("--json", dest="json_path", default=None,
+                                            help="Write structured organisation-health JSON")
+
     event_health_parser = subparsers.add_parser(
         "event-health", help="Summarise read-only Event curation/chronology attention indicators")
     event_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
@@ -600,6 +627,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nWrote {args.json_path}")
         return 0
 
+    if args.command == "organization-discovery":
+        from ppa.organization_discovery import build_organization_discovery, concise_text as discovery_text
+        try:
+            result=build_organization_discovery(conn,library_id=args.library_id,album_ids=tuple(args.album_ids),tag_ids=tuple(args.tag_ids))
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
+        print(discovery_text(result))
+        if args.json_path:
+            Path(args.json_path).write_text(result.to_json()+"\n",encoding="utf-8"); print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "organization-health":
+        from ppa.organization_health import build_organization_health, concise_text as organization_health_text
+        try:
+            health = build_organization_health(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(organization_health_text(health))
+        if args.json_path:
+            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
     if args.command == "event-health":
         from ppa.event_health import build_event_health_view, concise_text as health_text
         from ppa.timeline import build_timeline
@@ -685,6 +735,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Tag {tag.name}: {len(tag.photo_ids)} photos"); return 0
         except (ValueError, __import__('sqlite3').IntegrityError) as exc:
             print(str(exc), file=sys.stderr); return 1
+
+    if args.command == "organization-views":
+        from ppa.organization_views import delete_organization_view, evaluate_organization_view, get_organization_view, list_organization_views, save_organization_view
+        try:
+            if args.organization_views_command == "list":
+                views=list_organization_views(conn,library_id=args.library_id)
+                for v in views:
+                    print(f"{v.id}  {v.name}  [albums={len(v.album_ids)}, tags={len(v.tag_ids)}]")
+                return 0
+            if args.organization_views_command == "save":
+                v=save_organization_view(conn,library_id=args.library_id,name=args.name,album_ids=args.album_ids,tag_ids=args.tag_ids)
+                print(f"Saved {v.name}: {v.id}"); return 0
+            if args.organization_views_command == "delete":
+                if not delete_organization_view(conn,args.view_id):
+                    print(f"saved organisation view not found: {args.view_id}",file=sys.stderr); return 1
+                print("Deleted"); return 0
+            if args.organization_views_command == "run":
+                v=get_organization_view(conn,args.view_id); result=evaluate_organization_view(conn,v)
+                from ppa.organization_discovery import concise_text as discovery_text
+                print(discovery_text(result))
+                if args.json_path:
+                    Path(args.json_path).write_text(result.to_json()+"\n",encoding="utf-8"); print(f"\nWrote {args.json_path}")
+                return 0
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
 
     if args.command == "event-views":
         from ppa.event_views import delete_event_view, evaluate_saved_view, get_event_view, list_event_views, save_event_view

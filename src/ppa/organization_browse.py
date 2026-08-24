@@ -136,6 +136,41 @@ def build_organization_browse(conn: Connection, *, object_kind: str,
     )
 
 
+
+def build_membership_browse(conn: Connection, *, library_id: int, photo_ids: tuple[str, ...],
+                            object_kind: str, object_id: str, name: str,
+                            description: str | None = None) -> OrganizationBrowseView:
+    """Build a read-only browser from an explicit logical-Photo membership set."""
+    photo_ids = tuple(dict.fromkeys(photo_ids))
+    if conn.execute("SELECT 1 FROM libraries WHERE id=?", (library_id,)).fetchone() is None:
+        raise ValueError(f"unknown library {library_id}")
+    if not photo_ids:
+        return OrganizationBrowseView(ORGANIZATION_BROWSE_SCHEMA, True, object_kind, object_id,
+            library_id, name, description, 0, 0, 0, ())
+    marks = ",".join("?" for _ in photo_ids)
+    rows = conn.execute(
+        "SELECT f.*, (SELECT COUNT(*) FROM files c WHERE c.photo_id=f.photo_id) AS copy_count "
+        "FROM files f WHERE f.library_id=? AND f.photo_id IN (" + marks + ") "
+        "ORDER BY f.photo_id,CASE WHEN f.presence_status='present' THEN 0 ELSE 1 END,"
+        "f.filename COLLATE NOCASE,f.id", (library_id, *photo_ids)).fetchall()
+    grouped = {pid: [] for pid in photo_ids}
+    for row in rows: grouped.setdefault(row["photo_id"], []).append(row)
+    items=[]; present=missing=0
+    for pid in photo_ids:
+        copies=grouped.get(pid, [])
+        if not copies: raise ValueError("organisation member is not represented in its library")
+        rep=copies[0]
+        if any(r["presence_status"] == "present" for r in copies): present += 1
+        else: missing += 1
+        filenames=" ".join(str(r["filename"]) for r in copies)
+        items.append(OrganizationBrowseItem(pid,rep["id"],rep["filename"],rep["path"],rep["sha256"],
+            rep["status"],rep["width_px"],rep["height_px"],rep["size_bytes"],rep["copy_count"],
+            (filenames+" "+pid).casefold()))
+    items.sort(key=lambda i:(i.filename.casefold(),i.photo_id,i.file_id))
+    return OrganizationBrowseView(ORGANIZATION_BROWSE_SCHEMA,True,object_kind,object_id,library_id,
+        name,description,len(photo_ids),present,missing,tuple(items))
+
+
 def build_tag_intersection(conn: Connection, *, library_id: int,
                            tag_ids: tuple[str, ...]) -> OrganizationBrowseView:
     """Return the explicit logical-Photo intersection of two or more Tags."""

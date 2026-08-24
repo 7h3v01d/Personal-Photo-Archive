@@ -352,6 +352,42 @@ class ThumbnailWorker(QObject):
             self.ready.emit(file_id, img)
 
 
+class OrganizationHealthWorker(QObject):
+    """Build Phase-9.8 organisation health off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_health import build_organization_health
+            conn=connect(self._db_path)
+            self.finished.emit(build_organization_health(conn, library_id=self._library_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationGapWorker(QObject):
+    """Build one read-only organisation curation-gap browser off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, health, gap: str) -> None:
+        super().__init__(); self._db_path=db_path; self._health=health; self._gap=gap
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_health import build_gap_browse
+            conn=connect(self._db_path)
+            self.finished.emit(build_gap_browse(conn, self._health, self._gap))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
 class TagHomeWorker(QObject):
     """Build Phase-9.5 Tag Home projection off-thread."""
     finished = Signal(object)
@@ -367,6 +403,43 @@ class TagHomeWorker(QObject):
             self.finished.emit(build_tag_home(conn, library_id=self._library_id))
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationDiscoveryHomeWorker(QObject):
+    """Build Album + Tag selector homes off-thread for Phase 9.6."""
+    finished = Signal(object, object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.album_home import build_album_home
+            from ppa.tag_home import build_tag_home
+            conn=connect(self._db_path)
+            self.finished.emit(build_album_home(conn,library_id=self._library_id), build_tag_home(conn,library_id=self._library_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationDiscoveryRunWorker(QObject):
+    """Evaluate one explicit Album/Tag intersection off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int, album_ids, tag_ids) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id; self._album_ids=tuple(album_ids); self._tag_ids=tuple(tag_ids)
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_discovery import build_organization_discovery
+            conn=connect(self._db_path)
+            self.finished.emit(build_organization_discovery(conn,library_id=self._library_id,album_ids=self._album_ids,tag_ids=self._tag_ids))
+        except Exception as exc: self.failed.emit(str(exc))
         finally:
             if conn is not None: conn.close()
 

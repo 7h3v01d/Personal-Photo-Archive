@@ -58,6 +58,8 @@ from ppa.ui.workers import (
     EventHomeWorker,
     AlbumHomeWorker,
     TagHomeWorker,
+    OrganizationDiscoveryHomeWorker,
+    OrganizationHealthWorker,
     WorkerRegistry,
 )
 
@@ -304,6 +306,14 @@ class MainWindow(QMainWindow):
         self._act_tags = QAction("Tags", self)
         self._act_tags.triggered.connect(self._on_tag_home)
         tb.addAction(self._act_tags)
+
+        self._act_org_discovery = QAction("Discover", self)
+        self._act_org_discovery.triggered.connect(self._on_organization_discovery)
+        tb.addAction(self._act_org_discovery)
+
+        self._act_org_health = QAction("Organisation Health", self)
+        self._act_org_health.triggered.connect(self._on_organization_health)
+        tb.addAction(self._act_org_health)
 
         self._act_family_history = QAction("Family History", self)
         self._act_family_history.triggered.connect(self._on_family_history)
@@ -675,6 +685,33 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Albums failed.")
 
 
+    def _on_organization_health(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Organisation Health", "Select or scan a library first.")
+            return
+        if self._busy: return
+        self._set_busy(True); self._status.showMessage("Organisation Health: analysing curation gaps…")
+        worker = OrganizationHealthWorker(self._config.db_path, library_id)
+        self._org_health_worker = worker
+        worker.finished.connect(self._on_organization_health_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_organization_health_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_organization_health_ready(self, health) -> None:
+        self._set_busy(False)
+        from ppa.ui.organization_health_dialog import OrganizationHealthDialog
+        dialog = OrganizationHealthDialog(self._conn, self._config.db_path, health, self,
+                                          cache_dir=self._cache_dir/'organization-health')
+        dialog.show(); self._org_health_dialog = dialog
+        self._status.showMessage(f"Organisation Health ready — {health.unorganized_count} unorganised photo(s).")
+
+    @Slot(str)
+    def _on_organization_health_failed(self, message: str) -> None:
+        self._set_busy(False); self._warn(f"Organisation Health failed: {message}")
+        self._status.showMessage("Organisation Health failed.")
+
     def _on_tag_home(self) -> None:
         library_id = self._current_library_id()
         if library_id is None:
@@ -727,6 +764,37 @@ class MainWindow(QMainWindow):
         self._finish_tag_home_progress()
         self._warn(f"Tags failed: {message}")
         self._status.showMessage("Tags failed.")
+
+    def _on_organization_discovery(self) -> None:
+        library_id=self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self,"Organisational Discovery","Select or scan a library first."); return
+        if self._busy: return
+        self._set_busy(True); self._status.showMessage("Discovery: building Album and Tag selectors…")
+        progress=QProgressDialog("Building organisation index…","Cancel",0,0,self); progress.setWindowTitle("Organisational Discovery"); progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False); progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show(); self._org_discovery_progress=progress; self._org_discovery_cancelled=False
+        worker=OrganizationDiscoveryHomeWorker(self._config.db_path,library_id); self._org_discovery_worker=worker
+        worker.finished.connect(self._on_organization_discovery_ready,Qt.ConnectionType.QueuedConnection); worker.failed.connect(self._on_organization_discovery_failed,Qt.ConnectionType.QueuedConnection); progress.canceled.connect(self._cancel_organization_discovery); self._registry.start(worker)
+
+    @Slot()
+    def _cancel_organization_discovery(self) -> None:
+        self._org_discovery_cancelled=True; self._finish_organization_discovery(); self._status.showMessage("Discovery cancelled.")
+
+    def _finish_organization_discovery(self) -> None:
+        p=getattr(self,"_org_discovery_progress",None)
+        if p is not None: p.close(); p.deleteLater(); self._org_discovery_progress=None
+        self._set_busy(False)
+
+    @Slot(object,object)
+    def _on_organization_discovery_ready(self,albums,tags) -> None:
+        cancelled=bool(getattr(self,"_org_discovery_cancelled",False)); self._org_discovery_cancelled=False; self._finish_organization_discovery()
+        if cancelled: return
+        from ppa.ui.organization_discovery_dialog import OrganizationDiscoveryDialog
+        d=OrganizationDiscoveryDialog(self._config.db_path,albums,tags,self,cache_dir=self._cache_dir/"discovery"); d.show(); self._organization_discovery_dialog=d
+        self._status.showMessage(f"Discovery ready — {len(albums.cards)} albums · {len(tags.cards)} tags.")
+
+    @Slot(str)
+    def _on_organization_discovery_failed(self,message: str) -> None:
+        self._org_discovery_cancelled=False; self._finish_organization_discovery(); self._warn(f"Discovery failed: {message}"); self._status.showMessage("Discovery failed.")
 
     def _on_family_history(self) -> None:
         library_id = self._current_library_id()

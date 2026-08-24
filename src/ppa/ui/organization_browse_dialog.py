@@ -38,7 +38,7 @@ class OrganizationBrowseDialog(QDialog):
         self._page = 0
         self._filtered = self._view.items
 
-        kind_label = 'Album' if object_kind == 'album' else ('Tag' if object_kind == 'tag' else 'Tags')
+        kind_label = 'Album' if object_kind == 'album' else ('Tag' if object_kind == 'tag' else 'Photos')
         self.setWindowTitle(f"{kind_label}: {self._view.name}")
         self.resize(1080, 760)
         root = QVBoxLayout(self)
