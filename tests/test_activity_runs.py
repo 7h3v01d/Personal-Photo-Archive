@@ -74,3 +74,27 @@ def test_json_formatter_carries_run_fields():
     assert obj["run_outcome"] == "success"
     assert obj["elapsed_ms"] == 42
     assert obj["run_detail"] == {"usable": 7}
+
+
+def test_export_run_redacts_windows_path_before_json_serialization(tmp_path, monkeypatch):
+    # Host-independent regression for the Windows failure seen in real testing:
+    # structured values must be redacted before json.dumps escapes backslashes.
+    import ppa.activity_runs as ar
+    from ppa.activity_runs import ActivityRun, RunEvent
+
+    windows_home = r"C:\Users\leonp"
+    private = windows_home + r"\Pictures\secret.jpg"
+    monkeypatch.setattr(ar, "get_activity_run", lambda _log, _rid: ActivityRun(
+        run_id="abc", operation="scan", started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:01+00:00", outcome="success", elapsed_ms=1000,
+        events=(RunEvent("2026-01-01T00:00:00+00:00", "abc", "scan", "start", None,
+                         f"reading {private}", detail={"path": private}),),
+    ))
+    monkeypatch.setattr("ppa.diagnostics._redaction_pairs", lambda _cfg: [(windows_home, "<HOME>")])
+    cfg = SimpleNamespace(log_path=tmp_path / "ppa.log", db_path=tmp_path / "missing.sqlite")
+    out = export_run_transcript(cfg, "abc", tmp_path / "run")
+    text = out.read_text(encoding="utf-8")
+    assert private not in text
+    assert "<HOME>" in text
+    payload = json.loads(text)
+    assert payload["run"]["events"][0]["detail"]["path"].startswith("<HOME>")

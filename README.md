@@ -297,3 +297,88 @@ CLI: `python -m ppa.cli pilot session-report pilot.json progress.zip`
 The desktop **Timeline** action builds a read-only, provenance-aware chronology view in the background. Photos are separated into **Placed**, **Ranges**, **Tentative**, and **Unplaced** lanes. Fresh human-confirmed reconstructions take precedence; otherwise current TRUSTED/PROBABLY_VALID reconciled chronology may place a photo. Fresh proposals are tentative only, and stale decisions never anchor the timeline. Date ranges remain ranges.
 
 CLI: `python -m ppa.cli timeline <library_id>` with optional `--directory` and `--json`.
+
+## Phase 8.2 — Timeline Scale & Fast Jumping
+
+The desktop Timeline now supports **Decades / Years / Months** density navigation,
+fast page scrubbing, Previous/Next paging, and bounded thumbnail materialisation.
+The full chronology projection remains immutable in memory, while the visual grid
+loads at most 120 catalogue/thumbnail items per lane at a time. Range precision,
+placement authority, tentative chronology, and unplaced segregation remain exactly
+as defined by Phase 8.0.
+
+### Phase 8.3 — Timeline Context
+
+Timeline navigation can now detect conservative provisional chronological
+clusters (`Clusters` scale) from already-authorised point dates. Tentative/range
+items may be shown as context but never seed or strengthen a cluster. Use
+`python -m ppa.cli timeline-clusters <library_id>` for the read-only CLI view.
+
+### Phase 8.4 — Human Event Identity
+
+Timeline provisional clusters can now be explicitly named by a human. Naming a
+cluster creates a durable Event UUID with a snapshot of its authoritative seed
+photos; it does not rename the clustering algorithm or promote tentative/range
+context into event membership. The Timeline **Events** scale browses these
+human-authored event identities independently of future cluster changes.
+
+### Phase 8.5 — Event curation
+
+Named Timeline Events can now be explicitly curated from **Timeline → Events → Edit event…**.
+Rename the event, add a human note, add/remove same-Library photos, and inspect the recent audit
+history. Event membership never changes a photo's chronology lane or metadata. Human edits are
+append-audited in schema v14.
+
+## Phase 8.6 — Event Story Context
+
+Named Events can now carry richer human-authored memory: description, remembered place, people notes, occasion/context, and a longer story. These fields are stored separately from chronology evidence and are append-versioned in `event_context_history`. Editing story context never changes Timeline placement, date reliability, reconstruction state, EXIF, metadata observations, or source photos.
+
+See `docs/PHASE8_6_EVENT_STORY_CONTEXT.md`.
+
+## Phase 8.7 — Event Browse / Story View
+
+Timeline named Events now have **Story view…**, an album-style read-only presentation
+of human story context plus the Event's explicitly curated member photos. Members are
+ordered by their **current** Timeline chronology; ranges, tentative dates, stale states,
+and unplaced photos retain their existing truth state. Event membership and narrative
+context never become chronology evidence. The visual story is paged to at most 120
+thumbnail items at once and thumbnail decoding stays off the GUI thread.
+
+CLI: `python -m ppa.cli event-story <event-uuid>` with optional `--json`.
+See `docs/PHASE8_7_EVENT_STORY_VIEW.md`.
+
+## Phase 8.8 — Event-to-Event Story Navigation
+
+Story View now supports deterministic Previous/Next Event reading across year-grouped durable human Events. The navigation layer is read-only and never changes Event membership, Story Context, or chronology authority. See `docs/PHASE8_8_EVENT_STORY_NAVIGATION.md`.
+
+## Phase 8.9 — Family History Home
+
+The desktop toolbar now includes **Family History**, a year-grouped visual landing page
+for durable human Events. Event cards show a semantically neutral stable cover thumbnail,
+date span, member/chronology counts, occasion/place context, and a short story excerpt.
+Only 30 Event cards/covers are materialised per page. Double-click a card or choose
+**Open story…** to enter the existing continuous Story View. Cover selection is a stable
+browsing default only and never chronology or importance evidence.
+
+CLI: `python -m ppa.cli event-home <library_id>` with optional `--json`.
+See `docs/PHASE8_9_FAMILY_HISTORY_HOME.md`.
+
+## Phase 8.10 — Human Cover Selection & Presentation Preferences
+
+Human Events now support optional display-only presentation preferences:
+
+- choose any current Event member as the preferred Family History cover;
+- arrange the complete current Event membership into a custom Story reading order;
+- reset both choices back to deterministic defaults;
+- retain append-only presentation history.
+
+These preferences are intentionally outside chronology authority. Choosing a
+cover or moving a photo earlier in a Story never changes its date, Timeline
+lane, reliability, reconstruction, Event membership, metadata, EXIF, or source
+bytes. A custom order must be an exact permutation of current Event members.
+Membership changes invalidate the old order rather than guessing how new or
+removed members should be placed. A removed preferred-cover member clears the
+cover preference automatically.
+
+Schema v16 adds `event_presentation` and `event_presentation_history` plus a
+DB-level guard that prevents a non-member photo from becoming an Event cover.
