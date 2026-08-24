@@ -1,0 +1,204 @@
+"""Phase 9.12 — sanitized, shareable organisation curation report.
+
+The report is a read-only projection of human curation state. It deliberately
+excludes archive identity (paths, UUIDs/file ids, hashes, database details,
+thumbnails and source bytes) and never mutates the archive.
+"""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from sqlite3 import Connection
+
+from ppa.album_home import build_album_home
+from ppa.organization_activity import build_organization_activity
+from ppa.organization_health import build_organization_health
+from ppa.organization_suggestions import list_suggestion_reviews
+from ppa.organization_views import list_organization_views
+from ppa.tag_home import build_tag_home
+
+ORGANIZATION_REPORT_SCHEMA = "ppa-organization-report/1"
+
+
+@dataclass(frozen=True)
+class OrganizationReport:
+    schema: str
+    generated_at: str
+    read_only: bool
+    summary: dict
+    albums: tuple[dict, ...]
+    tags: tuple[dict, ...]
+    saved_views: tuple[dict, ...]
+    suggestion_reviews: tuple[dict, ...]
+    recent_activity: tuple[dict, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": self.schema,
+            "generated_at": self.generated_at,
+            "read_only": self.read_only,
+            "summary": self.summary,
+            "albums": list(self.albums),
+            "tags": list(self.tags),
+            "saved_views": list(self.saved_views),
+            "suggestion_reviews": list(self.suggestion_reviews),
+            "recent_activity": list(self.recent_activity),
+        }
+
+    def to_json(self, *, pretty: bool = True) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True,
+                          indent=2 if pretty else None,
+                          separators=None if pretty else (",", ":"))
+
+
+def _require_library(conn: Connection, library_id: int) -> None:
+    if conn.execute("SELECT 1 FROM libraries WHERE id=?", (library_id,)).fetchone() is None:
+        raise ValueError(f"unknown library {library_id}")
+
+
+def build_organization_report(conn: Connection, *, library_id: int,
+                              activity_limit: int = 100) -> OrganizationReport:
+    """Build one sanitized report projection without exposing archive identifiers."""
+    _require_library(conn, library_id)
+    before = conn.total_changes
+    album_home = build_album_home(conn, library_id=library_id)
+    tag_home = build_tag_home(conn, library_id=library_id)
+    health = build_organization_health(conn, library_id=library_id)
+    saved = list_organization_views(conn, library_id=library_id)
+    reviews = list_suggestion_reviews(conn, library_id=library_id)
+    activity = build_organization_activity(conn, library_id=library_id, limit=activity_limit)
+
+    album_names = {r["id"]: r["name"] for r in conn.execute(
+        "SELECT id,name FROM albums WHERE library_id=?", (library_id,))}
+    tag_names = {r["id"]: r["name"] for r in conn.execute(
+        "SELECT id,name FROM tags WHERE library_id=?", (library_id,))}
+
+    albums = tuple({
+        "name": c.name,
+        "description": c.description,
+        "photo_count": c.photo_count,
+        "present_count": c.present_count,
+        "missing_only_count": c.missing_only_count,
+        "custom_cover": c.has_custom_cover,
+        "custom_order": c.has_custom_order,
+    } for c in album_home.cards)
+    tags = tuple({
+        "name": c.name,
+        "photo_count": c.photo_count,
+        "present_count": c.present_count,
+        "missing_only_count": c.missing_only_count,
+    } for c in tag_home.cards)
+    saved_views = tuple({
+        "name": v.name,
+        "albums": [album_names.get(x, "[missing Album]") for x in v.album_ids],
+        "tags": [tag_names.get(x, "[missing Tag]") for x in v.tag_ids],
+    } for v in saved)
+    suggestion_reviews = tuple({
+        "status": r.status,
+        "note": r.note,
+        "reviewed_at": r.reviewed_at,
+    } for r in reviews)
+    recent_activity = tuple({
+        "when": e.created_at,
+        "kind": e.object_kind,
+        "object": e.object_name,
+        "change": e.summary,
+        "undoable": e.undoable,
+    } for e in activity.entries)
+    summary = {
+        "logical_photos": health.total_photos,
+        "album_count": len(album_home.cards),
+        "tag_count": len(tag_home.cards),
+        "unorganized_count": health.unorganized_count,
+        "no_album_count": health.no_album_count,
+        "no_tag_count": health.no_tag_count,
+        "empty_album_count": len(health.empty_album_ids),
+        "unused_tag_count": len(health.unused_tag_ids),
+        "albums_with_missing_only_members": len(health.albums_with_missing_only_members),
+        "tags_with_missing_only_members": len(health.tags_with_missing_only_members),
+        "broken_saved_view_count": len(health.broken_saved_view_ids),
+        "saved_view_count": len(saved),
+        "accepted_suggestion_count": sum(r.status == "accepted" for r in reviews),
+        "dismissed_suggestion_count": sum(r.status == "dismissed" for r in reviews),
+        "recent_activity_count": len(activity.entries),
+    }
+    if conn.total_changes != before:
+        raise RuntimeError("organisation report projection must be read-only")
+    return OrganizationReport(
+        ORGANIZATION_REPORT_SCHEMA, datetime.now(timezone.utc).isoformat(), True,
+        summary, albums, tags, saved_views, suggestion_reviews, recent_activity)
+
+
+def markdown_text(report: OrganizationReport) -> str:
+    s = report.summary
+    lines = [
+        "# Personal Photo Archive — Organisation Report", "",
+        f"Generated: {report.generated_at}", "",
+        "This report contains human curation summaries only. It excludes source-photo paths, archive identifiers, hashes, thumbnails and database internals.", "",
+        "## Summary", "",
+        f"- Logical photos: {s['logical_photos']}",
+        f"- Albums: {s['album_count']}", f"- Tags: {s['tag_count']}",
+        f"- Unorganised photos: {s['unorganized_count']}",
+        f"- Photos with no Album: {s['no_album_count']}",
+        f"- Photos with no Tags: {s['no_tag_count']}",
+        f"- Empty Albums: {s['empty_album_count']}", f"- Unused Tags: {s['unused_tag_count']}",
+        f"- Broken saved views: {s['broken_saved_view_count']}", "", "## Albums", "",
+    ]
+    if report.albums:
+        for a in report.albums:
+            desc = f" — {a['description']}" if a['description'] else ""
+            lines.append(f"- **{a['name']}** — {a['photo_count']} photos ({a['missing_only_count']} missing-only){desc}")
+    else: lines.append("- None")
+    lines += ["", "## Tags", ""]
+    if report.tags:
+        for t in report.tags:
+            lines.append(f"- **{t['name']}** — {t['photo_count']} photos ({t['missing_only_count']} missing-only)")
+    else: lines.append("- None")
+    lines += ["", "## Saved discovery views", ""]
+    if report.saved_views:
+        for v in report.saved_views:
+            recipe = [*(f"Album: {x}" for x in v['albums']), *(f"Tag: {x}" for x in v['tags'])]
+            lines.append(f"- **{v['name']}** — " + " ∩ ".join(recipe))
+    else: lines.append("- None")
+    lines += ["", "## Assisted-organisation reviews", ""]
+    if report.suggestion_reviews:
+        for r in report.suggestion_reviews:
+            note = f" — {r['note']}" if r['note'] else ""
+            lines.append(f"- {r['reviewed_at']} — **{r['status']}**{note}")
+    else: lines.append("- None")
+    lines += ["", "## Recent organisation activity", ""]
+    if report.recent_activity:
+        for e in report.recent_activity:
+            lines.append(f"- {e['when']} — {e['change']}")
+    else: lines.append("- None")
+    return "\n".join(lines) + "\n"
+
+
+def export_organization_report_zip(conn: Connection, *, library_id: int,
+                                   output_path: str | Path,
+                                   activity_limit: int = 100) -> Path:
+    report = build_organization_report(conn, library_id=library_id, activity_limit=activity_limit)
+    out = Path(output_path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    readme = (
+        "Personal Photo Archive — Shareable Organisation Report\n\n"
+        "This ZIP intentionally excludes source photographs, thumbnails, database files, "
+        "filesystem paths, archive identifiers and hashes.\n"
+    )
+    fd, tmp_name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=str(out.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("organization-report.json", report.to_json() + "\n")
+            zf.writestr("organization-report.md", markdown_text(report))
+            zf.writestr("README.txt", readme)
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists(): tmp.unlink(missing_ok=True)
+    return out

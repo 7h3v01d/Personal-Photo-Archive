@@ -186,6 +186,39 @@ def main(argv: list[str] | None = None) -> int:
     ov_run = org_views_sub.add_parser("run", help="Evaluate one saved organisation view against current membership")
     ov_run.add_argument("view_id"); ov_run.add_argument("--json", dest="json_path", default=None)
 
+    organization_suggestions_parser = subparsers.add_parser(
+        "organization-suggestions", help="Build conservative review-only Tag-gap suggestions")
+    organization_suggestions_parser.add_argument("library_id", type=int, help="Library id to inspect")
+    organization_suggestions_parser.add_argument("--json", dest="json_path", default=None,
+                                                 help="Write structured organisation-suggestions JSON")
+
+    suggestion_reviews_parser = subparsers.add_parser(
+        "organization-suggestion-reviews", help="Inspect/dismiss/restore assisted-organisation suggestion fingerprints")
+    suggestion_reviews_sub = suggestion_reviews_parser.add_subparsers(dest="suggestion_review_command", required=True)
+    sr_list = suggestion_reviews_sub.add_parser("list", help="List durable suggestion review state")
+    sr_list.add_argument("library_id", type=int); sr_list.add_argument("--status", choices=["dismissed","accepted"], default=None)
+    sr_dismiss = suggestion_reviews_sub.add_parser("dismiss", help="Dismiss one current suggestion fingerprint")
+    sr_dismiss.add_argument("library_id", type=int); sr_dismiss.add_argument("suggestion_id"); sr_dismiss.add_argument("--note", default=None)
+    sr_restore = suggestion_reviews_sub.add_parser("restore", help="Restore one dismissed suggestion fingerprint")
+    sr_restore.add_argument("library_id", type=int); sr_restore.add_argument("suggestion_id"); sr_restore.add_argument("--note", default=None)
+
+    organization_activity_parser = subparsers.add_parser(
+        "organization-activity", help="Inspect recent Album/Tag audit history and safely undo current membership changes")
+    organization_activity_parser.add_argument("library_id", type=int)
+    organization_activity_parser.add_argument("--limit", type=int, default=200)
+    organization_activity_parser.add_argument("--json", dest="json_path", default=None)
+
+    organization_undo_parser = subparsers.add_parser(
+        "organization-undo", help="Fail-closed undo of one current Album/Tag membership history entry")
+    organization_undo_parser.add_argument("library_id", type=int)
+    organization_undo_parser.add_argument("history_id", type=int)
+
+    organization_report_parser = subparsers.add_parser(
+        "organization-report", help="Export a sanitized shareable Album/Tag curation report")
+    organization_report_parser.add_argument("library_id", type=int, help="Library id to report")
+    organization_report_parser.add_argument("output_path", help="Destination ZIP path")
+    organization_report_parser.add_argument("--activity-limit", type=int, default=100)
+
     organization_health_parser = subparsers.add_parser(
         "organization-health", help="Summarise read-only Album/Tag curation gaps")
     organization_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
@@ -637,6 +670,72 @@ def main(argv: list[str] | None = None) -> int:
         if args.json_path:
             Path(args.json_path).write_text(result.to_json()+"\n",encoding="utf-8"); print(f"\nWrote {args.json_path}")
         return 0
+
+    if args.command == "organization-suggestions":
+        from ppa.organization_suggestions import build_organization_suggestions, concise_text as suggestions_text
+        try:
+            view = build_organization_suggestions(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(suggestions_text(view))
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "organization-suggestion-reviews":
+        from ppa.organization_suggestions import (
+            build_organization_suggestions, dismiss_organization_suggestion,
+            list_suggestion_reviews, restore_organization_suggestion,
+        )
+        try:
+            if args.suggestion_review_command == "list":
+                reviews=list_suggestion_reviews(conn,library_id=args.library_id,status=args.status)
+                for r in reviews:
+                    note=f" — {r.note}" if r.note else ""
+                    print(f"{r.status:9} {r.reviewed_at} {r.suggestion_id}{note}")
+                return 0
+            if args.suggestion_review_command == "dismiss":
+                view=build_organization_suggestions(conn,library_id=args.library_id,include_reviewed=True)
+                suggestion=next((s for s in view.suggestions if s.id == args.suggestion_id),None)
+                if suggestion is None:
+                    raise ValueError("current suggestion fingerprint not found")
+                dismiss_organization_suggestion(conn,suggestion,note=args.note)
+                print(f"Dismissed {args.suggestion_id}"); return 0
+            ok=restore_organization_suggestion(conn,library_id=args.library_id,suggestion_id=args.suggestion_id,note=args.note)
+            if not ok:
+                raise ValueError("dismissed suggestion fingerprint not found")
+            print(f"Restored {args.suggestion_id}"); return 0
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
+
+    if args.command == "organization-activity":
+        from ppa.organization_activity import build_organization_activity, concise_text as organization_activity_text
+        try:
+            view=build_organization_activity(conn,library_id=args.library_id,limit=args.limit)
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
+        print(organization_activity_text(view))
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json()+"\n",encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "organization-undo":
+        from ppa.organization_activity import undo_organization_membership
+        try:
+            entry=undo_organization_membership(conn,library_id=args.library_id,history_id=args.history_id)
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
+        print(entry.summary); return 0
+
+    if args.command == "organization-report":
+        from ppa.organization_report import export_organization_report_zip
+        try:
+            out=export_organization_report_zip(conn,library_id=args.library_id,output_path=args.output_path,activity_limit=args.activity_limit)
+        except ValueError as exc:
+            print(str(exc),file=sys.stderr); return 1
+        print(f"Wrote sanitized organisation report: {out}"); return 0
 
     if args.command == "organization-health":
         from ppa.organization_health import build_organization_health, concise_text as organization_health_text

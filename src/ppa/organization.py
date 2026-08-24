@@ -357,8 +357,13 @@ def bulk_remove_photos_from_album(conn: Connection, album_id: str, photo_ids) ->
     return get_album(conn, album_id)
 
 
-def bulk_tag_photos(conn: Connection, tag_id: str, photo_ids) -> Tag:
-    """Atomically apply one Tag to selected logical Photos."""
+def bulk_tag_photos(conn: Connection, tag_id: str, photo_ids, *, _manage_transaction: bool = True) -> Tag:
+    """Atomically apply one Tag to selected logical Photos.
+
+    ``_manage_transaction=False`` is an internal composition hook used when a
+    higher-level operation must include this audited membership change in a
+    larger atomic transaction. Public callers should keep the default.
+    """
     tag = get_tag(conn, tag_id)
     ids = tuple(dict.fromkeys(str(p) for p in photo_ids))
     for pid in ids:
@@ -369,15 +374,19 @@ def bulk_tag_photos(conn: Connection, tag_id: str, photo_ids) -> Tag:
         return tag
     now = _now()
     try:
-        conn.execute("BEGIN")
+        if _manage_transaction:
+            conn.execute("BEGIN")
         for pid in todo:
             conn.execute("INSERT INTO photo_tags(tag_id,photo_id,added_at) VALUES (?,?,?)", (tag_id, pid, now))
             conn.execute("INSERT INTO organization_history(library_id,object_kind,object_id,action,photo_id,new_value,created_at) "
                          "VALUES (?,'tag',?,'add_photo',?,'tagged',?)", (tag.library_id, tag_id, pid, now))
         conn.execute("UPDATE tags SET updated_at=? WHERE id=?", (now, tag_id))
-        conn.commit()
+        if _manage_transaction:
+            conn.commit()
     except Exception:
-        conn.rollback(); raise
+        if _manage_transaction:
+            conn.rollback()
+        raise
     return get_tag(conn, tag_id)
 
 
