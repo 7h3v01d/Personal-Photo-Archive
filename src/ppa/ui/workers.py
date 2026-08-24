@@ -352,6 +352,114 @@ class ThumbnailWorker(QObject):
             self.ready.emit(file_id, img)
 
 
+class OrganizationSuggestionsWorker(QObject):
+    """Build Phase-9.9 conservative assisted-curation suggestions off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import build_organization_suggestions
+            conn=connect(self._db_path)
+            self.finished.emit(build_organization_suggestions(conn,library_id=self._library_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationSuggestionBrowseWorker(QObject):
+    """Build the logical-Photo review view for one suggestion off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, suggestion) -> None:
+        super().__init__(); self._db_path=db_path; self._suggestion=suggestion
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import build_suggestion_browse
+            conn=connect(self._db_path)
+            self.finished.emit(build_suggestion_browse(conn,self._suggestion))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationSuggestionApplyWorker(QObject):
+    """Apply one explicitly approved, freshly revalidated suggestion."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, suggestion) -> None:
+        super().__init__(); self._db_path=db_path; self._suggestion=suggestion
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import apply_organization_suggestion
+            conn=connect(self._db_path)
+            self.finished.emit(apply_organization_suggestion(conn,self._suggestion))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationSuggestionDismissWorker(QObject):
+    """Dismiss one freshly revalidated suggestion and persist review state."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, suggestion, note: str | None = None) -> None:
+        super().__init__(); self._db_path=db_path; self._suggestion=suggestion; self._note=note
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import dismiss_organization_suggestion
+            conn=connect(self._db_path)
+            self.finished.emit(dismiss_organization_suggestion(conn,self._suggestion,note=self._note))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationSuggestionReviewsWorker(QObject):
+    """Load durable suggestion review state off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import list_suggestion_reviews
+            conn=connect(self._db_path)
+            self.finished.emit(list_suggestion_reviews(conn,library_id=self._library_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationSuggestionRestoreWorker(QObject):
+    """Restore one dismissed suggestion fingerprint."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int, suggestion_id: str, note: str | None = None) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id; self._suggestion_id=suggestion_id; self._note=note
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_suggestions import restore_organization_suggestion
+            conn=connect(self._db_path)
+            self.finished.emit(restore_organization_suggestion(conn,library_id=self._library_id,suggestion_id=self._suggestion_id,note=self._note))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
 class OrganizationHealthWorker(QObject):
     """Build Phase-9.8 organisation health off-thread."""
     finished = Signal(object)
@@ -803,3 +911,56 @@ class TimelineWorker(QObject):
         finally:
             if conn is not None:
                 conn.close()
+
+class OrganizationActivityWorker(QObject):
+    """Build Phase-9.11 organisation activity off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int, limit: int = 300) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id; self._limit=limit
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_activity import build_organization_activity
+            conn=connect(self._db_path)
+            self.finished.emit(build_organization_activity(conn,library_id=self._library_id,limit=self._limit))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationUndoWorker(QObject):
+    """Perform one fail-closed audited membership undo off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int, history_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id; self._history_id=history_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_activity import undo_organization_membership
+            conn=connect(self._db_path)
+            self.finished.emit(undo_organization_membership(conn,library_id=self._library_id,history_id=self._history_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class OrganizationReportWorker(QObject):
+    """Export one sanitized Phase-9.12 organisation report ZIP off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int, output_path: Path) -> None:
+        super().__init__(); self._db_path=Path(db_path); self._library_id=library_id; self._output_path=Path(output_path)
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.organization_report import export_organization_report_zip
+            conn=connect(self._db_path)
+            self.finished.emit(export_organization_report_zip(conn,library_id=self._library_id,output_path=self._output_path))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()

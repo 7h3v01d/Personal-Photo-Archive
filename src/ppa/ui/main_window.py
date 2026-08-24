@@ -60,6 +60,9 @@ from ppa.ui.workers import (
     TagHomeWorker,
     OrganizationDiscoveryHomeWorker,
     OrganizationHealthWorker,
+    OrganizationSuggestionsWorker,
+    OrganizationActivityWorker,
+    OrganizationReportWorker,
     WorkerRegistry,
 )
 
@@ -311,9 +314,21 @@ class MainWindow(QMainWindow):
         self._act_org_discovery.triggered.connect(self._on_organization_discovery)
         tb.addAction(self._act_org_discovery)
 
+        self._act_org_suggestions = QAction("Assisted Organisation", self)
+        self._act_org_suggestions.triggered.connect(self._on_organization_suggestions)
+        tb.addAction(self._act_org_suggestions)
+
         self._act_org_health = QAction("Organisation Health", self)
         self._act_org_health.triggered.connect(self._on_organization_health)
         tb.addAction(self._act_org_health)
+
+        self._act_org_activity = QAction("Organisation Activity", self)
+        self._act_org_activity.triggered.connect(self._on_organization_activity)
+        tb.addAction(self._act_org_activity)
+
+        self._act_org_report = QAction("Export Organisation Report…", self)
+        self._act_org_report.triggered.connect(self._on_organization_report)
+        tb.addAction(self._act_org_report)
 
         self._act_family_history = QAction("Family History", self)
         self._act_family_history.triggered.connect(self._on_family_history)
@@ -685,6 +700,33 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Albums failed.")
 
 
+    def _on_organization_suggestions(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Assisted Organisation", "Select or scan a library first.")
+            return
+        if self._busy: return
+        self._set_busy(True); self._status.showMessage("Assisted Organisation: analysing explicit peer groups…")
+        worker = OrganizationSuggestionsWorker(self._config.db_path, library_id)
+        self._org_suggestions_worker = worker
+        worker.finished.connect(self._on_organization_suggestions_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_organization_suggestions_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_organization_suggestions_ready(self, view) -> None:
+        self._set_busy(False)
+        from ppa.ui.organization_suggestions_dialog import OrganizationSuggestionsDialog
+        dialog = OrganizationSuggestionsDialog(self._conn, self._config.db_path, view, self,
+                                               cache_dir=self._cache_dir/'organization-suggestions')
+        dialog.show(); self._org_suggestions_dialog = dialog
+        self._status.showMessage(f"Assisted Organisation ready — {len(view.suggestions)} suggestion(s).")
+
+    @Slot(str)
+    def _on_organization_suggestions_failed(self, message: str) -> None:
+        self._set_busy(False); self._warn(f"Assisted Organisation failed: {message}")
+        self._status.showMessage("Assisted Organisation failed.")
+
     def _on_organization_health(self) -> None:
         library_id = self._current_library_id()
         if library_id is None:
@@ -711,6 +753,55 @@ class MainWindow(QMainWindow):
     def _on_organization_health_failed(self, message: str) -> None:
         self._set_busy(False); self._warn(f"Organisation Health failed: {message}")
         self._status.showMessage("Organisation Health failed.")
+
+
+    def _on_organization_activity(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Organisation Activity", "Select or scan a library first.")
+            return
+        if self._busy: return
+        self._set_busy(True); self._status.showMessage("Organisation Activity: loading audit history…")
+        worker=OrganizationActivityWorker(self._config.db_path,library_id); self._org_activity_worker=worker
+        worker.finished.connect(self._on_organization_activity_ready,Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_organization_activity_failed,Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_organization_activity_ready(self, view) -> None:
+        self._set_busy(False)
+        from ppa.ui.organization_activity_dialog import OrganizationActivityDialog
+        d=OrganizationActivityDialog(self._config.db_path,view,self); d.show(); self._org_activity_dialog=d
+        self._status.showMessage(f"Organisation Activity ready — {len(view.entries)} recent change(s).")
+
+    @Slot(str)
+    def _on_organization_activity_failed(self, message: str) -> None:
+        self._set_busy(False); self._warn(f"Organisation Activity failed: {message}"); self._status.showMessage("Organisation Activity failed.")
+
+
+    def _on_organization_report(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Organisation Report", "Select or scan a library first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Organisation Report", "organisation-report.zip", "ZIP archive (*.zip)")
+        if not path: return
+        if not path.lower().endswith('.zip'): path += '.zip'
+        if self._busy: return
+        self._set_busy(True); self._status.showMessage("Organisation Report: building sanitized export…")
+        worker=OrganizationReportWorker(self._config.db_path, library_id, Path(path)); self._org_report_worker=worker
+        worker.finished.connect(self._on_organization_report_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_organization_report_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_organization_report_ready(self, path) -> None:
+        self._set_busy(False); self._status.showMessage(f"Organisation Report exported — {path}")
+        QMessageBox.information(self, "Organisation Report", f"Sanitized report exported to:\n{path}")
+
+    @Slot(str)
+    def _on_organization_report_failed(self, message: str) -> None:
+        self._set_busy(False); self._warn(f"Organisation Report failed: {message}"); self._status.showMessage("Organisation Report failed.")
 
     def _on_tag_home(self) -> None:
         library_id = self._current_library_id()
