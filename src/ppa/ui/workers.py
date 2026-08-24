@@ -352,6 +352,49 @@ class ThumbnailWorker(QObject):
             self.ready.emit(file_id, img)
 
 
+class TagHomeWorker(QObject):
+    """Build Phase-9.5 Tag Home projection off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.tag_home import build_tag_home
+            conn=connect(self._db_path)
+            self.finished.emit(build_tag_home(conn, library_id=self._library_id))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class AlbumHomeWorker(QObject):
+    """Build Phase-9.4 Album Home projection off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._library_id = library_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.album_home import build_album_home
+            conn = connect(self._db_path)
+            self.finished.emit(build_album_home(conn, library_id=self._library_id))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 class EventHomeWorker(QObject):
     """Build Phase-8.9 Timeline + Family History projection off-thread."""
     progress = Signal(str)

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ppa import catalogue
+from ppa import organization
 from ppa.config import Config
 from ppa.db import connect
 from ppa.logging_setup import get_logger
@@ -55,6 +56,8 @@ from ppa.ui.workers import (
     VerifyWorker,
     TimelineWorker,
     EventHomeWorker,
+    AlbumHomeWorker,
+    TagHomeWorker,
     WorkerRegistry,
 )
 
@@ -149,7 +152,7 @@ class InspectorPanel(QScrollArea):
         self._layout.addWidget(hint)
         self._layout.addStretch(1)
 
-    def show_detail(self, d: catalogue.FileDetail, thumb: QPixmap | None) -> None:
+    def show_detail(self, d: catalogue.FileDetail, thumb: QPixmap | None, *, albums=(), tags=()) -> None:
         self._clear()
         self._path = d.path
 
@@ -177,6 +180,13 @@ class InspectorPanel(QScrollArea):
             pic.setPixmap(thumb.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio,
                                        Qt.TransformationMode.SmoothTransformation))
             self._layout.addWidget(pic)
+
+        if albums or tags:
+            self._header("ORGANISATION")
+            if albums:
+                self._field("albums", ", ".join(a.name for a in albums))
+            if tags:
+                self._field("tags", ", ".join(t.name for t in tags))
 
         self._field("status", d.status, theme.status_colour(d.status))
         if d.health_status and d.health_status != "ok":
@@ -283,6 +293,18 @@ class MainWindow(QMainWindow):
         self._act_timeline.triggered.connect(self._on_timeline)
         tb.addAction(self._act_timeline)
 
+        self._act_organize = QAction("Albums & Tags…", self)
+        self._act_organize.triggered.connect(self._on_organize)
+        tb.addAction(self._act_organize)
+
+        self._act_albums = QAction("Albums", self)
+        self._act_albums.triggered.connect(self._on_album_home)
+        tb.addAction(self._act_albums)
+
+        self._act_tags = QAction("Tags", self)
+        self._act_tags.triggered.connect(self._on_tag_home)
+        tb.addAction(self._act_tags)
+
         self._act_family_history = QAction("Family History", self)
         self._act_family_history.triggered.connect(self._on_family_history)
         tb.addAction(self._act_family_history)
@@ -351,7 +373,7 @@ class MainWindow(QMainWindow):
         self._grid.setItemDelegate(PhotoTileDelegate())
         self._grid.setSpacing(8)
         self._grid.setUniformItemSizes(True)
-        self._grid.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self._grid.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self._grid.selectionModel().currentChanged.connect(self._on_selection)
         self._grid.doubleClicked.connect(self._on_open_preview)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -471,7 +493,15 @@ class MainWindow(QMainWindow):
             self._inspector.show_empty()
             return
         thumb = self._model._pixmaps.get(item.file_id)
-        self._inspector.show_detail(detail, thumb)
+        library_id = self._current_library_id()
+        albums = tags = ()
+        if library_id is not None:
+            try:
+                albums = organization.list_photo_albums(self._conn, library_id=library_id, photo_id=detail.photo_id)
+                tags = organization.list_photo_tags(self._conn, library_id=library_id, photo_id=detail.photo_id)
+            except ValueError:
+                pass
+        self._inspector.show_detail(detail, thumb, albums=albums, tags=tags)
 
     def _on_open_preview(self, index: QModelIndex) -> None:
         if not index.isValid():
@@ -493,6 +523,26 @@ class MainWindow(QMainWindow):
                 if lib.canonical_path == wanted or lib.display_path == str(self._current_library):
                     return lib.id
         return libs[0].id if len(libs) == 1 else None
+
+    def _selected_photo_ids(self) -> tuple[str, ...]:
+        indexes = self._grid.selectionModel().selectedIndexes()
+        photo_ids = []
+        for index in sorted(indexes, key=lambda i: i.row()):
+            item = self._model.item_at(index)
+            if item is not None and item.photo_id not in photo_ids:
+                photo_ids.append(item.photo_id)
+        return tuple(photo_ids)
+
+    def _on_organize(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Albums & Tags", "Select or scan a library first.")
+            return
+        photo_ids = self._selected_photo_ids()
+        from ppa.ui.organization_dialog import OrganizationDialog
+        dialog = OrganizationDialog(self._conn, library_id, photo_ids, self)
+        dialog.changed.connect(self.refresh)
+        dialog.exec()
 
     def _on_timeline(self) -> None:
         library_id = self._current_library_id()
@@ -569,6 +619,114 @@ class MainWindow(QMainWindow):
         self._run_end("timeline", "failed", f"Timeline failed: {message}")
         self._warn(f"Timeline failed: {message}")
         self._status.showMessage("Timeline failed.")
+
+    def _on_album_home(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Albums", "Select or scan a library before opening Albums.")
+            return
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Albums: building visual index…")
+        progress = QProgressDialog("Building Album library…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Albums")
+        progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._album_home_progress = progress
+        worker = AlbumHomeWorker(self._config.db_path, library_id)
+        self._album_home_worker = worker
+        worker.finished.connect(self._on_album_home_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_album_home_failed, Qt.ConnectionType.QueuedConnection)
+        progress.canceled.connect(self._cancel_album_home)
+        self._registry.start(worker)
+
+    @Slot()
+    def _cancel_album_home(self) -> None:
+        # Projection is short and read-only; cancellation closes the progress UI
+        # and ignores the eventual result rather than terminating SQLite mid-query.
+        self._album_home_cancelled = True
+        self._finish_album_home_progress()
+        self._status.showMessage("Albums cancelled.")
+
+    def _finish_album_home_progress(self) -> None:
+        progress = getattr(self, "_album_home_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater(); self._album_home_progress = None
+        self._set_busy(False)
+
+    @Slot(object)
+    def _on_album_home_ready(self, home) -> None:
+        cancelled = bool(getattr(self, "_album_home_cancelled", False))
+        self._album_home_cancelled = False
+        self._finish_album_home_progress()
+        if cancelled:
+            return
+        from ppa.ui.album_home_dialog import AlbumHomeDialog
+        dialog = AlbumHomeDialog(self._conn, home, self, cache_dir=self._cache_dir / "albums")
+        dialog.show(); self._album_home_dialog = dialog
+        self._status.showMessage(f"Albums ready — {len(home.cards)} album{'s' if len(home.cards) != 1 else ''}.")
+
+    @Slot(str)
+    def _on_album_home_failed(self, message: str) -> None:
+        self._album_home_cancelled = False
+        self._finish_album_home_progress()
+        self._warn(f"Albums failed: {message}")
+        self._status.showMessage("Albums failed.")
+
+
+    def _on_tag_home(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Tags", "Select or scan a library before opening Tags.")
+            return
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Tags: building visual index…")
+        progress = QProgressDialog("Building Tag library…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Tags")
+        progress.setMinimumDuration(0); progress.setAutoClose(False); progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal); progress.show()
+        self._tag_home_progress = progress
+        self._tag_home_cancelled = False
+        worker = TagHomeWorker(self._config.db_path, library_id)
+        self._tag_home_worker = worker
+        worker.finished.connect(self._on_tag_home_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_tag_home_failed, Qt.ConnectionType.QueuedConnection)
+        progress.canceled.connect(self._cancel_tag_home)
+        self._registry.start(worker)
+
+    @Slot()
+    def _cancel_tag_home(self) -> None:
+        self._tag_home_cancelled = True
+        self._finish_tag_home_progress()
+        self._status.showMessage("Tags cancelled.")
+
+    def _finish_tag_home_progress(self) -> None:
+        progress = getattr(self, "_tag_home_progress", None)
+        if progress is not None:
+            progress.close(); progress.deleteLater(); self._tag_home_progress = None
+        self._set_busy(False)
+
+    @Slot(object)
+    def _on_tag_home_ready(self, home) -> None:
+        cancelled = bool(getattr(self, "_tag_home_cancelled", False))
+        self._tag_home_cancelled = False
+        self._finish_tag_home_progress()
+        if cancelled:
+            return
+        from ppa.ui.tag_home_dialog import TagHomeDialog
+        dialog = TagHomeDialog(self._conn, home, self, cache_dir=self._cache_dir / "tags")
+        dialog.show(); self._tag_home_dialog = dialog
+        self._status.showMessage(f"Tags ready — {len(home.cards)} tag{'s' if len(home.cards) != 1 else ''}.")
+
+    @Slot(str)
+    def _on_tag_home_failed(self, message: str) -> None:
+        self._tag_home_cancelled = False
+        self._finish_tag_home_progress()
+        self._warn(f"Tags failed: {message}")
+        self._status.showMessage("Tags failed.")
 
     def _on_family_history(self) -> None:
         library_id = self._current_library_id()

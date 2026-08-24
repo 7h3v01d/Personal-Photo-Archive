@@ -145,6 +145,26 @@ def main(argv: list[str] | None = None) -> int:
     event_home_parser.add_argument("--json", dest="json_path", default=None,
                                    help="Write structured Family History JSON to this path")
 
+    album_home_parser = subparsers.add_parser(
+        "album-home", help="Build the read-only visual Album-card landing view")
+    album_home_parser.add_argument("library_id", type=int, help="Library id to browse")
+    album_home_parser.add_argument("--json", dest="json_path", default=None,
+                                   help="Write structured Album Home JSON to this path")
+
+
+    tag_home_parser = subparsers.add_parser(
+        "tag-home", help="Build the read-only visual Tag-card landing view")
+    tag_home_parser.add_argument("library_id", type=int, help="Library id to browse")
+    tag_home_parser.add_argument("--json", dest="json_path", default=None,
+                                 help="Write structured Tag Home JSON to this path")
+
+    tag_intersection_parser = subparsers.add_parser(
+        "tag-intersection", help="Browse the explicit logical-Photo intersection of Tags")
+    tag_intersection_parser.add_argument("library_id", type=int, help="Library id to browse")
+    tag_intersection_parser.add_argument("tag_ids", nargs="+", help="Two or more Tag UUIDs")
+    tag_intersection_parser.add_argument("--json", dest="json_path", default=None,
+                                         help="Write structured intersection JSON to this path")
+
     event_health_parser = subparsers.add_parser(
         "event-health", help="Summarise read-only Event curation/chronology attention indicators")
     event_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
@@ -539,6 +559,44 @@ def main(argv: list[str] | None = None) -> int:
         print(home_text(home))
         if args.json_path:
             Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "album-home":
+        from ppa.album_home import build_album_home, concise_text as album_home_text
+        try:
+            home = build_album_home(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(album_home_text(home))
+        if args.json_path:
+            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+
+    if args.command == "tag-home":
+        from ppa.tag_home import build_tag_home, concise_text as tag_home_text
+        try:
+            home = build_tag_home(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(tag_home_text(home))
+        if args.json_path:
+            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "tag-intersection":
+        from ppa.tag_home import build_tag_intersection_view
+        try:
+            view = build_tag_intersection_view(conn, library_id=args.library_id, tag_ids=tuple(args.tag_ids))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(f"{view.name}: {view.total_members} logical photos")
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
             print(f"\nWrote {args.json_path}")
         return 0
 
