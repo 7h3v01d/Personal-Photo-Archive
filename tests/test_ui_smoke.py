@@ -619,3 +619,96 @@ def test_phase9_organization_health_dialog_constructs(app, tmp_path: Path) -> No
         assert len(health.unused_tag_ids) == 1
     finally:
         dialog.close(); conn.close()
+
+
+def test_phase9_assisted_organization_dialog_constructs_with_review_candidates(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, create_tag, bulk_add_photos_to_album, bulk_tag_photos
+    from ppa.organization_suggestions import build_organization_suggestions
+    from ppa.ui.organization_suggestions_dialog import OrganizationSuggestionsDialog
+
+    cfg = _config_with_library(tmp_path)
+    # The common smoke fixture starts with three photos; add two so the
+    # conservative 5-photo suggestion threshold is genuinely exercised.
+    libpath = tmp_path / "library"
+    Image.new("RGB", (60, 40), "yellow").save(libpath / "IMG_0004.jpg")
+    Image.new("RGB", (60, 40), "purple").save(libpath / "IMG_0005.jpg")
+    conn = connect(cfg.db_path); scan_library(conn, libpath)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    pids = tuple(sorted({i.photo_id for i in catalogue.grid_items(conn)}))
+    album = create_album(conn, library_id=lib_id, name="Family Set")
+    tag = create_tag(conn, library_id=lib_id, name="Family")
+    bulk_add_photos_to_album(conn, album.id, pids)
+    bulk_tag_photos(conn, tag.id, pids[:4])
+    view = build_organization_suggestions(conn, library_id=lib_id)
+    dialog = OrganizationSuggestionsDialog(conn, cfg.db_path, view, None,
+                                           cache_dir=tmp_path / "suggest-thumbs")
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Assisted Organisation"
+        assert dialog._table.rowCount() == 1
+        assert dialog._review.isEnabled() and dialog._apply.isEnabled()
+        assert "1 unique review candidate" in dialog._status.text()
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_suggestion_review_controls_construct(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, create_tag, bulk_add_photos_to_album, bulk_tag_photos
+    from ppa.organization_suggestions import build_organization_suggestions, dismiss_organization_suggestion
+    from ppa.scanner import scan_library
+    from ppa.ui.organization_suggestions_dialog import OrganizationSuggestionsDialog, SuggestionReviewsDialog
+
+    cfg = _config_with_library(tmp_path)
+    libpath = tmp_path / "library"
+    Image.new("RGB", (60, 40), "orange").save(libpath / "IMG_0004.jpg")
+    Image.new("RGB", (60, 40), "pink").save(libpath / "IMG_0005.jpg")
+    conn = connect(cfg.db_path); scan_library(conn, libpath)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    pids = tuple(sorted({i.photo_id for i in catalogue.grid_items(conn)}))
+    album = create_album(conn, library_id=lib_id, name="Review Set")
+    tag = create_tag(conn, library_id=lib_id, name="Family")
+    bulk_add_photos_to_album(conn, album.id, pids); bulk_tag_photos(conn, tag.id, pids[:4])
+    view = build_organization_suggestions(conn, library_id=lib_id)
+    dialog = OrganizationSuggestionsDialog(conn, cfg.db_path, view, None,
+                                           cache_dir=tmp_path / "review-thumbs")
+    try:
+        app.processEvents()
+        assert dialog._dismiss.isEnabled()
+        assert dialog._history.isEnabled()
+        review = dismiss_organization_suggestion(conn, view.suggestions[0], note="Checked")
+        history = SuggestionReviewsDialog(cfg.db_path, lib_id, (review,), dialog)
+        try:
+            app.processEvents()
+            assert history.windowTitle() == "Reviewed Organisation Suggestions"
+            assert history._table.rowCount() == 1
+            assert history._restore.isEnabled()
+        finally:
+            history.close()
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_organization_activity_dialog_constructs_and_marks_safe_undo(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, add_photo_to_album
+    from ppa.organization_activity import build_organization_activity
+    from ppa.ui.organization_activity_dialog import OrganizationActivityDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    pid = catalogue.grid_items(conn)[0].photo_id
+    album = create_album(conn, library_id=lib_id, name="Activity Test")
+    add_photo_to_album(conn, album.id, pid)
+    view = build_organization_activity(conn, library_id=lib_id)
+    dialog = OrganizationActivityDialog(cfg.db_path, view, None)
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Organisation Activity"
+        assert dialog._table.rowCount() >= 2
+        assert dialog._undo.isEnabled()
+        assert "Added Photo" in dialog._table.item(0, 3).text()
+    finally:
+        dialog.close(); conn.close()

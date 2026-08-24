@@ -35,7 +35,7 @@ def test_schema_v21_and_saved_organization_view_roundtrip(tmp_path: Path):
     conn, lib_id, pids = _library(tmp_path)
     album=create_album(conn,library_id=lib_id,name="Holiday"); tag=create_tag(conn,library_id=lib_id,name="Family")
     v=save_organization_view(conn,library_id=lib_id,name=" Holiday family ",album_ids=[album.id,album.id],tag_ids=[tag.id])
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 21
+    assert conn.execute("SELECT 1 FROM schema_version WHERE version=21").fetchone() is not None
     assert v.name == "Holiday family" and v.album_ids == (album.id,) and v.tag_ids == (tag.id,)
     assert get_organization_view(conn,v.id) == v
     assert list_organization_views(conn,library_id=lib_id) == (v,)
