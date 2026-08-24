@@ -424,3 +424,138 @@ def test_legacy_workers_close_sqlite_connection_on_failure(app, monkeypatch, tmp
         monkeypatch.setattr(workers, operation_name, boom)
         worker.run()
         assert fake.closed, operation_name
+
+
+def test_phase9_organization_dialog_constructs_and_bulk_curates(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, create_tag, get_album, get_tag
+    from ppa.ui.organization_dialog import OrganizationDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    items = catalogue.grid_items(conn)
+    photo_ids = tuple(dict.fromkeys(i.photo_id for i in items[:2]))
+    album = create_album(conn, library_id=lib_id, name="Family")
+    tag = create_tag(conn, library_id=lib_id, name="Favourite")
+    dialog = OrganizationDialog(conn, lib_id, photo_ids, None)
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Albums & Tags"
+        assert dialog._album_list.count() == 1
+        assert dialog._tag_list.count() == 1
+        dialog._album_list.setCurrentRow(0); dialog._album_add()
+        dialog._tag_list.setCurrentRow(0); dialog._tag_add()
+        assert set(get_album(conn, album.id).photo_ids) == set(photo_ids)
+        assert set(get_tag(conn, tag.id).photo_ids) == set(photo_ids)
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_organization_browser_constructs_filters_and_keeps_logical_photo_unique(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, add_photo_to_album, get_album
+    from ppa.ui.organization_browse_dialog import OrganizationBrowseDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    items = catalogue.grid_items(conn)
+    album = create_album(conn, library_id=lib_id, name="Browse Test")
+    for pid in tuple(dict.fromkeys(i.photo_id for i in items[:3])):
+        add_photo_to_album(conn, album.id, pid)
+    album = get_album(conn, album.id)
+    dialog = OrganizationBrowseDialog(conn, "album", album.id, None,
+                                      cache_dir=tmp_path / "org-thumbs")
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Album: Browse Test"
+        assert dialog._model.rowCount() == len(album.photo_ids)
+        if dialog._model.rowCount():
+            filename = dialog._model._items[0].filename
+            dialog._search.setText(filename)
+            app.processEvents()
+            assert dialog._model.rowCount() >= 1
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_album_presentation_dialog_constructs_and_persists(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_album, add_photo_to_album, get_album_presentation
+    from ppa.ui.album_presentation_dialog import AlbumPresentationDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    items = catalogue.grid_items(conn)
+    photo_ids = tuple(dict.fromkeys(i.photo_id for i in items[:2]))
+    album = create_album(conn, library_id=lib_id, name="Presentation Test")
+    for pid in photo_ids:
+        add_photo_to_album(conn, album.id, pid)
+    dialog = AlbumPresentationDialog(conn, album.id, None)
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Album presentation"
+        assert dialog._list.count() == len(photo_ids)
+        if photo_ids:
+            dialog._list.setCurrentRow(0); dialog._cover()
+            assert get_album_presentation(conn, album.id).cover_photo_id is not None
+        if len(photo_ids) > 1:
+            dialog._list.setCurrentRow(1); dialog._move(-1); dialog._save()
+            assert get_album_presentation(conn, album.id).order_photo_ids is not None
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_album_home_constructs_filters_and_opens_card(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.album_home import build_album_home
+    from ppa.organization import create_album, add_photo_to_album
+    from ppa.ui.album_home_dialog import AlbumHomeDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    items = catalogue.grid_items(conn)
+    album = create_album(conn, library_id=lib_id, name="Family Trips", description="Beach memories")
+    for pid in tuple(dict.fromkeys(i.photo_id for i in items[:2])):
+        add_photo_to_album(conn, album.id, pid)
+    home = build_album_home(conn, library_id=lib_id)
+    dialog = AlbumHomeDialog(conn, home, None, cache_dir=tmp_path / "album-home-thumbs")
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Albums"
+        assert dialog._list.count() == 1
+        dialog._search.setText("beach")
+        app.processEvents()
+        assert dialog._list.count() == 1
+        dialog._search.setText("does-not-exist")
+        app.processEvents()
+        assert dialog._list.count() == 0
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase9_tag_home_constructs_and_intersects(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.organization import create_tag, tag_photo
+    from ppa.tag_home import build_tag_home, build_tag_intersection_view
+    from ppa.ui.tag_home_dialog import TagHomeDialog
+
+    cfg = _config_with_library(tmp_path)
+    conn = connect(cfg.db_path)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    pids = tuple(dict.fromkeys(i.photo_id for i in catalogue.grid_items(conn)))
+    a=create_tag(conn,library_id=lib_id,name='Family'); b=create_tag(conn,library_id=lib_id,name='Beach')
+    for pid in pids[:2]: tag_photo(conn,a.id,pid)
+    for pid in pids[1:3]: tag_photo(conn,b.id,pid)
+    dialog=TagHomeDialog(conn,build_tag_home(conn,library_id=lib_id),None,cache_dir=tmp_path/'tag-home-thumbs')
+    try:
+        app.processEvents(); assert dialog.windowTitle()=='Tags'; assert dialog._list.count()==2
+        for i in range(dialog._list.count()): dialog._list.item(i).setSelected(True)
+        app.processEvents(); assert dialog._intersection.isEnabled()
+        view=build_tag_intersection_view(conn,library_id=lib_id,tag_ids=dialog._selected_ids())
+        assert view.total_members==1
+    finally:
+        dialog.close(); conn.close()

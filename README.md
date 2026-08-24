@@ -515,3 +515,23 @@ python -m ppa.cli organize tags 1
 ```
 
 See `docs/PHASE9_0_ALBUMS_TAGS_FOUNDATION.md`.
+
+### Phase 9.1 — Album & Tag Desktop Curation
+
+The desktop now supports extended photo selection and an **Albums & Tags…** curation dialog. Bulk membership changes are atomic, use logical Photo identity, retain Library ownership guards, and append the same organisation audit history introduced in Phase 9.0. The photo inspector also shows current Album/Tag membership. See `docs/PHASE9_1_DESKTOP_CURATION.md`.
+
+## Phase 9.2 — Album & Tag Browsing Views
+
+Albums and Tags now open as first-class, read-only thumbnail views. Each logical Photo appears once even when multiple physical copies exist; a stable representative File is chosen only for rendering/Preview. Missing-only curated members remain visible, browsing is bounded/paged, and filename filtering searches all known filenames for that Photo in the Library. No chronology/evidence authority is introduced. See `docs/PHASE9_2_ALBUM_TAG_BROWSING.md`.
+
+## Phase 9.3 — Album Curation & Presentation
+
+Albums now support a human-selected logical-Photo cover and an explicit presentation order. Both are display-only preferences, append-audited, and automatically invalidated when Album membership changes in a way that makes them stale. See `docs/PHASE9_3_ALBUM_PRESENTATION.md`.
+
+### Phase 9.4 — Album Home / Visual Album Library
+
+The desktop now includes an **Albums** landing page with paged visual Album cards, preferred-cover thumbnails, descriptions, logical-photo/presence counts, search, and one-click entry into the existing Album browser. The projection is read-only (`ppa-album-home/1`) and remains orthogonal to chronology/evidence.
+
+### Phase 9.5 — Tag Home & Organisational Discovery
+
+Tags now have a first-class visual landing page with bounded card paging, deterministic cover representatives, explicit present/missing counts, name search, and direct browsing. Selecting two or more Tags creates an exact logical-Photo set intersection (for example `Family + Beach`) and opens it through the existing bounded organisation browser. Intersections are read-only, same-Library only, and never influence chronology or evidence.

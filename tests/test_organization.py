@@ -125,3 +125,95 @@ def test_album_and_tag_curation_never_write_source_file(tmp_path):
     after_stat=source.stat()
     assert source.read_bytes() == before_bytes
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+from ppa.organization import (
+    bulk_add_photos_to_album, bulk_remove_photos_from_album,
+    bulk_tag_photos, bulk_untag_photos, get_photo_organization,
+)
+
+
+def test_bulk_album_membership_is_atomic_and_deduplicates_input(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2')])
+    album=create_album(conn,library_id=lid,name='Bulk')
+    out=bulk_add_photos_to_album(conn,album.id,['p1','p1','p2'])
+    assert out.photo_ids == ('p1','p2')
+    assert [h.action for h in list_organization_history(conn,object_kind='album',object_id=album.id)] == ['create','add_photo','add_photo']
+    out=bulk_remove_photos_from_album(conn,album.id,['p2','p2'])
+    assert out.photo_ids == ('p1',)
+
+
+def test_bulk_album_fails_all_or_zero_on_cross_library_photo(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib1',[('a','p1')]); _library(conn,tmp_path/'lib2',[('b','p2')])
+    album=create_album(conn,library_id=lid,name='Atomic')
+    with pytest.raises(ValueError, match='not represented'):
+        bulk_add_photos_to_album(conn,album.id,['p1','p2'])
+    assert get_album(conn,album.id).photo_ids == ()
+    assert [h.action for h in list_organization_history(conn,object_kind='album',object_id=album.id)] == ['create']
+
+
+def test_bulk_tag_is_atomic_and_photo_organization_is_read_only(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2')])
+    tag=create_tag(conn,library_id=lid,name='People')
+    bulk_tag_photos(conn,tag.id,['p1','p2'])
+    state=get_photo_organization(conn,library_id=lid,photo_id='p1')
+    assert state.tag_ids == (tag.id,)
+    before=conn.total_changes
+    again=get_photo_organization(conn,library_id=lid,photo_id='p1')
+    assert again == state and conn.total_changes == before
+    bulk_untag_photos(conn,tag.id,['p1'])
+    assert get_photo_organization(conn,library_id=lid,photo_id='p1').tag_ids == ()
+
+
+def test_bulk_organization_cannot_change_evidence(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2')])
+    album=create_album(conn,library_id=lid,name='Christmas 2004')
+    tag=create_tag(conn,library_id=lid,name='25 December 2004')
+    before={t:tuple(tuple(r) for r in conn.execute(f'SELECT * FROM {t}')) for t in ('metadata_observations','anchors','reconstructions')}
+    bulk_add_photos_to_album(conn,album.id,['p1','p2']); bulk_tag_photos(conn,tag.id,['p1','p2'])
+    after={t:tuple(tuple(r) for r in conn.execute(f'SELECT * FROM {t}')) for t in ('metadata_observations','anchors','reconstructions')}
+    assert before == after
+
+from ppa.organization import (
+    get_album_presentation, set_album_cover, set_album_presentation_order,
+    reset_album_presentation, list_album_presentation_history,
+)
+
+
+def test_album_presentation_schema_v20_and_cover_order_are_display_only(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2')])
+    assert current_schema_version(conn) >= 20
+    album=create_album(conn,library_id=lid,name='Family'); bulk_add_photos_to_album(conn,album.id,['p1','p2'])
+    before={t:tuple(tuple(r) for r in conn.execute(f'SELECT * FROM {t}')) for t in ('metadata_observations','anchors','reconstructions')}
+    p=set_album_cover(conn,album.id,'p2'); assert p.cover_photo_id=='p2'
+    p=set_album_presentation_order(conn,album.id,['p2','p1']); assert p.order_photo_ids==('p2','p1')
+    after={t:tuple(tuple(r) for r in conn.execute(f'SELECT * FROM {t}')) for t in ('metadata_observations','anchors','reconstructions')}
+    assert before==after
+    assert [h.action for h in list_album_presentation_history(conn,album.id)] == ['cover','order']
+
+
+def test_album_presentation_requires_member_and_exact_permutation(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2'),('c','p3')])
+    album=create_album(conn,library_id=lid,name='A'); bulk_add_photos_to_album(conn,album.id,['p1','p2'])
+    with pytest.raises(ValueError, match='current album member'): set_album_cover(conn,album.id,'p3')
+    with pytest.raises(ValueError, match='duplicate'): set_album_presentation_order(conn,album.id,['p1','p1'])
+    with pytest.raises(ValueError, match='every current album member'): set_album_presentation_order(conn,album.id,['p1'])
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO album_presentation(album_id,cover_photo_id,updated_at) VALUES (?,?,?)",(album.id,'p3','x'))
+
+
+def test_album_membership_change_invalidates_presentation_dependencies(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1'),('b','p2'),('c','p3')])
+    album=create_album(conn,library_id=lid,name='A'); bulk_add_photos_to_album(conn,album.id,['p1','p2'])
+    set_album_cover(conn,album.id,'p1'); set_album_presentation_order(conn,album.id,['p2','p1'])
+    add_photo_to_album(conn,album.id,'p3')
+    p=get_album_presentation(conn,album.id); assert p.cover_photo_id=='p1' and p.order_photo_ids is None
+    remove_photo_from_album(conn,album.id,'p1')
+    p=get_album_presentation(conn,album.id); assert p.cover_photo_id is None and p.order_photo_ids is None
+
+
+def test_album_presentation_reset_is_audited_and_idempotent(tmp_path):
+    conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib',[('a','p1')])
+    album=create_album(conn,library_id=lid,name='A'); add_photo_to_album(conn,album.id,'p1'); set_album_cover(conn,album.id,'p1')
+    reset_album_presentation(conn,album.id); reset_album_presentation(conn,album.id)
+    assert get_album_presentation(conn,album.id).cover_photo_id is None
+    assert [h.action for h in list_album_presentation_history(conn,album.id)] == ['cover','reset']
