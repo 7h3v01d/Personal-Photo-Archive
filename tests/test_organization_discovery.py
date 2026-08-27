@@ -60,3 +60,19 @@ def test_discovery_never_changes_evidence(tmp_path):
     before_changes=c.total_changes; build_organization_discovery(c,library_id=lid,album_ids=(a.id,),tag_ids=(t.id,))
     after={n:tuple(tuple(r) for r in c.execute(f'SELECT * FROM {n}')) for n in before}
     assert before==after and c.total_changes==before_changes
+
+
+def test_discovery_query_count_is_bounded_by_type_not_selector_count(tmp_path):
+    conn=connect(tmp_path/'scale.sqlite'); pids=('p1',); lid=_lib(conn,tmp_path/'scale-lib','s',pids)
+    from ppa.organization import create_album, create_tag, bulk_add_photos_to_album, bulk_tag_photos
+    albums=[]; tags=[]
+    for n in range(20):
+        a=create_album(conn,library_id=lid,name=f'A{n:02d}'); bulk_add_photos_to_album(conn,a.id,[pids[0]]); albums.append(a.id)
+        t=create_tag(conn,library_id=lid,name=f'T{n:02d}'); bulk_tag_photos(conn,t.id,[pids[0]]); tags.append(t.id)
+    statements=[]; conn.set_trace_callback(statements.append)
+    result=build_organization_discovery(conn,library_id=lid,album_ids=albums,tag_ids=tags)
+    conn.set_trace_callback(None)
+    selects=[s for s in statements if s.lstrip().upper().startswith('SELECT')]
+    assert result.view.total_members == 1
+    assert len(selects) <= 8
+    conn.close()

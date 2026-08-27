@@ -62,3 +62,33 @@ def test_activity_and_undo_do_not_touch_evidence(tmp_path):
     add_photo_to_album(conn,album.id,pids[0]); entry=build_organization_activity(conn,library_id=lib).entries[0]; undo_organization_membership(conn,library_id=lib,history_id=entry.id)
     after=tuple((t,conn.execute(f'SELECT COUNT(*) AS n FROM {t}').fetchone()['n']) for t in ('metadata_observations','anchors','reconstructions'))
     assert after==snapshot
+
+
+def test_activity_undoability_uses_bounded_selects(tmp_path):
+    """Activity pages must not issue per-history-row undoability queries."""
+    conn,lib,pids=_setup(tmp_path)
+    album=create_album(conn,library_id=lib,name='Scale')
+    for _ in range(40):
+        add_photo_to_album(conn,album.id,pids[0])
+        remove_photo_from_album(conn,album.id,pids[0])
+    statements=[]
+    conn.set_trace_callback(statements.append)
+    view=build_organization_activity(conn,library_id=lib,limit=80)
+    conn.set_trace_callback(None)
+    selects=[s for s in statements if s.lstrip().upper().startswith('SELECT')]
+    assert len(view.entries) == 80
+    assert len(selects) <= 7
+    conn.close()
+
+
+def test_undo_freshness_is_rechecked_inside_write_lock(tmp_path):
+    conn,lib,pids=_setup(tmp_path)
+    album=create_album(conn,library_id=lib,name='A'); add_photo_to_album(conn,album.id,pids[0])
+    entry=build_organization_activity(conn,library_id=lib).entries[0]
+    statements=[]; conn.set_trace_callback(statements.append)
+    undo_organization_membership(conn,library_id=lib,history_id=entry.id)
+    conn.set_trace_callback(None)
+    begin=next(i for i,s in enumerate(statements) if s.strip().upper().startswith('BEGIN IMMEDIATE'))
+    locked_history=next(i for i,s in enumerate(statements) if i>begin and 'FROM organization_history WHERE id=' in s)
+    assert begin < locked_history
+    conn.close()

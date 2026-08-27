@@ -67,3 +67,22 @@ def test_export_does_not_touch_source_bytes_or_mtime(tmp_path):
     export_organization_report_zip(conn,library_id=lib,output_path=tmp_path/'out.zip')
     assert source.read_bytes()==before and source.stat().st_mtime_ns==mt
     conn.close()
+
+
+def test_report_scrubs_identity_embedded_in_human_text_and_activity_prefix(tmp_path):
+    conn,lib,pids,root,cfg=_fixture(tmp_path)
+    import uuid
+    secret_uuid=str(uuid.uuid4())
+    secret_hash='a'*64
+    secret_path=r'C:\\Users\\someone\\Private Photos\\IMG_0001.jpg'
+    a=create_album(conn,library_id=lib,name='Private notes',
+                   description=f'Source was {secret_path}; token {secret_uuid}; digest {secret_hash}')
+    add_photo_to_album(conn,a.id,pids[0])
+    report=build_organization_report(conn,library_id=lib)
+    raw=report.to_json()
+    assert secret_path not in raw and secret_uuid not in raw and secret_hash not in raw
+    assert '<PRIVATE_PATH>' in raw and '<IDENTIFIER>' in raw and '<HASH>' in raw
+    # Shareable activity must not leak even a shortened logical Photo identifier.
+    assert pids[0][:8] not in raw
+    assert any(x['change'] == "Added a photo to Album 'Private notes'" for x in report.recent_activity)
+    conn.close()

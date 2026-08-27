@@ -4,17 +4,13 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phase 7 complete; Phase 8.14 feature-complete. Phase 8.14.1 pre-Phase-9 hardening closes Event-health semantics, Family History projection performance, Qt worker/thread-affinity, and worker SQLite lifecycle findings from independent adversarial review.**
+Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12.1 Backup & Archive Health storage-identity layer active.**
 
-The Library -> File -> FileRevision -> Observation model holds under attack;
-this slice closed the transaction/identity edges: a failed scan now rolls
-back ALL partial reconciliation before recording FAILED (no half-committed
-catalogue, no orphaned revision); within-library identity is the canonical
-relative path (a respelled/junctioned root is no longer a phantom move);
-overlapping library roots are rejected; and metadata extraction records its
-extractor name/version so a version bump re-runs extraction. Catalogue reads
-now use presence_status; `status`/`files.sha256` remain maintained compat
-mirrors.
+The Library -> File -> FileRevision -> Observation model remains the archive-core
+provenance boundary. Later chronology, Event, organisation, identity, navigation,
+and Archive Health layers build on that evidence without rewriting source photos.
+Current content identity is revision-bound; legacy `status` / `files.sha256` fields
+remain maintained compatibility mirrors rather than the preferred authority.
 
 See `docs/HARDENING.md` for the Archive Core findings -> fix -> test map, and `docs/PHASE8_14_1_PRE_PHASE9_HARDENING.md` for the independent pre-Phase-9 UI/integration hardening pass. Per the reviewer, Phase 6 (Date Reliability Engine) can
 unblock once a confirming adversarial pass on this build comes back clean.
@@ -37,8 +33,7 @@ python -m ppa.main
 On first run this will:
 - create `~/.config/personal-photo-archive/config.toml` if it doesn't exist
 - create the catalogue database at the path in that config
-- open the desktop window: **Add Library…**, **Scan**, **Verify**,
-  **Extract Metadata**, and a grid-size control; a thumbnail grid
+- open the desktop window with compact **Library / Timeline / Organisation / Identity / Diagnostics** workspaces, the **Commands…** palette, **Refresh**, and a grid-size control. The Library workspace includes **Add Library…**, **Scan**, **Verify**, **Archive Health**, and **Extract Metadata**; the main catalogue surface remains a thumbnail grid
   (All / Recently Added / Duplicates / Missing) with status-tinted tiles —
   a red MISSING ribbon on absent files, an amber ×N badge on duplicate
   copies, a teal selection ring; and an inspector showing each file's
@@ -596,3 +591,99 @@ state, and recent curation activity. Source paths, IDs, hashes, thumbnails,
 database details and source-photo content are deliberately excluded.
 
 CLI: `python -m ppa.cli organization-report <library_id> organisation-report.zip`
+
+### Phase 9.12.1 — Pre-Freeze Adversarial Hardening
+
+Before Phase 9 sign-off, the organisation stack received a focused adversarial hardening pass. Safe Undo and suggestion Apply/Dismiss now revalidate freshness inside `BEGIN IMMEDIATE` write transactions, closing TOCTOU windows. Organisation Activity and unified discovery use bounded query patterns rather than per-row/per-selector SELECTs. Shareable Organisation Reports also scrub private paths and identifier/hash-like material embedded inside human-authored text, and recent activity no longer exposes shortened logical Photo IDs. No schema migration or new authority is introduced. See `docs/PHASE9_12_1_PRE_FREEZE_HARDENING.md`.
+
+## Phase 10.0 — Duplicate Identity & Copy-Lineage Foundation
+
+Phase 10.0 makes exact-copy identity explicit and introduces human-confirmed lineage between
+distinct logical Photos. Exact duplicates remain multiple Files under one Photo; derivative
+relationships are separate directed edges with cycle protection and append-only history.
+See `docs/PHASE10_0_DUPLICATE_LINEAGE_FOUNDATION.md`.
+
+### Phase 10.1 — Duplicate & Lineage Review UI
+
+The desktop now includes **Duplicates & Lineage**, with separate review lanes for current
+SHA-confirmed exact physical copies, logical-photo identity divergences, and explicit
+human Photo lineage. Exact or divergent physical files can be viewed side-by-side;
+lineage can be added/removed only through the Phase-10 audited APIs. The UI never
+auto-merges, auto-splits, deletes, selects a canonical winner, or infers lineage.
+See `docs/PHASE10_1_DUPLICATE_LINEAGE_REVIEW_UI.md`.
+
+### Phase 10.2 — Identity Divergence Investigation
+Divergent logical Photos can now be investigated against immutable FileRevision history. PPA distinguishes proven modified-in-place cases from files that were merely distinct when first observed, while withholding explanation when history is incomplete. Investigation is read-only and never auto-splits/merges identity or creates lineage.
+
+### Phase 10.3 — Controlled Identity Resolution
+
+Identity divergence can now be resolved by a human-reviewed split of one complete current-SHA cohort into a new logical Photo. The split is revalidated under `BEGIN IMMEDIATE`, append-audited, refuses partial/cross-Library/competing identity cohorts, and never changes source bytes, EXIF, chronology, Events, Albums, Tags or FileRevision evidence. See `docs/PHASE10_3_CONTROLLED_IDENTITY_RESOLUTION.md`.
+
+### Phase 10.4 — Identity Resolution Review & Recovery
+Controlled split history now has a visual topology review and a fail-closed recovery path. Recovery reverses one exact audited split only when no later identity-dependent curation makes recombination ambiguous; freshness is re-proven inside `BEGIN IMMEDIATE`, and recovery appends a v25 audit record without deleting the original split history.
+
+### Phase 10.5 — Identity Health & Resolution Queue
+Adds a read-only priority queue for competing byte-identical logical Photos, current identity divergence, recoverable/review-only split history, and completed recombinations. No automatic identity correction is performed.
+
+### Phase 10.6 — Competing Identity Investigation
+
+P0 competing-identity cases now have a read-only forensic investigation that shows each logical Photo, every physical File, immutable revision history, first/last observation, and whether PPA observed previously different bytes converge to the shared current SHA. The investigation can only mark a narrowly clean two-Photo case as a candidate for a future controlled merge; Album/Tag history, lineage history, prior identity resolution, cross-Library identity, unknown hashes, or other current bytes force review-only status. No merge or source mutation is performed.
+
+### Phase 10.7 — Controlled Identity Merge
+
+Eligible Phase-10.6 competing logical Photos can now be merged only after explicit survivor selection. The complete File/revision state is fingerprinted and revalidated under `BEGIN IMMEDIATE`; the losing Photo identity is retired only after all its physical File records are atomically reassigned. Human Photo notes, organisation history, lineage history and prior identity-resolution/merge history block the operation. Source files remain untouched.
+
+### Phase 11.0 — compact workspace navigation
+The former 20+ item horizontal toolbar is now grouped into Library, Timeline,
+Organisation, Identity, and Diagnostics workspace menus. Existing feature
+actions and handlers are preserved; this is a navigation refactor with no
+schema or authority change.
+
+## Phase 11.0.1 — Workspace navigation dispatch hardening
+
+Phase 11.0.1 hardens the compact workspace toolbar introduced in Phase 11.0.
+Workspace menus now use menu-local proxy actions that explicitly dispatch the
+existing canonical QAction commands rather than sharing those command actions
+directly with QMenu.  Command enabled state remains authoritative and is
+mirrored by the proxies.  A Qt regression now triggers representative entries
+from every workspace and proves that the canonical command action actually
+fires, closing the gap where Phase 11.0 only verified menu presence/labels.
+
+## Phase 11.1 — Command Palette & Keyboard Navigation
+
+- `Ctrl+Shift+P` searchable command launcher over canonical application actions.
+- Compact **Commands…** toolbar entry for discoverability.
+- `Alt+1` … `Alt+5` opens Library, Timeline, Organisation, Identity, and Diagnostics workspaces.
+- Disabled commands remain visible but cannot be executed through the palette.
+- No alternate handler path: palette execution calls the existing canonical `QAction`.
+
+
+### Phase 11.1.1 — Command Palette Label Fix
+
+Preserve canonical QAction labels in the command palette. Literal ampersands in commands such as `Albums & Tags…` and `Duplicates & Lineage` are no longer stripped during palette indexing/display. The Windows Qt regression now verifies the exact canonical labels before dispatch/state checks.
+
+### Phase 11.2 — Navigation Polish & Usability
+
+Workspace commands now expose concise descriptions in menus and the command palette. Palette search includes those descriptions, selected commands show purpose/availability, and the five most recently launched palette commands are recalled for the current application session. Recent-command recall is intentionally non-persistent and does not touch archive or source state. See `docs/PHASE11_2_NAVIGATION_POLISH.md`.
+
+## Phase 11.2.1 — Command Palette Search Ranking Fix
+
+Phase 11.2 expanded palette matching to command descriptions. That correctly allows multiple relevant results for a query such as `organisation health`, but the older Phase 11.1 Qt smoke test still required exactly one result.
+
+11.2.1 formalises deterministic ranking instead:
+- exact command-label match first;
+- label-token matches next;
+- workspace + label matches next;
+- description-dependent matches remain discoverable afterward;
+- original command registry order breaks ties deterministically.
+
+No archive data, schema, command dispatch, recent-command state, or source-photo behavior changes.
+
+## Phase 12.0 — Backup & Archive Health Foundation
+
+The **Library → Archive Health** surface adds a read-only view of catalogue copy coverage: no-present, single-present, multiple exact present, partially missing, unhealthy, unknown-hash, and current-content-divergence indicators. Multiple exact Files are deliberately **not** described as independent backups because Phase 12.0 has not yet captured storage-device or hard-link identity. CLI: `python -m ppa.cli archive-health <library-id> [--json archive-health.json]`. See `docs/PHASE12_0_ARCHIVE_HEALTH.md`.
+
+## Phase 12.1 — Filesystem Storage Identity & Hard-Link Awareness
+
+Normal library scans now retain the filesystem `device + object/file-index + link-count` evidence already available from read-only `stat()` calls. Archive Health schema `ppa-archive-health/2` uses that evidence to distinguish **hard-linked paths** from **distinct filesystem objects**, and separately reports exact-copy sets spanning distinct filesystem device IDs. Existing catalogue rows upgrade with unknown storage identity until their next normal scan; no migration reads or mutates source photos. Distinct object/device evidence is deliberately **not** described as proof of independent physical backup hardware or failure domains. See `docs/PHASE12_1_STORAGE_IDENTITY.md`.
+

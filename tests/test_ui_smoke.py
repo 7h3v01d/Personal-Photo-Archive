@@ -16,7 +16,7 @@ from PIL import Image  # noqa: E402
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QToolBar  # noqa: E402
 
 from ppa.config import Config  # noqa: E402
 from ppa.db import connect  # noqa: E402
@@ -712,3 +712,412 @@ def test_phase9_organization_activity_dialog_constructs_and_marks_safe_undo(app,
         assert "Added Photo" in dialog._table.item(0, 3).text()
     finally:
         dialog.close(); conn.close()
+
+
+def test_phase10_duplicate_lineage_review_constructs_and_compares_exact_copies(app, tmp_path: Path) -> None:
+    from ppa import catalogue
+    from ppa.duplicate_lineage import add_lineage, build_duplicate_identity
+    from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog, SideBySidePreviewDialog
+
+    cfg = _config_with_library(tmp_path)
+    libpath = tmp_path / "library"
+    # Make a byte-identical physical copy; scanner should attach it to the same
+    # logical Photo rather than inventing a derivative relationship.
+    (libpath / "IMG_0001_COPY.jpg").write_bytes((libpath / "IMG_0001.jpg").read_bytes())
+    conn = connect(cfg.db_path)
+    scan_library(conn, libpath)
+    lib_id = catalogue.list_libraries(conn)[0].id
+    view = build_duplicate_identity(conn, library_id=lib_id)
+    assert len(view.sets) >= 1
+    exact = view.sets[0]
+    assert exact.copy_count >= 2
+
+    # Add an explicit human lineage relation between two genuinely distinct Photos.
+    photo_ids = sorted({item.photo_id for item in catalogue.grid_items(conn)})
+    parent = exact.photo_id
+    child = next(pid for pid in photo_ids if pid != parent)
+    add_lineage(conn, parent_photo_id=parent, child_photo_id=child, relation_type="edited_variant")
+
+    dialog = DuplicateLineageDialog(conn, lib_id, view, None)
+    compare = None
+    try:
+        app.processEvents()
+        assert dialog.windowTitle() == "Duplicates & Lineage"
+        assert dialog.tabs.count() == 5
+        assert dialog.exact_tree.topLevelItemCount() >= 1
+        assert dialog.lineage_table.rowCount() == 1
+        compare = SideBySidePreviewDialog(conn, exact.copies[0].file_id, exact.copies[1].file_id, dialog)
+        compare.show(); app.processEvents()
+        assert compare.windowTitle() == "Compare Exact Copies"
+    finally:
+        if compare is not None:
+            compare.close()
+        dialog.close(); conn.close()
+
+
+def test_phase10_divergence_investigation_dialog_constructs_from_revision_evidence(app, tmp_path: Path) -> None:
+    from ppa.db import connect
+    from ppa.divergence_investigation import investigate_identity_divergence
+    from ppa.ui.duplicate_lineage_dialog import DivergenceInvestigationDialog
+    conn = connect(tmp_path / "divergence.sqlite")
+    root = tmp_path / "lib"; root.mkdir()
+    conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
+    lid = conn.execute("SELECT id FROM libraries").fetchone()[0]
+    conn.execute("INSERT INTO photos(id,created_at) VALUES ('p','x')")
+    for fid,sha in [('f1','bbb'),('f2','aaa')]:
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256) VALUES (?,?,?,?,1,'2020','2021',?,?)",(fid,'p',str(root/(fid+'.jpg')),fid+'.jpg',lid,sha))
+    conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at,superseded_at) VALUES ('r1','f1','aaa',1,'2020','2021')")
+    conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES ('r2','f1','bbb',1,'2021')")
+    conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES ('r3','f2','aaa',1,'2020')")
+    conn.execute("UPDATE files SET current_revision_id='r2' WHERE id='f1'"); conn.execute("UPDATE files SET current_revision_id='r3' WHERE id='f2'"); conn.commit()
+    view = investigate_identity_divergence(conn, library_id=lid, photo_id='p')
+    dialog = DivergenceInvestigationDialog(view)
+    try:
+        dialog.show(); app.processEvents()
+        assert dialog.windowTitle() == "Identity Divergence Investigation"
+        assert dialog.evidence_tree.topLevelItemCount() == 2
+        assert "MODIFIED IN PLACE" in dialog.evidence_tree.topLevelItem(0).text(3)
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase10_controlled_identity_split_ui_constructs_for_divergence(app, tmp_path: Path) -> None:
+    from ppa.db import connect
+    from ppa.duplicate_lineage import build_duplicate_identity
+    from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog
+
+    conn = connect(tmp_path / "split-ui.sqlite")
+    root = tmp_path / "lib-split"; root.mkdir()
+    conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
+    lid = conn.execute("SELECT id FROM libraries").fetchone()[0]
+    conn.execute("INSERT INTO photos(id,created_at) VALUES ('p','x')")
+    for fid,sha in [('fa','aaa'),('fb','bbb')]:
+        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,lid,sha))
+    conn.commit()
+    view=build_duplicate_identity(conn,library_id=lid)
+    dialog=DuplicateLineageDialog(conn,lid,view,None)
+    try:
+        dialog.show(); app.processEvents()
+        assert len(view.divergences)==1
+        assert dialog.split_identity_btn.text()=="Split selected hash cohort…"
+        assert dialog.divergence_tree.topLevelItemCount()==1
+        assert dialog.divergence_tree.topLevelItem(0).childCount()==2
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase10_identity_resolution_review_ui_constructs_and_marks_recovery(app, tmp_path: Path) -> None:
+    from ppa.db import connect
+    from ppa.duplicate_lineage import build_duplicate_identity
+    from ppa.identity_resolution import plan_identity_split, execute_identity_split, review_identity_resolution
+    from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog, IdentityResolutionReviewDialog
+    conn=connect(tmp_path/'resolution-ui.sqlite')
+    root=tmp_path/'lib-resolution'; root.mkdir()
+    conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
+    lid=conn.execute("SELECT id FROM libraries").fetchone()[0]
+    conn.execute("INSERT INTO photos(id,created_at) VALUES ('p','x')")
+    for fid,sha in [('fa','aaa'),('fb','bbb')]:
+        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,lid,sha))
+    conn.commit()
+    split=execute_identity_split(conn,plan_identity_split(conn,library_id=lid,source_photo_id='p',file_ids=('fa',)))
+    view=build_duplicate_identity(conn,library_id=lid)
+    dialog=DuplicateLineageDialog(conn,lid,view,None)
+    review_dialog=IdentityResolutionReviewDialog(review_identity_resolution(conn,split.resolution_id),dialog)
+    try:
+        dialog.show(); review_dialog.show(); app.processEvents()
+        assert dialog.tabs.count()==5
+        assert dialog.resolution_table.rowCount()==1
+        dialog.resolution_table.selectRow(0); app.processEvents()
+        assert dialog.recombine_resolution_btn.isEnabled()
+        assert review_dialog.windowTitle()=="Identity Resolution Review"
+        assert review_dialog.topology_tree.topLevelItemCount()==3
+    finally:
+        review_dialog.close(); dialog.close(); conn.close()
+
+
+def test_phase10_identity_health_tab_constructs_and_prioritises(app, tmp_path: Path) -> None:
+    from ppa.db import connect
+    from ppa.duplicate_lineage import build_duplicate_identity
+    from ppa.identity_health import build_identity_health
+    from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog
+    conn=connect(tmp_path/'health-ui.sqlite')
+    root=tmp_path/'lib-health'; root.mkdir()
+    conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
+    lid=conn.execute("SELECT id FROM libraries").fetchone()[0]
+    for pid in ('p1','p2','p3'):
+        conn.execute("INSERT INTO photos(id,created_at) VALUES (?,'x')",(pid,))
+    for fid,pid,sha in [('a','p1','same'),('b','p2','same'),('c','p3','x'),('d','p3','y')]:
+        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,pid,str(path),path.name,lid,sha))
+    conn.commit()
+    identity=build_duplicate_identity(conn,library_id=lid); health=build_identity_health(conn,library_id=lid)
+    dialog=DuplicateLineageDialog(conn,lid,identity,None,identity_health=health)
+    try:
+        dialog.show(); app.processEvents()
+        assert dialog.tabs.count()==5
+        assert dialog.tabs.tabText(4).startswith('Identity Health')
+        assert dialog.identity_health_table.rowCount()>=2
+        assert dialog.identity_health_table.item(0,0).text()=='P0'
+    finally:
+        dialog.close(); conn.close()
+
+
+def test_phase10_competing_identity_investigation_dialog_constructs(app, tmp_path: Path) -> None:
+    from ppa.db import connect
+    from ppa.competing_identity import investigate_competing_identity
+    from ppa.duplicate_lineage import build_duplicate_identity
+    from ppa.identity_health import build_identity_health
+    from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog, CompetingIdentityInvestigationDialog
+    conn=connect(tmp_path/'competing-ui.sqlite')
+    root=tmp_path/'lib-competing'; root.mkdir()
+    conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
+    lid=conn.execute("SELECT id FROM libraries").fetchone()[0]
+    for pid in ('p1','p2'): conn.execute("INSERT INTO photos(id,created_at) VALUES (?,'2020')",(pid,))
+    for fid,pid in [('a','p1'),('b','p2')]:
+        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'2020','2021',?,'same','present','ok')",(fid,pid,str(path),path.name,lid))
+        rid='r'+fid; conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,'same',1,'2020')",(rid,fid)); conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
+    conn.commit()
+    investigation=investigate_competing_identity(conn,library_id=lid,sha256='same')
+    identity=build_duplicate_identity(conn,library_id=lid); health=build_identity_health(conn,library_id=lid)
+    dialog=DuplicateLineageDialog(conn,lid,identity,None,identity_health=health)
+    evidence=CompetingIdentityInvestigationDialog(investigation,dialog,conn=conn)
+    try:
+        dialog.show(); evidence.show(); app.processEvents()
+        assert dialog.tabs.count()==5
+        assert dialog.identity_health_table.item(0,0).text()=='P0'
+        dialog.identity_health_table.selectRow(0); app.processEvents()
+        assert dialog.investigate_competing_btn.text()=='Investigate competing identity…'
+        assert evidence.windowTitle()=='Competing Identity Investigation'
+        assert evidence.evidence_tree.topLevelItemCount()==2
+        assert evidence.merge_controls.isVisible()
+        assert evidence.merge_btn.text()=='Merge competing identities…'
+    finally:
+        evidence.close(); dialog.close(); conn.close()
+
+
+def test_phase11_workspace_navigation_replaces_flat_toolbar(app, tmp_path: Path) -> None:
+    """Phase 11 keeps every command reachable without a 20+ action strip."""
+    from ppa.ui.main_window import MainWindow
+
+    config = _config_with_library(tmp_path)
+    win = MainWindow(config)
+    try:
+        assert list(win._workspace_buttons) == [
+            "Library", "Timeline", "Organisation", "Identity", "Diagnostics"
+        ]
+
+        expected = {
+            "Library": {"Add Library…", "Libraries…", "Scan", "Verify", "Archive Health", "Extract Metadata"},
+            "Timeline": {"Timeline", "Family History", "Date Review", "Unresolved Memories"},
+            "Organisation": {
+                "Albums & Tags…", "Albums", "Tags", "Discover",
+                "Assisted Organisation", "Organisation Health",
+                "Organisation Activity", "Export Organisation Report…",
+            },
+            "Identity": {"Duplicates & Lineage"},
+            "Diagnostics": {
+                "Pilot Audit", "Pilot Session…", "Activity Log…",
+                "Activity Runs…", "Export Diagnostics…",
+            },
+        }
+        for label, names in expected.items():
+            actual = {a.text() for a in win._workspace_menus[label].actions() if not a.isSeparator()}
+            assert actual == names
+
+        # The toolbar itself contains only the global Refresh QAction; feature
+        # actions live inside workspace menus instead of forming a giant strip.
+        direct_action_text = {a.text() for a in win.findChild(QToolBar, "MainWorkspaceToolbar").actions()}
+        assert "Refresh" in direct_action_text
+        assert "Scan" not in direct_action_text
+        assert "Albums" not in direct_action_text
+        assert "Export Diagnostics…" not in direct_action_text
+    finally:
+        win._registry.shutdown()
+        win.close()
+
+
+
+def test_phase11_workspace_menu_entries_dispatch_canonical_actions(app, tmp_path: Path) -> None:
+    """Workspace entries must actually dispatch, not merely render command labels."""
+    from ppa.ui.main_window import MainWindow
+
+    config = _config_with_library(tmp_path)
+    win = MainWindow(config)
+    try:
+        cases = [
+            ("Library", win._act_scan),
+            ("Timeline", win._act_timeline),
+            ("Organisation", win._act_albums),
+            ("Identity", win._act_duplicates_lineage),
+            ("Diagnostics", win._act_activity_log),
+        ]
+        for workspace, command in cases:
+            proxy = next(
+                action for action in win._workspace_menus[workspace].actions()
+                if not action.isSeparator() and action.text() == command.text()
+            )
+            assert proxy is not command
+            assert proxy.isEnabled() == command.isEnabled()
+
+            # Isolate dispatch from the command's modal/worker production slot.
+            # The proxy must call QAction.trigger(), which is proven by the
+            # canonical action's triggered signal firing exactly once.
+            command.triggered.disconnect()
+            seen = []
+            command.triggered.connect(lambda checked=False, bucket=seen: bucket.append(True))
+            proxy.trigger()
+            app.processEvents()
+            assert seen == [True]
+
+            # Menu-local enabled state follows the canonical command action.
+            command.setEnabled(False)
+            app.processEvents()
+            assert not proxy.isEnabled()
+            command.setEnabled(True)
+            app.processEvents()
+            assert proxy.isEnabled()
+    finally:
+        win._registry.shutdown()
+        win.close()
+
+
+def test_phase11_command_palette_filters_dispatches_and_respects_command_state(app, tmp_path: Path) -> None:
+    """Phase 11.1 palette is a searchable proxy over canonical QActions."""
+    from PySide6.QtGui import QKeySequence
+    from ppa.ui.command_palette_dialog import CommandPaletteDialog
+    from ppa.ui.main_window import MainWindow
+
+    config = _config_with_library(tmp_path)
+    win = MainWindow(config)
+    try:
+        commands = win._palette_commands()
+        assert len(commands) == 24
+        assert [c.workspace for c in commands[:5]] == ["Library"] * 5
+        assert {c.label for c in commands} >= {
+            "Scan", "Archive Health", "Timeline", "Albums & Tags…", "Organisation Health", "Duplicates & Lineage", "Activity Log…"
+        }
+        assert win._act_command_palette.shortcut() == QKeySequence("Ctrl+Shift+P")
+        assert [sc.key() for sc in win._workspace_shortcuts] == [
+            QKeySequence("Alt+1"), QKeySequence("Alt+2"), QKeySequence("Alt+3"),
+            QKeySequence("Alt+4"), QKeySequence("Alt+5"),
+        ]
+
+        dialog = CommandPaletteDialog(commands, win)
+        try:
+            dialog.search.setText("organisation health")
+            app.processEvents()
+            # Phase 11.2 description search can legitimately surface additional
+            # relevant commands (for example the organisation-health report).
+            # Exact command-name matches must rank first rather than being the
+            # only permitted result.
+            assert dialog.list.count() >= 1
+            assert dialog.current_command().action is win._act_org_health
+
+            # Prove execution is through the canonical QAction, not a parallel handler.
+            win._act_org_health.triggered.disconnect()
+            seen = []
+            win._act_org_health.triggered.connect(lambda checked=False: seen.append(True))
+            dialog._run_current()
+            app.processEvents()
+            assert seen == [True]
+        finally:
+            dialog.close()
+
+        disabled = CommandPaletteDialog(win._palette_commands(), win)
+        try:
+            win._act_scan.setEnabled(False)
+            disabled.search.setText("scan")
+            app.processEvents()
+            assert disabled.list.count() == 1
+            assert "unavailable" in disabled.list.item(0).text().lower()
+            assert not disabled.run_button.isEnabled()
+            win._act_scan.setEnabled(True)
+            app.processEvents()
+            assert "unavailable" not in disabled.list.item(0).text().lower()
+            assert disabled.run_button.isEnabled()
+        finally:
+            disabled.close()
+    finally:
+        win._registry.shutdown()
+        win.close()
+
+
+def test_phase11_navigation_polish_descriptions_and_recent_palette_order(app, tmp_path: Path) -> None:
+    """Phase 11.2 adds explanatory command metadata and session-local recents."""
+    from PySide6.QtCore import Qt
+    from ppa.ui.command_palette_dialog import CommandPaletteDialog
+    from ppa.ui.main_window import MainWindow
+
+    config = _config_with_library(tmp_path)
+    win = MainWindow(config)
+    try:
+        commands = win._palette_commands()
+        by_label = {command.label: command for command in commands}
+        assert by_label["Verify"].description
+        assert "integrity" in by_label["Verify"].description.casefold()
+        assert by_label["Duplicates & Lineage"].description
+        assert win._act_verify.toolTip() == by_label["Verify"].description
+        assert win._workspace_menu_actions["Library"][3].toolTip() == by_label["Verify"].description
+
+        # Descriptions are searchable, not merely decorative.
+        searchable = CommandPaletteDialog(commands, win)
+        try:
+            searchable.search.setText("integrity hashes")
+            app.processEvents()
+            assert searchable.list.count() == 1
+            assert searchable.current_command().label == "Verify"
+        finally:
+            searchable.close()
+
+        # Recent ordering applies only to an empty query and remains bounded.
+        recent = ["Organisation Health", "Timeline", "Scan"]
+        dialog = CommandPaletteDialog(commands, win, recent_labels=recent)
+        try:
+            shown = [
+                dialog._commands[dialog.list.item(i).data(Qt.ItemDataRole.UserRole)].label
+                for i in range(3)
+            ]
+            assert shown == recent
+            assert "recent" in dialog.list.item(0).text().casefold()
+            dialog.search.setText("scan")
+            app.processEvents()
+            assert dialog.list.count() == 1
+            assert "recent" not in dialog.list.item(0).text().casefold()
+        finally:
+            dialog.close()
+
+        # Main-window recall is session-local, MRU, de-duplicated, and capped.
+        for label in ["Scan", "Timeline", "Albums", "Tags", "Verify", "Scan"]:
+            win._remember_palette_command(by_label[label])
+        assert win._recent_palette_labels == ["Scan", "Verify", "Tags", "Albums", "Timeline"]
+    finally:
+        win._registry.shutdown()
+        win.close()
+
+
+def test_phase12_archive_health_navigation_and_dialog_are_read_only(app, tmp_path: Path) -> None:
+    """Phase 12.1 exposes copy/storage evidence without creating new authority."""
+    from ppa.archive_health import build_archive_health
+    from ppa.ui.archive_health_dialog import ArchiveHealthDialog
+    from ppa.ui.main_window import MainWindow
+
+    config = _config_with_library(tmp_path)
+    conn = connect(config.db_path)
+    lid = int(conn.execute("SELECT id FROM libraries ORDER BY id LIMIT 1").fetchone()["id"])
+    health = build_archive_health(conn, library_id=lid)
+
+    win = MainWindow(config)
+    dialog = ArchiveHealthDialog(conn, config.db_path, health, win)
+    try:
+        assert "Archive Health" in {
+            a.text() for a in win._workspace_menus["Library"].actions() if not a.isSeparator()
+        }
+        command = next(c for c in win._palette_commands() if c.label == "Archive Health")
+        assert "copy coverage" in command.description.casefold()
+        assert dialog.windowTitle() == "Backup & Archive Health"
+        assert health.single_present_count == 3
+    finally:
+        dialog.close(); win._registry.shutdown(); win.close(); conn.close()

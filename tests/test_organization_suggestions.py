@@ -206,3 +206,28 @@ def test_review_state_never_changes_evidence_or_source(tmp_path: Path):
     assert _evidence_counts(conn) == evidence
     assert source.read_bytes() == raw and source.stat().st_mtime_ns == mtime
     conn.close()
+
+
+def test_apply_and_dismiss_prove_freshness_inside_immediate_transaction(tmp_path: Path):
+    from ppa.organization_suggestions import dismiss_organization_suggestion
+    conn,lid,pids=_setup(tmp_path,10)
+    a1=create_album(conn,library_id=lid,name='A1'); t1=create_tag(conn,library_id=lid,name='T1')
+    bulk_add_photos_to_album(conn,a1.id,pids[:5]); bulk_tag_photos(conn,t1.id,pids[:4])
+    s1=build_organization_suggestions(conn,library_id=lid).suggestions[0]
+    trace=[]; conn.set_trace_callback(trace.append)
+    dismiss_organization_suggestion(conn,s1)
+    conn.set_trace_callback(None)
+    begin=next(i for i,s in enumerate(trace) if s.strip().upper().startswith('BEGIN IMMEDIATE'))
+    freshness=next(i for i,s in enumerate(trace) if i>begin and 'FROM libraries WHERE id=' in s)
+    assert begin < freshness
+
+    a2=create_album(conn,library_id=lid,name='A2'); t2=create_tag(conn,library_id=lid,name='T2')
+    bulk_add_photos_to_album(conn,a2.id,pids[5:10]); bulk_tag_photos(conn,t2.id,pids[5:9])
+    s2=next(s for s in build_organization_suggestions(conn,library_id=lid).suggestions if s.group_id==a2.id)
+    trace=[]; conn.set_trace_callback(trace.append)
+    apply_organization_suggestion(conn,s2)
+    conn.set_trace_callback(None)
+    begin=next(i for i,s in enumerate(trace) if s.strip().upper().startswith('BEGIN IMMEDIATE'))
+    freshness=next(i for i,s in enumerate(trace) if i>begin and 'FROM libraries WHERE id=' in s)
+    assert begin < freshness
+    conn.close()
