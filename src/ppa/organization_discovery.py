@@ -78,12 +78,22 @@ def build_organization_discovery(conn: Connection, *, library_id: int,
             raise ValueError("organisation discovery cannot cross Libraries")
 
     sets: list[set[str]] = []
-    for aid in albums:
-        sets.append({r["photo_id"] for r in conn.execute(
-            "SELECT photo_id FROM album_photos WHERE album_id=?", (aid,))})
-    for tid in tags:
-        sets.append({r["photo_id"] for r in conn.execute(
-            "SELECT photo_id FROM photo_tags WHERE tag_id=?", (tid,))})
+    if albums:
+        marks = ",".join("?" for _ in albums)
+        grouped = {aid: set() for aid in albums}
+        for r in conn.execute(
+            "SELECT album_id,photo_id FROM album_photos WHERE album_id IN (" + marks + ") "
+            "ORDER BY album_id,photo_id", albums):
+            grouped[r["album_id"]].add(r["photo_id"])
+        sets.extend(grouped[aid] for aid in albums)
+    if tags:
+        marks = ",".join("?" for _ in tags)
+        grouped = {tid: set() for tid in tags}
+        for r in conn.execute(
+            "SELECT tag_id,photo_id FROM photo_tags WHERE tag_id IN (" + marks + ") "
+            "ORDER BY tag_id,photo_id", tags):
+            grouped[r["tag_id"]].add(r["photo_id"])
+        sets.extend(grouped[tid] for tid in tags)
     photo_ids = tuple(sorted(set.intersection(*sets))) if sets else ()
     album_names_by_id = {r["id"]: r["name"] for r in album_rows}
     tag_names_by_id = {r["id"]: r["name"] for r in tag_rows}

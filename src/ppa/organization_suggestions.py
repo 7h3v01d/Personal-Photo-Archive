@@ -219,14 +219,19 @@ def _write_review_rows(conn: Connection, suggestion: OrganizationSuggestion, *,
 
 def apply_organization_suggestion(conn: Connection, suggestion: OrganizationSuggestion, *,
                                   note: str | None = None):
-    """Apply one approved suggestion and record acceptance atomically."""
-    current = build_organization_suggestions(conn, library_id=suggestion.library_id, include_reviewed=True)
-    fresh = next((s for s in current.suggestions if s.id == suggestion.id), None)
-    if fresh is None or fresh != suggestion:
-        raise ValueError("organisation suggestion is stale; refresh and review again")
+    """Apply one approved suggestion and record acceptance atomically.
+
+    Freshness is proven *inside* a reserved write transaction so another
+    connection cannot alter the peer/tag state between review validation and
+    mutation.
+    """
     note = _clean_note(note); now = _now()
     try:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
+        current = build_organization_suggestions(conn, library_id=suggestion.library_id, include_reviewed=True)
+        fresh = next((s for s in current.suggestions if s.id == suggestion.id), None)
+        if fresh is None or fresh != suggestion:
+            raise ValueError("organisation suggestion is stale; refresh and review again")
         result = bulk_tag_photos(conn, suggestion.tag_id, suggestion.target_photo_ids, _manage_transaction=False)
         _write_review_rows(conn, suggestion, status="accepted", action="accept", note=note, now=now)
         conn.commit()
@@ -273,11 +278,18 @@ def _record_review(conn: Connection, suggestion: OrganizationSuggestion, *, stat
 
 def dismiss_organization_suggestion(conn: Connection, suggestion: OrganizationSuggestion, *,
                                     note: str | None = None) -> SuggestionReview:
-    current = build_organization_suggestions(conn, library_id=suggestion.library_id, include_reviewed=True)
-    fresh = next((s for s in current.suggestions if s.id == suggestion.id), None)
-    if fresh is None or fresh != suggestion:
-        raise ValueError("organisation suggestion is stale; refresh and review again")
-    return _record_review(conn, suggestion, status="dismissed", action="dismiss", note=note)
+    note = _clean_note(note); now = _now()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = build_organization_suggestions(conn, library_id=suggestion.library_id, include_reviewed=True)
+        fresh = next((s for s in current.suggestions if s.id == suggestion.id), None)
+        if fresh is None or fresh != suggestion:
+            raise ValueError("organisation suggestion is stale; refresh and review again")
+        _write_review_rows(conn, suggestion, status="dismissed", action="dismiss", note=note, now=now)
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    return SuggestionReview(suggestion.library_id, suggestion.id, "dismissed", note, now)
 
 
 def restore_organization_suggestion(conn: Connection, *, library_id: int, suggestion_id: str,

@@ -219,6 +219,84 @@ def main(argv: list[str] | None = None) -> int:
     organization_report_parser.add_argument("output_path", help="Destination ZIP path")
     organization_report_parser.add_argument("--activity-limit", type=int, default=100)
 
+    duplicate_identity_parser = subparsers.add_parser(
+        "duplicate-identity", help="Inspect exact-copy sets already sharing one logical Photo")
+    duplicate_identity_parser.add_argument("library_id", type=int, help="Library id to inspect")
+    duplicate_identity_parser.add_argument("--json", dest="json_path", default=None,
+                                           help="Write structured duplicate-identity JSON")
+
+    archive_health_parser = subparsers.add_parser(
+        "archive-health", help="Summarise read-only catalogue copy coverage and archive-health indicators")
+    archive_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
+    archive_health_parser.add_argument("--json", dest="json_path", default=None,
+                                       help="Write structured archive-health JSON")
+
+    identity_health_parser = subparsers.add_parser(
+        "identity-health", help="Build the read-only Phase-10 identity health and resolution queue")
+    identity_health_parser.add_argument("library_id", type=int)
+    identity_health_parser.add_argument("--json", dest="json_path", default=None)
+
+    competing_parser = subparsers.add_parser(
+        "competing-identity-investigation", help="Inspect why identical current bytes belong to multiple logical Photos")
+    competing_parser.add_argument("library_id", type=int)
+    competing_parser.add_argument("sha256")
+    competing_parser.add_argument("--json", dest="json_path", default=None)
+
+    identity_merge_parser = subparsers.add_parser(
+        "identity-merge", help="Plan or execute one controlled merge of two eligible competing logical Photos")
+    identity_merge_parser.add_argument("library_id", type=int)
+    identity_merge_parser.add_argument("sha256")
+    identity_merge_parser.add_argument("survivor_photo_id")
+    identity_merge_parser.add_argument("--apply", action="store_true", help="Execute the reviewed merge plan")
+    identity_merge_parser.add_argument("--note", default=None)
+
+    identity_merge_history_parser = subparsers.add_parser(
+        "identity-merge-history", help="List append-only controlled identity merge audit records")
+    identity_merge_history_parser.add_argument("--photo-id", default=None)
+
+    divergence_parser = subparsers.add_parser(
+        "divergence-investigation", help="Inspect immutable FileRevision evidence for one identity divergence")
+    divergence_parser.add_argument("library_id", type=int)
+    divergence_parser.add_argument("photo_id")
+    divergence_parser.add_argument("--json", dest="json_path", default=None)
+
+    identity_split_parser = subparsers.add_parser(
+        "identity-split", help="Plan or execute one controlled current-hash-cohort Photo split")
+    identity_split_parser.add_argument("library_id", type=int)
+    identity_split_parser.add_argument("source_photo_id")
+    identity_split_parser.add_argument("file_ids", nargs="+")
+    identity_split_parser.add_argument("--apply", action="store_true", help="Execute the reviewed split plan")
+    identity_split_parser.add_argument("--note", default=None)
+    identity_split_parser.add_argument("--json", dest="json_path", default=None)
+
+    identity_history_parser = subparsers.add_parser(
+        "identity-resolution-history", help="List append-only controlled identity split audit history")
+    identity_history_parser.add_argument("--photo-id", default=None)
+
+    identity_review_parser = subparsers.add_parser(
+        "identity-resolution-review", help="Review one audited identity split and current recovery eligibility")
+    identity_review_parser.add_argument("resolution_id")
+    identity_review_parser.add_argument("--json", dest="json_path", default=None)
+
+    identity_recover_parser = subparsers.add_parser(
+        "identity-recombine", help="Plan or execute safe reversal of one audited identity split")
+    identity_recover_parser.add_argument("resolution_id")
+    identity_recover_parser.add_argument("--apply", action="store_true")
+    identity_recover_parser.add_argument("--note", default=None)
+
+    lineage_parser = subparsers.add_parser(
+        "lineage", help="Manage explicit human-confirmed relationships between logical Photos")
+    lineage_sub = lineage_parser.add_subparsers(dest="lineage_command", required=True)
+    lineage_list = lineage_sub.add_parser("list", help="List active Photo lineage relationships")
+    lineage_list.add_argument("--photo-id", default=None, help="Restrict to relationships touching this Photo")
+    lineage_add = lineage_sub.add_parser("add", help="Add a human-confirmed parent→child Photo relation")
+    lineage_add.add_argument("parent_photo_id"); lineage_add.add_argument("child_photo_id")
+    lineage_add.add_argument("relation_type", choices=[
+        "derived_copy","edited_variant","resized_variant","format_conversion","crop","unknown_derivative"])
+    lineage_add.add_argument("--note", default=None)
+    lineage_remove = lineage_sub.add_parser("remove", help="Remove one active lineage relation (history survives)")
+    lineage_remove.add_argument("lineage_id")
+
     organization_health_parser = subparsers.add_parser(
         "organization-health", help="Summarise read-only Album/Tag curation gaps")
     organization_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
@@ -621,6 +699,205 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
             print(f"\nWrote {args.json_path}")
         return 0
+
+    if args.command == "archive-health":
+        from ppa.archive_health import build_archive_health, concise_text as archive_health_text
+        try:
+            health = build_archive_health(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(archive_health_text(health))
+        if args.json_path:
+            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "identity-health":
+        from ppa.identity_health import build_identity_health
+        conn = connect(config.db_path)
+        try:
+            view = build_identity_health(conn, library_id=args.library_id)
+            if args.json_path:
+                Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            print(f"Identity health: {len(view.items)} item(s)")
+            print(f"P0 competing identity: {view.competing_identity_count}")
+            print(f"P1 divergence: {view.divergence_count}")
+            print(f"P2 recoverable split: {view.recoverable_split_count}")
+            print(f"P3 review-only split: {view.review_only_split_count}")
+            print(f"INFO recombined split: {view.recovered_split_count}")
+            for item in view.items:
+                print(f"[{item.priority}] {item.kind}: {item.summary} -> {item.next_action}")
+        finally:
+            conn.close()
+        return 0
+
+    if args.command == "duplicate-identity":
+        from ppa.duplicate_lineage import build_duplicate_identity
+        try:
+            view = build_duplicate_identity(conn, library_id=args.library_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+        else:
+            print(f"Exact duplicate logical Photos: {view.duplicate_photos}")
+            print(f"Physical Files in duplicate sets: {view.duplicate_files}")
+            print(f"Logical Photos with current hash divergence: {len(view.divergences)}")
+            for divergence in view.divergences:
+                print(f"\nDIVERGENCE Photo {divergence.photo_id}: {len(divergence.known_hashes)} current hashes")
+                print("  Files: " + ", ".join(divergence.file_ids))
+            for group in view.sets:
+                print(f"\nPhoto {group.photo_id} — {group.copy_count} copies ({group.present_count} present)")
+                for copy in group.copies:
+                    print(f"  {copy.presence_status:7} {copy.filename}  file={copy.file_id}")
+        return 0
+
+
+    if args.command == "competing-identity-investigation":
+        from ppa.competing_identity import investigate_competing_identity
+        try:
+            view = investigate_competing_identity(conn, library_id=args.library_id, sha256=args.sha256)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+        else:
+            print(f"Classification: {view.classification}")
+            print(view.rationale)
+            print(f"Logical Photos: {len(view.photos)}")
+            print(f"Merge consideration: {view.merge_consideration.status}")
+            if view.merge_consideration.blockers:
+                for blocker in view.merge_consideration.blockers:
+                    print(f"  BLOCKER: {blocker}")
+            for photo in view.photos:
+                print(f"\nPhoto {photo.photo_id}  created={photo.created_at}  files={len(photo.files)}")
+                for f in photo.files:
+                    changed = " CHANGED_TO_SHARED_BYTES" if f.changed_to_shared_bytes else ""
+                    print(f"  {f.filename}  Library {f.library_id}  current={f.current_sha256 or 'unknown'}{changed}")
+        return 0
+
+    if args.command == "identity-merge":
+        from ppa.identity_merge import plan_identity_merge, execute_identity_merge
+        try:
+            plan = plan_identity_merge(conn, library_id=args.library_id, sha256=args.sha256,
+                                       survivor_photo_id=args.survivor_photo_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(f"Survivor Photo: {plan.survivor_photo_id}")
+        print(f"Retired Photo:  {plan.retired_photo_id}")
+        print(f"SHA-256:        {plan.sha256}")
+        print(f"Files to move:  {len(plan.moved_file_ids)}")
+        if not args.apply:
+            print("DRY RUN — pass --apply to execute after review")
+            return 0
+        try:
+            result = execute_identity_merge(conn, plan, note=args.note)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        print(f"Merged: {result.merge_id}")
+        return 0
+
+    if args.command == "identity-merge-history":
+        from ppa.identity_merge import list_identity_merges
+        rows = list_identity_merges(conn, photo_id=args.photo_id)
+        for r in rows:
+            print(f"{r['created_at']}  {r['merge_id']}  survivor={r['survivor_photo_id']}  retired={r['retired_photo_id']}  sha={r['sha256']}")
+        return 0
+
+    if args.command == "divergence-investigation":
+        from ppa.divergence_investigation import investigate_identity_divergence
+        try:
+            view = investigate_identity_divergence(conn, library_id=args.library_id, photo_id=args.photo_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        if args.json_path:
+            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+        else:
+            print(f"Classification: {view.classification}")
+            print(view.rationale)
+            for f in view.files:
+                print(f"\n{f.filename}  current={f.current_sha256 or 'unknown'}  revisions={len(f.revisions)}")
+                for r in f.revisions:
+                    state = "CURRENT" if r.is_current else "historical"
+                    print(f"  {r.first_observed_at}  {r.sha256 or 'unknown'}  {state}")
+        return 0
+
+    if args.command == "identity-split":
+        from ppa.identity_resolution import plan_identity_split, execute_identity_split
+        try:
+            plan = plan_identity_split(conn, library_id=args.library_id, source_photo_id=args.source_photo_id, file_ids=tuple(args.file_ids))
+            if args.json_path:
+                import json as _json
+                Path(args.json_path).write_text(_json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"Split plan: {len(plan.files)} file(s), SHA-256 {plan.sha256}, {plan.remaining_file_count} file(s) remain on source Photo")
+            if not args.apply:
+                print("Dry run only. Re-run with --apply after review.")
+                return 0
+            result = execute_identity_split(conn, plan, note=args.note)
+            print(f"Created logical Photo {result.new_photo_id}; moved {len(result.moved_file_ids)} file(s). Resolution {result.resolution_id}")
+            return 0
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+
+    if args.command == "identity-resolution-history":
+        from ppa.identity_resolution import list_identity_resolutions
+        rows = list_identity_resolutions(conn, photo_id=args.photo_id)
+        for row in rows:
+            print(f"{row['created_at']} {row['action']} {row['source_photo_id']} -> {row['new_photo_id']} "
+                  f"SHA-256 {row['sha256']} resolution={row['resolution_id']}")
+        return 0
+
+    if args.command == "identity-resolution-review":
+        from ppa.identity_resolution import review_identity_resolution
+        try:
+            view = review_identity_resolution(conn, args.resolution_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        if args.json_path:
+            import json as _json
+            Path(args.json_path).write_text(_json.dumps(view.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        else:
+            print(f"Resolution: {view.resolution_id}")
+            print(f"Source: {view.source_photo_id}  Split-created: {view.new_photo_id}")
+            print(f"Recovery eligible: {'yes' if view.recovery_eligible else 'no'} — {view.recovery_reason}")
+            print(f"Current source files: {len(view.source_files_now)}; split-created files: {len(view.new_photo_files_now)}")
+        return 0
+
+    if args.command == "identity-recombine":
+        from ppa.identity_resolution import plan_identity_recovery, execute_identity_recovery
+        try:
+            plan = plan_identity_recovery(conn, args.resolution_id)
+            print(f"Recovery plan: {len(plan.moved_file_ids)} file(s) will return to logical Photo {plan.source_photo_id}")
+            if not args.apply:
+                print("Dry run only. Re-run with --apply after review."); return 0
+            result = execute_identity_recovery(conn, plan, note=args.note)
+            print(f"Recombined split {result.resolution_id}; retired logical Photo {result.removed_photo_id}; recovery {result.recovery_id}")
+            return 0
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+
+    if args.command == "lineage":
+        from ppa.duplicate_lineage import add_lineage, list_lineage, remove_lineage
+        try:
+            if args.lineage_command == "list":
+                rows=list_lineage(conn, photo_id=args.photo_id)
+                for r in rows:
+                    print(f"{r.id}  {r.parent_photo_id} -> {r.child_photo_id}  {r.relation_type}  {r.note or ''}")
+                print(f"\n{len(rows)} lineage relation(s).")
+                return 0
+            if args.lineage_command == "add":
+                r=add_lineage(conn,parent_photo_id=args.parent_photo_id,child_photo_id=args.child_photo_id,
+                              relation_type=args.relation_type,note=args.note)
+                print(f"Added lineage {r.id}: {r.parent_photo_id} -> {r.child_photo_id} ({r.relation_type})")
+                return 0
+            if args.lineage_command == "remove":
+                ok=remove_lineage(conn,args.lineage_id)
+                print("Removed; audit history preserved." if ok else "No active lineage relation with that id.")
+                return 0 if ok else 1
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr); return 1
+        return 1
 
     if args.command == "album-home":
         from ppa.album_home import build_album_home, concise_text as album_home_text

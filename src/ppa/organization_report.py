@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from ppa.organization_health import build_organization_health
 from ppa.organization_suggestions import list_suggestion_reviews
 from ppa.organization_views import list_organization_views
 from ppa.tag_home import build_tag_home
+from ppa.diagnostics import sanitize_text
 
 ORGANIZATION_REPORT_SCHEMA = "ppa-organization-report/1"
 
@@ -61,6 +63,66 @@ def _require_library(conn: Connection, library_id: int) -> None:
         raise ValueError(f"unknown library {library_id}")
 
 
+def _privacy_pairs(conn: Connection, library_id: int) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    home = str(Path.home())
+    if home:
+        pairs.append((home, "<HOME>"))
+    for r in conn.execute(
+        "SELECT root_display_path,root_canonical_path FROM libraries WHERE id=?", (library_id,)):
+        for value in (r["root_display_path"], r["root_canonical_path"]):
+            if value:
+                pairs.append((str(value), "<LIBRARY>"))
+    for r in conn.execute("PRAGMA database_list"):
+        value = r["file"]
+        if value:
+            pairs.append((str(Path(value).parent), "<PPA_DATA>"))
+            pairs.append((str(value), "<PPA_DB>"))
+    # Longest first prevents a parent replacement from exposing a deeper suffix.
+    return tuple(sorted(set(pairs), key=lambda x: len(x[0]), reverse=True))
+
+
+_UUID_RE = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b")
+_HASH_RE = re.compile(r"(?i)\b[0-9a-f]{64}\b")
+_WIN_ABS_RE = re.compile(r'(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/][^\r\n;<>|\"]+')
+_UNC_RE = re.compile(r'\\\\[^\s\\/]+[\\/][^\r\n;<>|\"]+')
+_POSIX_PRIVATE_RE = re.compile(r'(?<![A-Za-z0-9_])/(?:home|Users|mnt|media|Volumes)/[^\r\n;<>|\"]+')
+
+
+def _sanitize_share_text(value: str | None, pairs) -> str | None:
+    if value is None:
+        return None
+    out = sanitize_text(str(value), pairs)
+    out = _WIN_ABS_RE.sub("<PRIVATE_PATH>", out)
+    out = _UNC_RE.sub("<PRIVATE_PATH>", out)
+    out = _POSIX_PRIVATE_RE.sub("<PRIVATE_PATH>", out)
+    out = _UUID_RE.sub("<IDENTIFIER>", out)
+    out = _HASH_RE.sub("<HASH>", out)
+    return out
+
+
+def _shareable_activity_change(entry, pairs) -> str:
+    label = "Album" if entry.object_kind == "album" else "Tag"
+    name = _sanitize_share_text(entry.object_name, pairs) or "[unnamed]"
+    if entry.action == "create":
+        return f"Created {label} '{name}'"
+    if entry.action == "rename":
+        old = _sanitize_share_text(entry.old_value, pairs) or ""
+        new = _sanitize_share_text(entry.new_value, pairs) or name
+        return f"Renamed {label} '{old}' → '{new}'"
+    if entry.action == "description":
+        return f"Updated description for Album '{name}'"
+    if entry.action == "add_photo":
+        return f"Added a photo to {label} '{name}'"
+    if entry.action == "remove_photo":
+        return f"Removed a photo from {label} '{name}'"
+    if entry.action == "undo_add_photo":
+        return f"Undid an add to {label} '{name}'"
+    if entry.action == "undo_remove_photo":
+        return f"Undid a removal from {label} '{name}'"
+    return f"{label} '{name}': {entry.action.replace('_', ' ')}"
+
+
 def build_organization_report(conn: Connection, *, library_id: int,
                               activity_limit: int = 100) -> OrganizationReport:
     """Build one sanitized report projection without exposing archive identifiers."""
@@ -73,14 +135,15 @@ def build_organization_report(conn: Connection, *, library_id: int,
     reviews = list_suggestion_reviews(conn, library_id=library_id)
     activity = build_organization_activity(conn, library_id=library_id, limit=activity_limit)
 
-    album_names = {r["id"]: r["name"] for r in conn.execute(
+    pairs = _privacy_pairs(conn, library_id)
+    album_names = {r["id"]: (_sanitize_share_text(r["name"], pairs) or "") for r in conn.execute(
         "SELECT id,name FROM albums WHERE library_id=?", (library_id,))}
-    tag_names = {r["id"]: r["name"] for r in conn.execute(
+    tag_names = {r["id"]: (_sanitize_share_text(r["name"], pairs) or "") for r in conn.execute(
         "SELECT id,name FROM tags WHERE library_id=?", (library_id,))}
 
     albums = tuple({
-        "name": c.name,
-        "description": c.description,
+        "name": _sanitize_share_text(c.name, pairs),
+        "description": _sanitize_share_text(c.description, pairs),
         "photo_count": c.photo_count,
         "present_count": c.present_count,
         "missing_only_count": c.missing_only_count,
@@ -88,26 +151,26 @@ def build_organization_report(conn: Connection, *, library_id: int,
         "custom_order": c.has_custom_order,
     } for c in album_home.cards)
     tags = tuple({
-        "name": c.name,
+        "name": _sanitize_share_text(c.name, pairs),
         "photo_count": c.photo_count,
         "present_count": c.present_count,
         "missing_only_count": c.missing_only_count,
     } for c in tag_home.cards)
     saved_views = tuple({
-        "name": v.name,
+        "name": _sanitize_share_text(v.name, pairs),
         "albums": [album_names.get(x, "[missing Album]") for x in v.album_ids],
         "tags": [tag_names.get(x, "[missing Tag]") for x in v.tag_ids],
     } for v in saved)
     suggestion_reviews = tuple({
         "status": r.status,
-        "note": r.note,
+        "note": _sanitize_share_text(r.note, pairs),
         "reviewed_at": r.reviewed_at,
     } for r in reviews)
     recent_activity = tuple({
         "when": e.created_at,
         "kind": e.object_kind,
-        "object": e.object_name,
-        "change": e.summary,
+        "object": _sanitize_share_text(e.object_name, pairs),
+        "change": _shareable_activity_change(e, pairs),
         "undoable": e.undoable,
     } for e in activity.entries)
     summary = {

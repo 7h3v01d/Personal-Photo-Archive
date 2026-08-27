@@ -106,6 +106,47 @@ def _undo_status(conn: Connection, row) -> tuple[bool, str | None]:
     return True, None
 
 
+def _bulk_undo_status(conn: Connection, rows) -> dict[int, tuple[bool, str | None]]:
+    """Resolve activity undoability with bounded SELECTs, not per-row queries."""
+    rows = tuple(rows)
+    pairs = {(r["object_kind"], r["object_id"], r["photo_id"]) for r in rows
+             if r["action"] in {"add_photo", "remove_photo"} and r["photo_id"]}
+    latest: dict[tuple[str, str, str], int] = {}
+    if pairs:
+        # One ledger scan for the library/object pairs represented in the page.
+        library_id = int(rows[0]["library_id"]) if rows else -1
+        for h in conn.execute(
+            "SELECT id,object_kind,object_id,photo_id FROM organization_history "
+            "WHERE library_id=? AND photo_id IS NOT NULL "
+            "AND action IN ('add_photo','remove_photo','undo_add_photo','undo_remove_photo') "
+            "ORDER BY id DESC", (library_id,)):
+            key=(h["object_kind"],h["object_id"],h["photo_id"])
+            if key in pairs and key not in latest:
+                latest[key]=int(h["id"])
+
+    album_members={(r["album_id"],r["photo_id"]) for r in conn.execute(
+        "SELECT ap.album_id,ap.photo_id FROM album_photos ap JOIN albums a ON a.id=ap.album_id "
+        "WHERE a.library_id=?", (int(rows[0]["library_id"]) if rows else -1,))}
+    tag_members={(r["tag_id"],r["photo_id"]) for r in conn.execute(
+        "SELECT pt.tag_id,pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id "
+        "WHERE t.library_id=?", (int(rows[0]["library_id"]) if rows else -1,))}
+    out={}
+    for r in rows:
+        action=r["action"]; pid=r["photo_id"]
+        if action not in {"add_photo","remove_photo"} or not pid:
+            out[int(r["id"])]=(False,"Only direct Album/Tag membership changes are automatically reversible"); continue
+        key=(r["object_kind"],r["object_id"],pid)
+        if latest.get(key) != int(r["id"]):
+            out[int(r["id"])]=(False,"A later membership change exists for this Photo and object"); continue
+        exists=((r["object_id"],pid) in (album_members if r["object_kind"]=="album" else tag_members))
+        if action=="add_photo" and not exists:
+            out[int(r["id"])]=(False,"Photo is no longer a current member"); continue
+        if action=="remove_photo" and exists:
+            out[int(r["id"])]=(False,"Photo is already a current member"); continue
+        out[int(r["id"])]=(True,None)
+    return out
+
+
 def build_organization_activity(conn: Connection, *, library_id: int,
                                 limit: int = 200,
                                 object_kind: str | None = None,
@@ -121,11 +162,12 @@ def build_organization_activity(conn: Connection, *, library_id: int,
     sql += " ORDER BY id DESC LIMIT ?"; args.append(limit)
     rows = conn.execute(sql, tuple(args)).fetchall()
     albums, tags = _name_maps(conn, library_id)
+    statuses = _bulk_undo_status(conn, rows)
     entries = []
     for r in rows:
         names = albums if r["object_kind"] == "album" else tags
         name = names.get(r["object_id"], f"[deleted {r['object_kind']}]")
-        undoable, reason = _undo_status(conn, r)
+        undoable, reason = statuses[int(r["id"])]
         entries.append(OrganizationActivityEntry(
             r["id"], r["library_id"], r["object_kind"], r["object_id"], name,
             r["action"], r["photo_id"], r["old_value"], r["new_value"], r["created_at"],
@@ -139,24 +181,25 @@ def build_organization_activity(conn: Connection, *, library_id: int,
 def undo_organization_membership(conn: Connection, *, library_id: int, history_id: int) -> OrganizationActivityEntry:
     """Undo one provably current add/remove membership action atomically."""
     _require_library(conn, library_id)
-    row = conn.execute("SELECT * FROM organization_history WHERE id=? AND library_id=?", (history_id, library_id)).fetchone()
-    if row is None: raise ValueError("organisation history entry not found in this library")
-    ok, reason = _undo_status(conn, row)
-    if not ok: raise ValueError(f"organisation action cannot be safely undone: {reason}")
-    kind, oid, pid, action = row["object_kind"], row["object_id"], row["photo_id"], row["action"]
-    if kind == "album":
-        obj = conn.execute("SELECT id FROM albums WHERE id=? AND library_id=?", (oid, library_id)).fetchone()
-    else:
-        obj = conn.execute("SELECT id FROM tags WHERE id=? AND library_id=?", (oid, library_id)).fetchone()
-    if obj is None: raise ValueError("organisation object no longer exists")
-    # Logical photo must still be represented in the library before a restoration.
-    if action == "remove_photo" and conn.execute(
-        "SELECT 1 FROM files WHERE library_id=? AND photo_id=? LIMIT 1", (library_id, pid)).fetchone() is None:
-        raise ValueError("photo is no longer represented in this library")
-    now = datetime.now(timezone.utc).isoformat()
-    inverse = "undo_add_photo" if action == "add_photo" else "undo_remove_photo"
     try:
-        conn.execute("BEGIN")
+        # Lock the write state before proving freshness. This closes the TOCTOU
+        # window between "safe to undo" and the inverse membership mutation.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM organization_history WHERE id=? AND library_id=?", (history_id, library_id)).fetchone()
+        if row is None: raise ValueError("organisation history entry not found in this library")
+        ok, reason = _undo_status(conn, row)
+        if not ok: raise ValueError(f"organisation action cannot be safely undone: {reason}")
+        kind, oid, pid, action = row["object_kind"], row["object_id"], row["photo_id"], row["action"]
+        if kind == "album":
+            obj = conn.execute("SELECT id FROM albums WHERE id=? AND library_id=?", (oid, library_id)).fetchone()
+        else:
+            obj = conn.execute("SELECT id FROM tags WHERE id=? AND library_id=?", (oid, library_id)).fetchone()
+        if obj is None: raise ValueError("organisation object no longer exists")
+        if action == "remove_photo" and conn.execute(
+            "SELECT 1 FROM files WHERE library_id=? AND photo_id=? LIMIT 1", (library_id, pid)).fetchone() is None:
+            raise ValueError("photo is no longer represented in this library")
+        now = datetime.now(timezone.utc).isoformat()
+        inverse = "undo_add_photo" if action == "add_photo" else "undo_remove_photo"
         if kind == "album":
             if action == "add_photo":
                 conn.execute("DELETE FROM album_photos WHERE album_id=? AND photo_id=?", (oid, pid))

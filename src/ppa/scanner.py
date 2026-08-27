@@ -33,7 +33,10 @@ fast. The paranoid, re-hash-everything integrity check is a separate,
 explicit operation (see ppa.integrity.verify_library).
 
 Every path change is written to file_path_history and every notable
-transition to integrity_events, so nothing is silently overwritten.
+transition to integrity_events, so nothing is silently overwritten. Phase 12.1
+also retains the device/object/link-count identity already returned by stat(),
+allowing Archive Health to distinguish hard-linked paths from distinct
+filesystem objects without adding another source-file pass.
 Read-only with respect to every source file, always.
 """
 
@@ -86,6 +89,8 @@ class ScanReport:
     alias_skipped: int = 0     # extra dir entries resolving to an already-seen file
     library_unavailable: bool = False  # the library root itself was not reachable
     hashed_files: int = 0  # how many files we actually read+hashed this run
+    storage_identity_known: int = 0  # stat supplied device + filesystem object id
+    storage_identity_unknown: int = 0  # platform/stat could not establish both ids
     inaccessible_files: list[tuple[str, str]] = field(default_factory=list)
 
     # Legacy Phase 1 field. Hashing removes the filename/size guesswork, so
@@ -117,6 +122,8 @@ class ScanReport:
             f"  unsupported:        {self.unsupported_files}",
             f"  deferred format:    {self.deferred_format_files}",
             f"  hashed this run:    {self.hashed_files}",
+            f"  storage id known:   {self.storage_identity_known}",
+            f"  storage id unknown: {self.storage_identity_unknown}",
             f"  inaccessible:       {len(self.inaccessible_files)}",
         ]
         return "\n".join(lines)
@@ -139,6 +146,9 @@ class _DiskFile:
     hashed_now: bool
     rel_key: str          # canonical within-library identity
     known_row: Row | None  # active catalogue row with this identity, if any
+    fs_device_id: str | None  # opaque stat().st_dev token, when available
+    fs_object_id: str | None  # opaque stat().st_ino/file-index token, when available
+    fs_link_count: int | None
 
 
 def scan_library(
@@ -568,6 +578,111 @@ def _record_fs_observation(
     )
 
 
+def _stat_storage_identity(stat) -> tuple[str | None, str | None, int | None]:
+    """Return conservative opaque filesystem identity tokens from ``stat``.
+
+    ``(device, object)`` is sufficient to recognise two directory entries as
+    the same filesystem object (hard links) on platforms that expose stable
+    ``st_dev`` + ``st_ino``/file-index values.  A zero/absent object id is
+    treated as unknown rather than asserted.  ``st_dev == 0`` is permitted:
+    some platforms legitimately use zero as an opaque device token.
+    """
+    dev = getattr(stat, "st_dev", None)
+    obj = getattr(stat, "st_ino", None)
+    links = getattr(stat, "st_nlink", None)
+
+    try:
+        device_id = str(int(dev)) if dev is not None and int(dev) >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        device_id = None
+    try:
+        object_id = str(int(obj)) if obj is not None and int(obj) > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        object_id = None
+    try:
+        link_count = int(links) if links is not None and int(links) > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        link_count = None
+
+    # An object token without a device token is not globally comparable.
+    if device_id is None:
+        object_id = None
+    return device_id, object_id, link_count
+
+
+def _record_storage_identity(
+    conn: Connection, file_id: str, df: _DiskFile, now: str, session_id: str
+) -> None:
+    """Persist the latest filesystem-object observation without source writes.
+
+    History is intentionally sparse: first observation, object-identity change,
+    or link-count change.  If the current platform cannot establish identity,
+    the current fields are cleared so Archive Health fails closed instead of
+    reusing stale certainty from an older scan/platform.
+    """
+    current = conn.execute(
+        "SELECT fs_device_id, fs_object_id, fs_link_count FROM files WHERE id=?",
+        (file_id,),
+    ).fetchone()
+    if current is None:
+        raise RuntimeError(f"unknown File while recording storage identity: {file_id}")
+
+    old_dev = current["fs_device_id"]
+    old_obj = current["fs_object_id"]
+    old_links = current["fs_link_count"]
+    new_dev = df.fs_device_id
+    new_obj = df.fs_object_id
+    new_links = df.fs_link_count
+
+    old_known = old_dev is not None and old_obj is not None
+    new_known = new_dev is not None and new_obj is not None
+    identity_changed = old_known and new_known and (old_dev, old_obj) != (new_dev, new_obj)
+    link_changed = (
+        not identity_changed
+        and old_known and new_known
+        and old_links is not None and new_links is not None
+        and int(old_links) != int(new_links)
+    )
+    established = not old_known and new_known
+    became_unknown = old_known and not new_known
+
+    reason = None
+    if established:
+        reason = "identity_established"
+    elif identity_changed:
+        reason = "identity_changed"
+    elif became_unknown:
+        reason = "identity_unavailable"
+    elif link_changed:
+        reason = "link_count_changed"
+
+    if reason is not None:
+        conn.execute(
+            "INSERT INTO file_storage_identity_history "
+            "(file_id, device_id, object_id, link_count, path, observed_at, session_id, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_id, new_dev, new_obj, new_links, df.path, now, session_id, reason),
+        )
+
+    conn.execute(
+        "UPDATE files SET fs_device_id=?, fs_object_id=?, fs_link_count=?, "
+        "fs_identity_observed_at=?, fs_identity_session=? WHERE id=?",
+        (new_dev, new_obj, new_links, now, session_id, file_id),
+    )
+
+    if identity_changed:
+        conn.execute(
+            "INSERT INTO integrity_events (file_id, event_type, detail, session_id) "
+            "VALUES (?, 'filesystem_object_changed', ?, ?)",
+            (
+                file_id,
+                f"Filesystem object identity changed while logical File identity was retained: "
+                f"device/object {old_dev}/{old_obj} -> {new_dev}/{new_obj}.",
+                session_id,
+            ),
+        )
+
+
 def _inventory_supported_file(
     *,
     report: ScanReport,
@@ -593,6 +708,7 @@ def _inventory_supported_file(
 
     size_bytes = stat.st_size
     fs_mtime = _fmt_mtime(stat.st_mtime)
+    fs_device_id, fs_object_id, fs_link_count = _stat_storage_identity(stat)
 
     try:
         with Image.open(path) as img:
@@ -631,6 +747,11 @@ def _inventory_supported_file(
         hashed_now = True
         report.hashed_files += 1
 
+    if fs_device_id is not None and fs_object_id is not None:
+        report.storage_identity_known += 1
+    else:
+        report.storage_identity_unknown += 1
+
     return _DiskFile(
         path=abs_path,
         ext=ext,
@@ -643,6 +764,9 @@ def _inventory_supported_file(
         hashed_now=hashed_now,
         rel_key=rel_key,
         known_row=known,
+        fs_device_id=fs_device_id,
+        fs_object_id=fs_object_id,
+        fs_link_count=fs_link_count,
     )
 
 
@@ -702,6 +826,7 @@ def _reconcile_known_path(
                  row["current_revision_id"]),
             )
         _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
+        _record_storage_identity(conn, row["id"], df, now, session_id)
         _index_add(hash_index, df.sha256, _refetch(conn, row["id"]))
         return
 
@@ -722,6 +847,7 @@ def _reconcile_known_path(
         # Content is unchanged but the filesystem mtime may have been touched;
         # keep the filesystem-date evidence current.
         _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
+        _record_storage_identity(conn, row["id"], df, now, session_id)
         return
 
     # Same path, different content. If Verify has already flagged this file as
@@ -733,6 +859,7 @@ def _reconcile_known_path(
             "UPDATE files SET last_seen_at = ?, last_seen_session = ? WHERE id = ?",
             (now, session_id, row["id"]),
         )
+        _record_storage_identity(conn, row["id"], df, now, session_id)
         return
 
     # Otherwise this is a legitimate in-place modification: append a new
@@ -772,6 +899,7 @@ def _reconcile_known_path(
         ),
     )
     _record_fs_observation(conn, row["id"], new_rev, df.fs_mtime, session_id)
+    _record_storage_identity(conn, row["id"], df, now, session_id)
     # Keep the hash index truthful: this row no longer holds the old content.
     _index_remove(hash_index, old_sha, row["id"])
     _index_add(hash_index, df.sha256, _refetch(conn, row["id"]))
@@ -920,6 +1048,7 @@ def _apply_relocation(
         ),
     )
     _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
+    _record_storage_identity(conn, row["id"], df, now, session_id)
     if was_missing:
         report.restored_files += 1
         event, detail = "restored", (
@@ -980,6 +1109,7 @@ def _insert_file(
         (file_id, df.path, now, session_id),
     )
     _record_fs_observation(conn, file_id, rev_id, df.fs_mtime, session_id)
+    _record_storage_identity(conn, file_id, df, now, session_id)
     return conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
 
 
