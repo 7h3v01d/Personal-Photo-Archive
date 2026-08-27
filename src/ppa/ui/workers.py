@@ -460,6 +460,42 @@ class OrganizationSuggestionRestoreWorker(QObject):
             if conn is not None: conn.close()
 
 
+class ArchiveHealthWorker(QObject):
+    """Build Phase-12.1 Backup & Archive Health off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__(); self._db_path=db_path; self._library_id=library_id
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.archive_health import build_archive_health
+            conn=connect(self._db_path)
+            self.finished.emit(build_archive_health(conn, library_id=self._library_id))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
+class ArchiveHealthBrowseWorker(QObject):
+    """Build one read-only Phase-12.1 health-category browser off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+    def __init__(self, db_path: Path, health, category: str) -> None:
+        super().__init__(); self._db_path=db_path; self._health=health; self._category=category
+    @Slot()
+    def run(self) -> None:
+        conn=None
+        try:
+            from ppa.archive_health import build_archive_health_browse
+            conn=connect(self._db_path)
+            self.finished.emit(build_archive_health_browse(conn, self._health, self._category))
+        except Exception as exc: self.failed.emit(str(exc))
+        finally:
+            if conn is not None: conn.close()
+
+
 class OrganizationHealthWorker(QObject):
     """Build Phase-9.8 organisation health off-thread."""
     finished = Signal(object)
@@ -964,3 +1000,31 @@ class OrganizationReportWorker(QObject):
         except Exception as exc: self.failed.emit(str(exc))
         finally:
             if conn is not None: conn.close()
+
+
+class DuplicateLineageReviewWorker(QObject):
+    """Build the Phase-10 duplicate-identity projection off the GUI thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, library_id: int) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._library_id = library_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.duplicate_lineage import build_duplicate_identity
+            from ppa.identity_health import build_identity_health
+            conn = connect(self._db_path)
+            self.finished.emit((
+                build_duplicate_identity(conn, library_id=self._library_id),
+                build_identity_health(conn, library_id=self._library_id),
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()

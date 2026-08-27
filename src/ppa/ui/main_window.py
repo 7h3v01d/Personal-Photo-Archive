@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QToolBar,
+    QToolButton,
+    QMenu,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +46,7 @@ from ppa.logging_setup import get_logger
 from ppa.activity_runs import new_run_id, run_extra
 from ppa.ui import theme
 from ppa.ui.delegate import PhotoTileDelegate
+from ppa.ui.command_palette_dialog import CommandPaletteDialog, PaletteCommand
 from ppa.ui.gpsmap import GpsMiniMap
 from ppa.ui.models import FILE_ID_ROLE, PhotoGridModel
 from ppa.ui.workers import (
@@ -60,9 +63,11 @@ from ppa.ui.workers import (
     TagHomeWorker,
     OrganizationDiscoveryHomeWorker,
     OrganizationHealthWorker,
+    ArchiveHealthWorker,
     OrganizationSuggestionsWorker,
     OrganizationActivityWorker,
     OrganizationReportWorker,
+    DuplicateLineageReviewWorker,
     WorkerRegistry,
 )
 
@@ -270,100 +275,246 @@ class MainWindow(QMainWindow):
 
     # --- construction -------------------------------------------------------
     def _build_toolbar(self) -> None:
+        """Build a compact workspace-aware toolbar.
+
+        Phase 11.0 replaces the former flat 20+ action strip with a handful
+        of stable workspace menus.  QAction instances are preserved so the
+        existing handlers, busy-state logic, shortcuts, and tests keep using
+        exactly the same command objects.
+        """
         tb = QToolBar()
+        tb.setObjectName("MainWorkspaceToolbar")
         tb.setMovable(False)
         self.addToolBar(tb)
 
+        # --- command actions ------------------------------------------------
         self._act_add = QAction("Add Library…", self)
         self._act_add.triggered.connect(self._on_add_library)
-        tb.addAction(self._act_add)
 
         self._act_libraries = QAction("Libraries…", self)
         self._act_libraries.triggered.connect(self._on_manage_libraries)
-        tb.addAction(self._act_libraries)
 
         self._act_scan = QAction("Scan", self)
         self._act_scan.triggered.connect(self._on_scan)
-        tb.addAction(self._act_scan)
 
         self._act_verify = QAction("Verify", self)
         self._act_verify.triggered.connect(self._on_verify)
-        tb.addAction(self._act_verify)
+
+        self._act_archive_health = QAction("Archive Health", self)
+        self._act_archive_health.triggered.connect(self._on_archive_health)
 
         self._act_extract = QAction("Extract Metadata", self)
         self._act_extract.triggered.connect(lambda: self._start_metadata(auto=False))
-        tb.addAction(self._act_extract)
 
         self._act_timeline = QAction("Timeline", self)
         self._act_timeline.triggered.connect(self._on_timeline)
-        tb.addAction(self._act_timeline)
 
         self._act_organize = QAction("Albums & Tags…", self)
         self._act_organize.triggered.connect(self._on_organize)
-        tb.addAction(self._act_organize)
 
         self._act_albums = QAction("Albums", self)
         self._act_albums.triggered.connect(self._on_album_home)
-        tb.addAction(self._act_albums)
 
         self._act_tags = QAction("Tags", self)
         self._act_tags.triggered.connect(self._on_tag_home)
-        tb.addAction(self._act_tags)
 
         self._act_org_discovery = QAction("Discover", self)
         self._act_org_discovery.triggered.connect(self._on_organization_discovery)
-        tb.addAction(self._act_org_discovery)
 
         self._act_org_suggestions = QAction("Assisted Organisation", self)
         self._act_org_suggestions.triggered.connect(self._on_organization_suggestions)
-        tb.addAction(self._act_org_suggestions)
 
         self._act_org_health = QAction("Organisation Health", self)
         self._act_org_health.triggered.connect(self._on_organization_health)
-        tb.addAction(self._act_org_health)
 
         self._act_org_activity = QAction("Organisation Activity", self)
         self._act_org_activity.triggered.connect(self._on_organization_activity)
-        tb.addAction(self._act_org_activity)
 
         self._act_org_report = QAction("Export Organisation Report…", self)
         self._act_org_report.triggered.connect(self._on_organization_report)
-        tb.addAction(self._act_org_report)
+
+        self._act_duplicates_lineage = QAction("Duplicates & Lineage", self)
+        self._act_duplicates_lineage.triggered.connect(self._on_duplicates_lineage)
 
         self._act_family_history = QAction("Family History", self)
         self._act_family_history.triggered.connect(self._on_family_history)
-        tb.addAction(self._act_family_history)
 
         self._act_date_review = QAction("Date Review", self)
         self._act_date_review.triggered.connect(self._on_date_review)
-        tb.addAction(self._act_date_review)
 
         self._act_unresolved = QAction("Unresolved Memories", self)
         self._act_unresolved.triggered.connect(self._on_unresolved_memories)
-        tb.addAction(self._act_unresolved)
 
         self._act_pilot_audit = QAction("Pilot Audit", self)
         self._act_pilot_audit.triggered.connect(self._on_pilot_audit)
-        tb.addAction(self._act_pilot_audit)
 
         self._act_pilot_session = QAction("Pilot Session…", self)
         self._act_pilot_session.triggered.connect(self._on_pilot_session)
-        tb.addAction(self._act_pilot_session)
 
         self._act_activity_log = QAction("Activity Log…", self)
         self._act_activity_log.triggered.connect(self._on_activity_log)
-        tb.addAction(self._act_activity_log)
 
         self._act_activity_runs = QAction("Activity Runs…", self)
         self._act_activity_runs.triggered.connect(self._on_activity_runs)
-        tb.addAction(self._act_activity_runs)
 
         self._act_export_diagnostics = QAction("Export Diagnostics…", self)
         self._act_export_diagnostics.triggered.connect(self._on_export_diagnostics)
-        tb.addAction(self._act_export_diagnostics)
 
         self._act_refresh = QAction("Refresh", self)
         self._act_refresh.triggered.connect(self.refresh)
+
+        # Application-owned command labels. Do not use QAction.text() as the
+        # canonical label outside Qt menu rendering: on Windows, ``&`` may be
+        # interpreted as a mnemonic marker. These strings are the portable
+        # names used by the command palette/search layer.
+        self._command_display_labels: dict[int, str] = {
+            id(self._act_add): "Add Library…",
+            id(self._act_libraries): "Libraries…",
+            id(self._act_scan): "Scan",
+            id(self._act_verify): "Verify",
+            id(self._act_archive_health): "Archive Health",
+            id(self._act_extract): "Extract Metadata",
+            id(self._act_timeline): "Timeline",
+            id(self._act_family_history): "Family History",
+            id(self._act_date_review): "Date Review",
+            id(self._act_unresolved): "Unresolved Memories",
+            id(self._act_organize): "Albums & Tags…",
+            id(self._act_albums): "Albums",
+            id(self._act_tags): "Tags",
+            id(self._act_org_discovery): "Discover",
+            id(self._act_org_suggestions): "Assisted Organisation",
+            id(self._act_org_health): "Organisation Health",
+            id(self._act_org_activity): "Organisation Activity",
+            id(self._act_org_report): "Export Organisation Report…",
+            id(self._act_duplicates_lineage): "Duplicates & Lineage",
+            id(self._act_pilot_audit): "Pilot Audit",
+            id(self._act_pilot_session): "Pilot Session…",
+            id(self._act_activity_log): "Activity Log…",
+            id(self._act_activity_runs): "Activity Runs…",
+            id(self._act_export_diagnostics): "Export Diagnostics…",
+        }
+
+        self._command_descriptions: dict[int, str] = {
+            id(self._act_add): "Register another source-photo library without modifying its files.",
+            id(self._act_libraries): "Review registered libraries, availability, counts, and safe forget operations.",
+            id(self._act_scan): "Scan the current library for new, changed, moved, restored, or missing files.",
+            id(self._act_verify): "Re-check catalogue integrity against source files and recorded hashes.",
+            id(self._act_archive_health): "Inspect copy coverage, missing copies, health warnings, hard-link inflation, and filesystem-object evidence without overstating backup independence.",
+            id(self._act_extract): "Extract revision-bound metadata from catalogue files without rewriting originals.",
+            id(self._act_timeline): "Browse photos through the current authoritative and tentative chronology lanes.",
+            id(self._act_family_history): "Open the curated family-history view built from durable Events and stories.",
+            id(self._act_date_review): "Review questionable dates, reconstruction proposals, and evidence traces.",
+            id(self._act_unresolved): "Show memories that still lack sufficiently reliable chronological placement.",
+            id(self._act_organize): "Bulk-curate Albums and Tags for selected logical Photos.",
+            id(self._act_albums): "Browse and manage Album homes, covers, membership, and presentation order.",
+            id(self._act_tags): "Browse Tags and explicit tag intersections across logical Photos.",
+            id(self._act_org_discovery): "Find Photos through explicit Album and Tag intersections.",
+            id(self._act_org_suggestions): "Review conservative Album/Event peer-group Tag suggestions before applying them.",
+            id(self._act_org_health): "Inspect unorganised Photos, empty Albums, unused Tags, and broken saved views.",
+            id(self._act_org_activity): "Review recent organisation changes and safely undo eligible membership edits.",
+            id(self._act_org_report): "Export a sanitized organisation-health and activity report.",
+            id(self._act_duplicates_lineage): "Investigate exact copies, identity divergence, lineage, and identity-resolution history.",
+            id(self._act_pilot_audit): "Create a read-only pilot audit snapshot for chronology-review progress.",
+            id(self._act_pilot_session): "Start, checkpoint, inspect, or close a bounded pilot review session.",
+            id(self._act_activity_log): "Inspect the application activity log and operational diagnostics.",
+            id(self._act_activity_runs): "Review grouped activity runs and their terminal outcomes.",
+            id(self._act_export_diagnostics): "Export sanitized diagnostic information without source-photo content.",
+        }
+        for action_id, description in self._command_descriptions.items():
+            action = next(
+                (candidate for candidate in self.findChildren(QAction) if id(candidate) == action_id),
+                None,
+            )
+            if action is not None:
+                action.setToolTip(description)
+                action.setStatusTip(description)
+
+        # Session-local command recall only: no database, registry, or source state.
+        self._recent_palette_labels: list[str] = []
+
+        # --- compact workspace navigation ----------------------------------
+        self._workspace_buttons: dict[str, QToolButton] = {}
+        self._workspace_menus: dict[str, QMenu] = {}
+        self._workspace_menu_actions: dict[str, list[QAction]] = {}
+        self._workspace_command_actions: dict[str, list[QAction]] = {}
+
+        self._add_workspace_menu(
+            tb,
+            "Library",
+            [
+                self._act_add,
+                self._act_libraries,
+                None,
+                self._act_scan,
+                self._act_verify,
+                self._act_archive_health,
+                self._act_extract,
+            ],
+        )
+        self._add_workspace_menu(
+            tb,
+            "Timeline",
+            [
+                self._act_timeline,
+                self._act_family_history,
+                self._act_date_review,
+                self._act_unresolved,
+            ],
+        )
+        self._add_workspace_menu(
+            tb,
+            "Organisation",
+            [
+                self._act_organize,
+                self._act_albums,
+                self._act_tags,
+                self._act_org_discovery,
+                None,
+                self._act_org_suggestions,
+                self._act_org_health,
+                self._act_org_activity,
+                None,
+                self._act_org_report,
+            ],
+        )
+        self._add_workspace_menu(
+            tb,
+            "Identity",
+            [self._act_duplicates_lineage],
+        )
+        self._add_workspace_menu(
+            tb,
+            "Diagnostics",
+            [
+                self._act_pilot_audit,
+                self._act_pilot_session,
+                None,
+                self._act_activity_log,
+                self._act_activity_runs,
+                self._act_export_diagnostics,
+            ],
+        )
+
+        # Keyboard-first navigation. These shortcuts only expose the same
+        # workspace menus and canonical command QActions used by mouse input.
+        self._workspace_shortcuts: list[QShortcut] = []
+        for number, label in enumerate(self._workspace_buttons, start=1):
+            shortcut = QShortcut(QKeySequence(f"Alt+{number}"), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(self._workspace_buttons[label].showMenu)
+            self._workspace_shortcuts.append(shortcut)
+            self._workspace_buttons[label].setToolTip(
+                f"{label} workspace (Alt+{number})"
+            )
+
+        self._act_command_palette = QAction("Commands…", self)
+        self._act_command_palette.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        self._act_command_palette.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self._act_command_palette.setToolTip("Command Palette (Ctrl+Shift+P)")
+        self._act_command_palette.triggered.connect(self._on_command_palette)
+
+        tb.addSeparator()
+        tb.addAction(self._act_command_palette)
         tb.addAction(self._act_refresh)
 
         spacer = QWidget()
@@ -375,6 +526,104 @@ class MainWindow(QMainWindow):
         self._density.setCurrentIndex(1)
         self._density.currentIndexChanged.connect(self._on_density_changed)
         tb.addWidget(self._density)
+
+    def _add_workspace_menu(
+        self,
+        toolbar: QToolBar,
+        label: str,
+        actions: list[QAction | None],
+    ) -> None:
+        """Add one compact workspace button with explicit command proxies.
+
+        Do not insert the command QAction itself into a QMenu.  The command
+        action remains the single owner of enabled state/shortcuts/handler
+        wiring, while a small menu-local proxy dispatches it explicitly.
+        This avoids a platform-specific failure mode where shared QActions can
+        render correctly in a tool-button menu yet fail to dispatch reliably.
+        """
+        menu = QMenu(label, self)
+        proxies: list[QAction] = []
+        commands: list[QAction] = []
+        for command in actions:
+            if command is None:
+                menu.addSeparator()
+                continue
+
+            commands.append(command)
+            proxy = QAction(command.icon(), command.text(), menu)
+            proxy.setObjectName(f"Workspace{label}Action{len(proxies)}")
+            proxy.setToolTip(command.toolTip())
+            proxy.setStatusTip(command.statusTip())
+            proxy.setEnabled(command.isEnabled())
+
+            # Capture the command by value. QAction.trigger() preserves the
+            # established command handler and remains the one dispatch point.
+            proxy.triggered.connect(
+                lambda _checked=False, target=command: self._dispatch_workspace_command(target)
+            )
+            command.changed.connect(
+                lambda target=command, item=proxy: item.setEnabled(target.isEnabled())
+            )
+            menu.addAction(proxy)
+            proxies.append(proxy)
+
+        button = QToolButton(toolbar)
+        button.setObjectName(f"Workspace{label}Button")
+        button.setText(label)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setMenu(menu)
+        button.setToolTip(f"{label} workspace")
+        toolbar.addWidget(button)
+
+        self._workspace_buttons[label] = button
+        self._workspace_menus[label] = menu
+        self._workspace_menu_actions[label] = proxies
+        self._workspace_command_actions[label] = commands
+
+    def _dispatch_workspace_command(self, command: QAction) -> None:
+        """Dispatch one workspace entry through its canonical QAction.
+
+        A disabled command now gives visible feedback instead of presenting a
+        dead menu entry with no explanation.
+        """
+        if not command.isEnabled():
+            self.statusBar().showMessage(
+                "Another archive operation is still running; this command will be available when it finishes.",
+                5000,
+            )
+            return
+        command.trigger()
+
+    def _palette_commands(self) -> list[PaletteCommand]:
+        """Return every canonical workspace command once, in navigation order."""
+        commands: list[PaletteCommand] = []
+        seen: set[int] = set()
+        for workspace, actions in self._workspace_command_actions.items():
+            for action in actions:
+                if id(action) in seen:
+                    continue
+                seen.add(id(action))
+                label = self._command_display_labels.get(id(action), action.text())
+                description = self._command_descriptions.get(id(action), action.toolTip())
+                commands.append(PaletteCommand(workspace, action, label, description))
+        return commands
+
+    def _remember_palette_command(self, command: PaletteCommand) -> None:
+        label = command.label
+        self._recent_palette_labels = [item for item in self._recent_palette_labels if item != label]
+        self._recent_palette_labels.insert(0, label)
+        del self._recent_palette_labels[5:]
+
+    @Slot()
+    def _on_command_palette(self) -> None:
+        dialog = CommandPaletteDialog(
+            self._palette_commands(),
+            self,
+            recent_labels=self._recent_palette_labels,
+            on_command_run=self._remember_palette_command,
+        )
+        dialog.exec()
 
     def _build_body(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -887,6 +1136,35 @@ class MainWindow(QMainWindow):
     def _on_organization_discovery_failed(self,message: str) -> None:
         self._org_discovery_cancelled=False; self._finish_organization_discovery(); self._warn(f"Discovery failed: {message}"); self._status.showMessage("Discovery failed.")
 
+    def _on_duplicates_lineage(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Duplicates & Lineage", "Select or scan a library first.")
+            return
+        self._set_busy(True)
+        self._status.showMessage("Duplicates & Lineage: building identity review…")
+        worker = DuplicateLineageReviewWorker(self._config.db_path, library_id)
+        worker.finished.connect(lambda payload, lid=library_id: self._on_duplicates_lineage_ready(lid, payload), Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_duplicates_lineage_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(int, object)
+    def _on_duplicates_lineage_ready(self, library_id: int, payload) -> None:
+        self._set_busy(False)
+        view, health = payload
+        from ppa.ui.duplicate_lineage_dialog import DuplicateLineageDialog
+        dialog = DuplicateLineageDialog(self._conn, library_id, view, self, identity_health=health)
+        dialog.exec()
+        self._status.showMessage(
+            f"Duplicates & Lineage ready — {len(view.sets)} exact-copy group(s), "
+            f"{len(view.divergences)} identity divergence(s).")
+
+    @Slot(str)
+    def _on_duplicates_lineage_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Duplicates & Lineage failed: {message}")
+        self._status.showMessage("Duplicates & Lineage failed.")
+
     def _on_family_history(self) -> None:
         library_id = self._current_library_id()
         if library_id is None:
@@ -1287,7 +1565,7 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         for act in (self._act_add, self._act_libraries, self._act_scan, self._act_verify,
-                    self._act_extract, self._act_date_review, self._act_unresolved,
+                    self._act_archive_health, self._act_extract, self._act_date_review, self._act_unresolved,
                     self._act_pilot_audit, self._act_pilot_session, self._act_refresh):
             act.setEnabled(not busy)
 
@@ -1390,6 +1668,43 @@ class MainWindow(QMainWindow):
             f"Metadata read for {count} file(s)." if count
             else "Metadata up to date."
         )
+
+    def _on_archive_health(self) -> None:
+        library_id = self._current_library_id()
+        if library_id is None:
+            QMessageBox.information(self, "Backup & Archive Health", "Select or scan a library first.")
+            return
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Archive Health: analysing copy coverage and storage identity…")
+        worker = ArchiveHealthWorker(self._config.db_path, library_id)
+        self._archive_health_worker = worker
+        worker.finished.connect(self._on_archive_health_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_archive_health_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_archive_health_ready(self, health) -> None:
+        self._set_busy(False)
+        from ppa.ui.archive_health_dialog import ArchiveHealthDialog
+        dialog = ArchiveHealthDialog(
+            self._conn, self._config.db_path, health, self,
+            cache_dir=self._cache_dir / 'archive-health',
+        )
+        dialog.show()
+        self._archive_health_dialog = dialog
+        self._status.showMessage(
+            f"Archive Health ready — {health.no_present_count} with no present File, "
+            f"{health.single_present_count} with one present File, "
+            f"{health.hardlink_overstated_count} exact set(s) with hard-link path inflation."
+        )
+
+    @Slot(str)
+    def _on_archive_health_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Archive Health failed: {message}")
+        self._status.showMessage("Archive Health failed.")
 
     def _on_verify(self) -> None:
         if self._busy:
