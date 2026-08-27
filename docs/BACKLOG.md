@@ -10,11 +10,12 @@ restore one arbitrarily. Better: model as `REAPPEARED — AMBIGUOUS ORIGIN`, or
 create a new File under the same Photo and leave both originals missing —
 "don't invent certainty." No evidence is lost either way.
 
-## 2. Hard links look like independent duplicate copies
-Two directory entries sharing one inode are reported as two duplicate copies,
-but they are not two independently recoverable copies. Future: use device+inode
-(POSIX) / file ID (NTFS) to distinguish a true second copy from a hard link.
-Relevant to Backup/Archive Health accounting, not provenance.
+## 2. Hard links look like independent duplicate copies — CLOSED in Phase 12.1
+Phase 12.1 captures current filesystem device/object identity during normal scans
+and Archive Health now detects when multiple catalogue paths share one filesystem
+object. Distinct filesystem objects and distinct device IDs are reported
+separately, while the UI/CLI still refuse to call either proof of independent
+physical backup hardware. See `docs/PHASE12_1_STORAGE_IDENTITY.md`.
 
 ## 3. Thumbnail vs current-bytes after a hash mismatch
 After a verified `hash_mismatch`, the cached thumbnail still shows the trusted
