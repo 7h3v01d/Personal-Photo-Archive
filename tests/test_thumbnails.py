@@ -66,3 +66,38 @@ def test_undecodable_source_returns_none(tmp_path: Path) -> None:
     bad.write_bytes(b"not an image")
     cache = ThumbnailCache(tmp_path / "cache")
     assert cache.get_or_create(bad, sha256="e" * 64) is None
+
+
+def test_attested_thumbnail_requires_matching_source_hash(tmp_path: Path) -> None:
+    from ppa.hashing import sha256_file
+
+    src = tmp_path / "img.jpg"
+    _img(src, color="red")
+    expected = sha256_file(src)
+    cache = ThumbnailCache(tmp_path / "cache", size=96)
+
+    out = cache.get_or_create_attested(src, expected)
+    assert out is not None
+    assert cache.attested_cached_path(src, expected) == out
+
+    # A source that no longer has the expected bytes cannot create/refresh an
+    # attested derivative under the old catalogue identity.
+    _img(src, color="blue")
+    out.unlink()
+    cache._attestation_path(out).unlink()
+    assert cache.get_or_create_attested(src, expected) is None
+    assert cache.cached_path_only(src, expected) is None
+
+
+def test_attested_thumbnail_detects_derivative_tampering(tmp_path: Path) -> None:
+    from ppa.hashing import sha256_file
+
+    src = tmp_path / "img.jpg"
+    _img(src)
+    expected = sha256_file(src)
+    cache = ThumbnailCache(tmp_path / "cache", size=96)
+    out = cache.get_or_create_attested(src, expected)
+    assert out is not None
+
+    out.write_bytes(b"tampered derivative")
+    assert cache.attested_cached_path(src, expected) is None

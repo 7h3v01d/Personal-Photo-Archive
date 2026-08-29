@@ -1,18 +1,31 @@
 from pathlib import Path
+from io import BytesIO
+import hashlib
+from PIL import Image
 from ppa.db import connect
 from ppa.identity_health import IDENTITY_HEALTH_SCHEMA, build_identity_health
 from ppa.identity_resolution import plan_identity_split, execute_identity_split, plan_identity_recovery, execute_identity_recovery
+
+
+def _bytes_for(label: str) -> bytes:
+    digest=hashlib.sha256(label.encode()).digest()
+    out=BytesIO()
+    Image.new("RGB",(12,10),color=(digest[0],digest[1],digest[2])).save(out,format="JPEG")
+    return out.getvalue()
 
 
 def _setup(conn, root: Path, specs):
     root.mkdir(parents=True,exist_ok=True)
     conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
     lid=conn.execute("SELECT id FROM libraries WHERE root_canonical_path=?",(str(root).casefold(),)).fetchone()[0]
-    for fid,pid,sha in specs:
+    for fid,pid,label in specs:
         if conn.execute("SELECT 1 FROM photos WHERE id=?",(pid,)).fetchone() is None:
             conn.execute("INSERT INTO photos(id,created_at) VALUES (?,'x')",(pid,))
-        p=root/(fid+'.jpg'); p.write_bytes(fid.encode())
-        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?,'present','ok')",(fid,pid,str(p),p.name,lid,sha))
+        data=_bytes_for(label); sha=hashlib.sha256(data).hexdigest(); p=root/(fid+'.jpg'); p.write_bytes(data)
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,?,'x','x',?,?,'present','ok')",(fid,pid,str(p),p.name,len(data),lid,sha))
+        rid='r-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,?,'x')",(rid,fid,sha,len(data)))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit(); return lid
 
 

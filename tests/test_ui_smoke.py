@@ -791,9 +791,14 @@ def test_phase10_controlled_identity_split_ui_constructs_for_divergence(app, tmp
     conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
     lid = conn.execute("SELECT id FROM libraries").fetchone()[0]
     conn.execute("INSERT INTO photos(id,created_at) VALUES ('p','x')")
-    for fid,sha in [('fa','aaa'),('fb','bbb')]:
-        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
-        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,lid,sha))
+    from ppa.hashing import sha256_file
+    for fid,color in [('fa','red'),('fb','blue')]:
+        path=root/(fid+'.jpg'); Image.new('RGB',(16,12),color=color).save(path)
+        sha=sha256_file(path); size=path.stat().st_size
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,?,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,size,lid,sha))
+        rid='r-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,?,'x')",(rid,fid,sha,size))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit()
     view=build_duplicate_identity(conn,library_id=lid)
     dialog=DuplicateLineageDialog(conn,lid,view,None)
@@ -817,9 +822,14 @@ def test_phase10_identity_resolution_review_ui_constructs_and_marks_recovery(app
     conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
     lid=conn.execute("SELECT id FROM libraries").fetchone()[0]
     conn.execute("INSERT INTO photos(id,created_at) VALUES ('p','x')")
-    for fid,sha in [('fa','aaa'),('fb','bbb')]:
-        path=root/(fid+'.jpg'); path.write_bytes(fid.encode())
-        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,lid,sha))
+    from ppa.hashing import sha256_file
+    for fid,color in [('fa','red'),('fb','blue')]:
+        path=root/(fid+'.jpg'); Image.new('RGB',(16,12),color=color).save(path)
+        sha=sha256_file(path); size=path.stat().st_size
+        conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,?,'x','x',?,?, 'present','ok')",(fid,'p',str(path),path.name,size,lid,sha))
+        rid='r-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,?,'x')",(rid,fid,sha,size))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit()
     split=execute_identity_split(conn,plan_identity_split(conn,library_id=lid,source_photo_id='p',file_ids=('fa',)))
     view=build_duplicate_identity(conn,library_id=lid)
@@ -1099,7 +1109,7 @@ def test_phase11_navigation_polish_descriptions_and_recent_palette_order(app, tm
 
 
 def test_phase12_archive_health_navigation_and_dialog_are_read_only(app, tmp_path: Path) -> None:
-    """Phase 12.1 exposes copy/storage evidence without creating new authority."""
+    """Phase 12.2 exposes copy/storage/origin evidence without creating new authority."""
     from ppa.archive_health import build_archive_health
     from ppa.ui.archive_health_dialog import ArchiveHealthDialog
     from ppa.ui.main_window import MainWindow
@@ -1121,3 +1131,83 @@ def test_phase12_archive_health_navigation_and_dialog_are_read_only(app, tmp_pat
         assert health.single_present_count == 3
     finally:
         dialog.close(); win._registry.shutdown(); win.close(); conn.close()
+
+
+def test_phase13_recovery_planning_dialog_smoke(app) -> None:
+    from types import SimpleNamespace
+    from ppa.ui.recovery_planning_dialog import RecoveryPlanningDialog
+
+    candidate = SimpleNamespace(
+        qualified=True,
+        library_id=1,
+        path="/archive/donor.jpg",
+        topology_class="distinct_filesystem_objects_same_device_id",
+        rejection_reasons=(),
+        physical_sha256="abc",
+        expected_sha256="abc",
+    )
+    view = SimpleNamespace(
+        file_id="target-file",
+        path="/archive/target.jpg",
+        expected_sha256="abc",
+        target_state="still_mismatched",
+        recovery_intent_resolution_id="resolution-1",
+        candidates=(candidate,),
+        notes=(),
+    )
+    plan = SimpleNamespace(
+        donor_file_id="donor-file",
+        donor_library_id=1,
+        donor_path="/archive/donor.jpg",
+        topology_class="distinct_filesystem_objects_same_device_id",
+        evidence_fingerprint="fingerprint",
+        proposed_action=("preserve suspect bytes", "restore expected bytes"),
+    )
+    dlg = RecoveryPlanningDialog(view, plan)
+    captured = []
+    dlg.proposal_requested.connect(lambda p, note: captured.append((p, note)))
+    dlg.proposal_requested.emit(plan, "reviewed")
+    app.processEvents()
+    assert captured == [(plan, "reviewed")]
+    assert "Dry Run" in dlg.windowTitle()
+    dlg.close()
+
+
+def test_phase13_plan_recovery_button_emits_file_id(app) -> None:
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QPushButton
+    from ppa.ui.mismatch_investigation_dialog import MismatchInvestigationDialog
+
+    inv = SimpleNamespace(
+        file_id="target-file",
+        verify_observed_sha256="badsha",
+        verify_observed_at="2026-08-28T00:00:00Z",
+        latest_resolution_action="retain_expected_recovery_needed",
+        latest_resolution_at="2026-08-28T00:01:00Z",
+        latest_resolution_note=None,
+        notes=(),
+        current_state="still_mismatched",
+        expected_reference_status="unavailable",
+        expected_reference_attested=False,
+        expected_reference_path=None,
+        expected_sha256="expectedsha",
+        current_preview_path=None,
+        current_observed_sha256="badsha",
+    )
+    dlg = MismatchInvestigationDialog(inv)
+    captured = []
+    dlg.recovery_planning_requested.connect(captured.append)
+    button = next(b for b in dlg.findChildren(QPushButton) if b.text() == "Plan recovery…")
+    button.click(); app.processEvents()
+    assert captured == ["target-file"]
+    dlg.close()
+
+
+def test_phase14_recovery_preservation_worker_smoke(app, tmp_path) -> None:
+    from ppa.ui.workers import RecoveryPreservationWorker
+
+    worker = RecoveryPreservationWorker(tmp_path / "catalogue.sqlite3", "proposal-1", "reviewed")
+    assert worker._proposal_id == "proposal-1"
+    assert worker._note == "reviewed"
+    worker.deleteLater()
+    app.processEvents()

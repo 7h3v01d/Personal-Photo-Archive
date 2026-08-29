@@ -19,6 +19,9 @@ def _library(conn, root: Path, specs):
         conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) "
                      "VALUES (?,?,?,?,1,'x','x',?,?,?,'ok')",
                      (fid,pid,str(root/(fid+'.jpg')),fid+'.jpg',lid,sha,presence))
+        rid='r-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,1,'x')",(rid,fid,sha))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit(); return lid
 
 
@@ -30,10 +33,8 @@ def test_schema_v23_and_exact_duplicate_view_is_existing_identity_only(tmp_path)
     before=conn.total_changes
     view=build_duplicate_identity(conn,library_id=lid)
     assert view.schema == DUPLICATE_IDENTITY_SCHEMA
-    assert view.duplicate_photos == 1 and view.duplicate_files == 2
-    assert view.sets[0].photo_id == 'p1'
-    assert [c.file_id for c in view.sets[0].copies] == ['f1','f2']
-    assert view.sets[0].present_count == 1
+    assert view.duplicate_photos == 0 and view.duplicate_files == 0
+    assert view.sets == ()
     assert view.divergences == ()
     assert conn.total_changes == before
 
@@ -102,19 +103,24 @@ def test_duplicate_view_does_not_call_diverged_current_bytes_exact_duplicates(tm
     lid=_library(conn,tmp_path/'lib',[
         ('f1','p1','aaa','present'),('f2','p1','bbb','present'),('f3','p1','aaa','missing')])
     view=build_duplicate_identity(conn,library_id=lid)
-    # f1/f3 are still exact current copies; f2 has diverged current bytes.
-    assert len(view.sets)==1 and [c.file_id for c in view.sets[0].copies]==['f1','f3']
+    # Missing f3 has historical expected bytes but no verified current bytes.
+    assert view.sets == ()
     assert len(view.divergences)==1
     assert view.divergences[0].photo_id=='p1'
     assert view.divergences[0].known_hashes==('aaa','bbb')
 
 
 def test_exact_copy_pair_validation_requires_current_hash_not_just_photo_identity(tmp_path):
+    from PIL import Image
+    from ppa.hashing import sha256_file
     from ppa.duplicate_lineage import validate_exact_copy_pair
-    conn=connect(tmp_path/'ppa.sqlite')
-    lid=_library(conn,tmp_path/'lib',[
-        ('f1','p1','aaa','present'),('f2','p1','aaa','present'),('f3','p1','bbb','present'),
-        ('f4','p2','aaa','present')])
+    conn=connect(tmp_path/'ppa.sqlite'); root=tmp_path/'lib'; root.mkdir()
+    for name,color in [('f1','red'),('f2','red'),('f3','blue'),('f4','red')]:
+        Image.new('RGB',(16,12),color=color).save(root/(name+'.jpg'))
+    red=sha256_file(root/'f1.jpg'); blue=sha256_file(root/'f3.jpg')
+    lid=_library(conn,root,[
+        ('f1','p1',red,'present'),('f2','p1',red,'present'),('f3','p1',blue,'present'),
+        ('f4','p2',red,'present')])
     pair=validate_exact_copy_pair(conn,library_id=lid,file_ids=('f1','f2'))
     assert {p.file_id for p in pair} == {'f1','f2'}
     with pytest.raises(ValueError,match='not proven current exact copies'):
@@ -151,7 +157,10 @@ def test_divergence_investigation_distinct_when_first_observed_does_not_claim_de
 def test_divergence_investigation_withholds_explanation_when_revision_history_incomplete(tmp_path):
     from ppa.divergence_investigation import investigate_identity_divergence, INSUFFICIENT_EVIDENCE
     conn=connect(tmp_path/'ppa.sqlite'); lid=_library(conn,tmp_path/'lib', [('f1','p','aaa','present'),('f2','p','bbb','present')])
-    _revision(conn,'r1','f1','aaa','2020-01-01'); conn.execute("UPDATE files SET current_revision_id='r1' WHERE id='f1'"); conn.commit()
+    # Keep current revision coherent for both Files, but make f2's earliest
+    # historical revision unhashed so the origin explanation remains incomplete.
+    conn.execute("UPDATE file_revisions SET sha256=NULL, first_observed_at='2019-01-01', superseded_at='2020-06-01' WHERE id='r-f2'")
+    _revision(conn,'r2','f2','bbb','2020-06-01'); conn.execute("UPDATE files SET current_revision_id='r2' WHERE id='f2'"); conn.commit()
     view=investigate_identity_divergence(conn,library_id=lid,photo_id='p')
     assert view.classification==INSUFFICIENT_EVIDENCE
 

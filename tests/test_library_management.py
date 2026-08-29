@@ -217,3 +217,25 @@ def test_migration_009_does_not_attach_legacy_library_anchor_to_reused_id(tmp_pa
     assert a.library_id is None                   # stayed dormant, not adopted by B
     assert anchors.resolve_for(anchors.list_anchors(conn),
                                file_id="x", directory="", library_id=idb) is None
+
+
+def test_forget_library_cascades_phase123_mismatch_observations(tmp_path):
+    from ppa.integrity import verify_library
+
+    lib = tmp_path / "A"
+    path = lib / "a.jpg"
+    _img(path, "red")
+    conn = connect(tmp_path / "c.sqlite3")
+    scan_library(conn, lib)
+    lid = catalogue.list_libraries(conn)[0].id
+    _img(path, "blue")
+    verify_library(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM integrity_mismatch_observations"
+    ).fetchone()["n"] == 1
+
+    catalogue.forget_library(conn, lid)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM integrity_mismatch_observations"
+    ).fetchone()["n"] == 0
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

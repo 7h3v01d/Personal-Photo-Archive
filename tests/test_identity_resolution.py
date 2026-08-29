@@ -1,20 +1,37 @@
 from pathlib import Path
+from io import BytesIO
+import hashlib
 import pytest
+from PIL import Image
 
 from ppa.db import connect, current_schema_version
 from ppa.identity_resolution import plan_identity_split, execute_identity_split, list_identity_resolutions
+
+
+def _bytes_for(label: str) -> bytes:
+    colors = {"aaa": "red", "bbb": "blue", "ccc": "green"}
+    out = BytesIO()
+    Image.new("RGB", (16, 12), color=colors.get(label, "white")).save(out, format="JPEG")
+    return out.getvalue()
+
+
+def _sha_for(label: str) -> str:
+    return hashlib.sha256(_bytes_for(label)).hexdigest()
 
 
 def _setup(conn, root: Path, specs):
     root.mkdir(exist_ok=True)
     conn.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(root),str(root).casefold()))
     lid=conn.execute("SELECT id FROM libraries WHERE root_canonical_path=?",(str(root).casefold(),)).fetchone()[0]
-    for fid,pid,sha in specs:
+    for fid,pid,label in specs:
         if conn.execute("SELECT 1 FROM photos WHERE id=?",(pid,)).fetchone() is None:
             conn.execute("INSERT INTO photos(id,created_at) VALUES (?,'x')",(pid,))
-        path=root/(fid+'.jpg'); path.write_bytes((fid+'-bytes').encode())
+        data=_bytes_for(label); sha=_sha_for(label); path=root/(fid+'.jpg'); path.write_bytes(data)
         conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) "
-                     "VALUES (?,?,?,?,1,'x','x',?,?, 'present','ok')",(fid,pid,str(path),path.name,lid,sha))
+                     "VALUES (?,?,?,?,?,'x','x',?,?, 'present','ok')",(fid,pid,str(path),path.name,len(data),lid,sha))
+        rid='r-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,?,'x')",(rid,fid,sha,len(data)))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit(); return lid
 
 
@@ -23,7 +40,7 @@ def test_schema_v24_and_split_moves_complete_hash_cohort_atomically(tmp_path):
         ('a1','p','aaa'),('a2','p','aaa'),('b1','p','bbb')])
     assert current_schema_version(conn) >= 24
     plan=plan_identity_split(conn,library_id=lid,source_photo_id='p',file_ids=('a2','a1'))
-    assert plan.sha256=='aaa' and [f.file_id for f in plan.files]==['a1','a2']
+    assert plan.sha256==_sha_for('aaa') and [f.file_id for f in plan.files]==['a1','a2']
     result=execute_identity_split(conn,plan,note='separate edited cohort')
     assert {r[0] for r in conn.execute("SELECT id FROM files WHERE photo_id=?",(result.new_photo_id,))}=={'a1','a2'}
     assert {r[0] for r in conn.execute("SELECT id FROM files WHERE photo_id='p'")}=={'b1'}

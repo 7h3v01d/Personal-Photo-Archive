@@ -54,7 +54,7 @@ def test_archive_health_classifies_catalogue_copy_coverage_without_writes(tmp_pa
     health = build_archive_health(conn, library_id=1)
     assert conn.total_changes == before
     assert health.read_only is True
-    assert health.schema == "ppa-archive-health/2"
+    assert health.schema == "ppa-archive-health/4"
     assert health.total_photos == 7
     assert health.total_files == 10
     assert health.present_files == 8
@@ -64,7 +64,7 @@ def test_archive_health_classifies_catalogue_copy_coverage_without_writes(tmp_pa
     assert health.multiple_exact_present_count == 1
     assert health.missing_copy_photo_count == 1
     assert health.unhealthy_present_count == 1
-    assert health.unknown_hash_count == 1
+    assert health.unknown_hash_count == 2
     assert health.divergent_count == 1
     assert health.exact_storage_unknown_count == 0
     assert health.hardlink_overstated_count == 0

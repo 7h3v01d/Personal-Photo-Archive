@@ -19,12 +19,19 @@ def _setup(conn, root: Path, specs):
             conn.execute("INSERT INTO photos(id,created_at) VALUES (?,'2020-01-01')", (pid,))
         p=root/(fid+'.jpg'); p.write_bytes(fid.encode())
         conn.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES (?,?,?,?,1,'2020','2021',?,?,'present','ok')", (fid,pid,str(p),p.name,lid,sha))
+        rid='base-'+fid
+        conn.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES (?,?,?,1,'2020')",(rid,fid,sha))
+        conn.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
     conn.commit(); return lid
 
 
 def _rev(c,rid,fid,sha,when,sup=None,current=False):
+    if current:
+        old=c.execute("SELECT current_revision_id FROM files WHERE id=?",(fid,)).fetchone()[0]
+        if old:
+            c.execute("UPDATE file_revisions SET superseded_at=? WHERE id=? AND superseded_at IS NULL",(when,old))
     c.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at,superseded_at) VALUES (?,?,?,1,?,?)",(rid,fid,sha,when,sup))
-    if current: c.execute("UPDATE files SET current_revision_id=? WHERE id=?",(rid,fid))
+    if current: c.execute("UPDATE files SET current_revision_id=?,sha256=? WHERE id=?",(rid,sha,fid))
 
 
 def test_competing_identity_first_observed_same_bytes_is_read_only_candidate(tmp_path):
@@ -49,7 +56,9 @@ def test_competing_identity_detects_observed_convergence_without_claiming_correc
 
 def test_competing_identity_withholds_origin_explanation_for_incomplete_history(tmp_path):
     c=connect(tmp_path/'p.sqlite'); lid=_setup(c,tmp_path/'lib',[('a','p1','same'),('b','p2','same')])
-    _rev(c,'ra','a','same','2020',current=True); c.commit()
+    c.execute("UPDATE file_revisions SET first_observed_at='2021' WHERE id='base-b'")
+    c.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at,superseded_at) VALUES ('old-b','b',NULL,1,'2019','2021')")
+    c.commit()
     assert investigate_competing_identity(c,library_id=lid,sha256='same').classification==INSUFFICIENT_HISTORY
 
 
@@ -67,7 +76,7 @@ def test_merge_consideration_blocks_other_current_bytes_and_cross_library_scope(
     c=connect(tmp_path/'p.sqlite'); lid=_setup(c,tmp_path/'lib',[('a','p1','same'),('b','p2','same'),('c','p1','other')])
     other=tmp_path/'other'; other.mkdir(); c.execute("INSERT INTO libraries(root_display_path,root_canonical_path) VALUES (?,?)",(str(other),str(other).casefold()))
     lid2=c.execute("SELECT id FROM libraries WHERE root_canonical_path=?",(str(other).casefold(),)).fetchone()[0]
-    p=other/'d.jpg'; p.write_bytes(b'd'); c.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES ('d','p2',?,'d.jpg',1,'x','x',?,'same','present','ok')",(str(p),lid2)); c.commit()
+    p=other/'d.jpg'; p.write_bytes(b'd'); c.execute("INSERT INTO files(id,photo_id,path,filename,size_bytes,first_seen_at,last_seen_at,library_id,sha256,presence_status,health_status) VALUES ('d','p2',?,'d.jpg',1,'x','x',?,'same','present','ok')",(str(p),lid2)); c.execute("INSERT INTO file_revisions(id,file_id,sha256,size_bytes,first_observed_at) VALUES ('base-d','d','same',1,'x')"); c.execute("UPDATE files SET current_revision_id='base-d' WHERE id='d'"); c.commit()
     m=investigate_competing_identity(c,library_id=lid,sha256='same').merge_consideration
     assert not m.eligible
     assert any('different known current bytes' in b for b in m.blockers)

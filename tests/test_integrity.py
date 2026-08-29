@@ -112,3 +112,29 @@ def test_verify_flags_unreadable_file_as_corrupt(tmp_path: Path) -> None:
     row = conn.execute("SELECT presence_status, health_status FROM files").fetchone()
     assert row["presence_status"] == "present"
     assert row["health_status"] == "unreadable"
+
+
+def test_verify_records_structured_mismatch_observation(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    img_path = library / "IMG_0001.jpg"
+    _make_image(img_path, color="red")
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    scan_library(conn, library)
+    before = conn.execute(
+        "SELECT f.id, f.current_revision_id, r.sha256 FROM files f "
+        "JOIN file_revisions r ON r.id=f.current_revision_id"
+    ).fetchone()
+
+    _make_image(img_path, color="blue")
+    verify_library(conn)
+
+    obs = conn.execute(
+        "SELECT * FROM integrity_mismatch_observations WHERE file_id=?",
+        (before["id"],),
+    ).fetchone()
+    assert obs is not None
+    assert obs["expected_revision_id"] == before["current_revision_id"]
+    assert obs["expected_sha256"] == before["sha256"]
+    assert obs["observed_sha256"] != before["sha256"]
+    assert obs["observed_path"] == str(img_path)
+    assert obs["observed_size_bytes"] == img_path.stat().st_size

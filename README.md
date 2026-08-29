@@ -4,13 +4,16 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12.1 Backup & Archive Health storage-identity layer active.**
+Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12 adversarially ACCEPTED/FROZEN at 12.4.2; Phase 13 adversarially ACCEPTED/FROZEN at 13.0.1; Phase 14.0.1 recovery preservation staging hardening active.**
 
 The Library -> File -> FileRevision -> Observation model remains the archive-core
 provenance boundary. Later chronology, Event, organisation, identity, navigation,
 and Archive Health layers build on that evidence without rewriting source photos.
-Current content identity is revision-bound; legacy `status` / `files.sha256` fields
-remain maintained compatibility mirrors rather than the preferred authority.
+Expected content identity is revision-bound; legacy `status` / `files.sha256` fields
+remain maintained compatibility mirrors rather than unconditional proof of current
+on-disk bytes. Current-byte identity is asserted through the Phase-12.4.1 verified-current
+projection and re-attested from physical source bytes at Phase-12.4.2 identity
+execution boundaries.
 
 See `docs/HARDENING.md` for the Archive Core findings -> fix -> test map, and `docs/PHASE8_14_1_PRE_PHASE9_HARDENING.md` for the independent pre-Phase-9 UI/integration hardening pass. Per the reviewer, Phase 6 (Date Reliability Engine) can
 unblock once a confirming adversarial pass on this build comes back clean.
@@ -122,7 +125,10 @@ tool that rewrote the bytes while preserving the timestamp. `verify` is
 the deliberate, re-read-everything check for exactly that. It never
 repairs anything and never overwrites a stored hash on mismatch: a
 mismatch is a warning to investigate against your backups, logged to
-`integrity_events`.
+`integrity_events` plus a structured Phase-12.3 mismatch-observation ledger.
+When a mismatching File is selected in the desktop inspector, **Investigate hash
+mismatch…** opens a read-only expected/catalogued-vs-current comparison. PPA does
+not regenerate an expected-image derivative from suspect mismatching bytes.
 
 HEIC files are detected but reported as unsupported unless the optional
 plugin is installed:
@@ -687,3 +693,90 @@ The **Library → Archive Health** surface adds a read-only view of catalogue co
 
 Normal library scans now retain the filesystem `device + object/file-index + link-count` evidence already available from read-only `stat()` calls. Archive Health schema `ppa-archive-health/2` uses that evidence to distinguish **hard-linked paths** from **distinct filesystem objects**, and separately reports exact-copy sets spanning distinct filesystem device IDs. Existing catalogue rows upgrade with unknown storage identity until their next normal scan; no migration reads or mutates source photos. Distinct object/device evidence is deliberately **not** described as proof of independent physical backup hardware or failure domains. See `docs/PHASE12_1_STORAGE_IDENTITY.md`.
 
+## Phase 12.2 — Ambiguous Restoration & File-Origin Preservation
+
+The scanner no longer arbitrarily selects one historical File when multiple byte-identical absent-path candidates could explain a newly observed path. It now catalogs the observed object as a new physical File, leaves the historical candidates unchanged, and records the full candidate set in the append-only `file_origin_ambiguities` ledger. If all candidates belong to one logical Photo, only physical File origin is withheld; if candidates span logical Photos, PPA also refuses to cross that identity boundary automatically. Same-path restoration and a genuinely unique historical candidate remain deterministic. Phase-12.1 filesystem object IDs are deliberately not promoted to historical authority across absence because inode/file-index values may be reused after deletion. Archive Health schema is now `ppa-archive-health/3` with a browsable **Recorded Ambiguous File Origins** attention category. See `docs/PHASE12_2_AMBIGUOUS_RESTORATION.md`.
+
+
+## Phase 12.3 — Hash-Mismatch Forensics & Trusted Derivatives
+
+Verified `hash_mismatch` Files now expose **Investigate hash mismatch…** in the
+inspector. The read-only comparison keeps the immutable FileRevision SHA separate
+from a fresh hash/preview of current on-disk bytes. Forensic expected thumbnails
+require `ppa-thumbnail-attestation/1` provenance; legacy cache entries are labelled
+unattested, and known mismatches cannot create new browsing thumbnails under the
+trusted SHA key. Migration 029 adds structured append-only mismatch observations.
+See `docs/PHASE12_3_HASH_MISMATCH_FORENSICS.md`.
+
+
+## Phase 12.4 — Controlled Hash-Mismatch Resolution
+
+The Phase-12.3 forensic comparison now supports three explicit human dispositions: **keep the expected revision / recovery needed**, **record unresolved**, or **adopt the reviewed current bytes as a new immutable FileRevision**. Resolution is bound to the exact reviewed revision, Verify observation and current SHA, then revalidated again under a reserved database transaction; changed evidence aborts instead of adopting unseen bytes. Recovery-needed and unresolved decisions leave objective `hash_mismatch` health intact, while adoption appends revision history rather than rewriting it. No resolution action modifies the source photograph. Migration 030 adds the append-only `integrity_mismatch_resolutions` ledger. See `docs/PHASE12_4_CONTROLLED_MISMATCH_RESOLUTION.md`.
+
+## Phase 12.4.1 — Verified Current Identity Hardening
+
+The post-12.4 adversarial pass found a real semantic authority leak in older
+Phase-10 identity logic: after Verify records `hash_mismatch`, `files.sha256`
+still correctly preserves the expected current-revision SHA, but some duplicate,
+merge and split paths were treating that expected SHA as proof of current disk
+bytes. Phase 12.4.1 centralises `verified_current_sha256` semantics and converts
+all current-byte identity decisions to fail closed when presence, health or
+revision coherence is unresolved. Merge/split/recovery fingerprints now include
+that state, Scanner cannot clear a known mismatch merely by re-observing expected
+bytes, Archive Health advances to `ppa-archive-health/4`, and migration 031 gives
+mismatch-resolution plans one-shot decision identities. See
+`docs/PHASE12_4_1_VERIFIED_CURRENT_IDENTITY_HARDENING.md`.
+
+
+## Phase 12.4.2 — Execution-Time Content Re-attestation
+
+The final Phase-12 adversarial pass found a narrow physical-file TOCTOU window:
+a merge/split/recovery plan could remain database-valid if a source photograph
+was externally replaced after review but before execution. Phase 12.4.2
+generalises the stable read-only physical observer and requires fresh SHA/decode/
+stat re-attestation of every relevant File immediately before identity mutation
+and again before commit. Exact-copy action validation now performs the same
+physical proof. Any disappearance, unreadability, hash change or unstable source
+rolls the identity transaction back and requires Verify / refreshed review.
+Catalogue schema remains v31; source photographs remain strictly read-only. See
+`docs/PHASE12_4_2_EXECUTION_TIME_CONTENT_REATTESTATION.md`.
+
+
+## Phase 13.0 — Recovery Planning & Donor Qualification
+
+With Phase 12 frozen, PPA can now plan recovery for a verified mismatch whose latest human disposition is **keep expected / recovery needed**. Phase 13.0 remains source-read-only: it discovers same-revision donor candidates, requires Phase-12.4.1 verified-current catalogue authority, freshly re-attests physical donor bytes using the Phase-12.4.2 stable observer, rejects unhealthy/missing/ambiguous/same-object candidates, reports filesystem topology without claiming independent backup hardware, and builds a fingerprinted `ppa-recovery-plan/1` dry run. Migration 032 adds immutable `archive_recovery_plan_proposals`; recording a proposal says explicitly **proposed but not executed** and authorises no recovery write. The mismatch-investigation UI exposes **Plan recovery…** after a recovery-needed disposition. CLI: `recovery-candidates <file-id>` and `recovery-plan <file-id> [--donor ...] [--record]`. See `docs/PHASE13_0_RECOVERY_PLANNING.md`.
+
+
+## Phase 13.0.1 — Archive-Safe Outputs & Decision-Order Hardening
+
+The Phase-13.0 adversarial pass found that user-selected CLI/report output paths could bypass the otherwise read-only recovery boundary and overwrite a source photograph. Phase 13.0.1 centralises all user-directed JSON/CSV/report writes behind `ppa.safe_export`: destinations inside any registered source Library are refused, source-file symlink/hard-link aliases are rejected, PPA database/WAL/SHM, thumbnail-cache and known log destinations are protected, and output is committed through a sibling temporary file plus atomic replacement rather than opening the existing destination inode for writing. Durable pilot-session JSON also uses the same primitive.
+
+Append order is now the authority for mismatch decision and Verify-observation recency: `id`/sequence determines what happened later; wall-clock timestamps remain descriptive audit evidence only. This prevents RTC rollback, NTP correction, DST or manual clock changes from resurrecting an older recovery-needed decision. Phase 13 Qt smoke coverage now includes the recovery planning dialog and Plan recovery signal wiring. Catalogue schema remains v32. See `docs/PHASE13_0_1_ARCHIVE_SAFE_OUTPUTS.md`.
+
+
+## Phase 14.0.1 — Stage-Path & Rollback-Cleanup Hardening
+
+The Phase-14.0 review found that a caller-supplied `stage_id` could carry filesystem path authority and, on failure, generic recursive cleanup could therefore operate outside the intended preservation root. Phase 14.0.1 closes that boundary structurally: stage IDs are canonical UUIDs only; execution revalidates them before filesystem use; the created stage directory is bound to its filesystem identity; rollback removes only PPA-owned artifacts and never recursively traverses/chmods unexpected content; custom recorded preservation roots are protected by `ppa.safe_export`; the parent directory entry is fsynced when the stage directory is created; and post-commit read-only chmod is descriptor/identity-bound so a replaced alias cannot redirect the permission change to a source file.
+
+The recovery authority remains unchanged: Phase 14.0.1 preserves suspect bytes only. It does not materialise donor bytes and does not replace, rename, move, delete, metadata-rewrite, timestamp-repair, or otherwise modify a source photograph.
+
+## Phase 14.0 — Recovery Execution Protocol & Preservation Staging
+
+Phase 14 crosses the first recovery write boundary without yet restoring a source photograph. A recorded, immutable Phase-13 proposal is reloaded and rebuilt from current catalogue authority; target and donor are physically re-attested again; then an explicit preservation-stage action may copy the **currently suspect target bytes only** into PPA operational storage at `recovery-preservation/<stage-id>/`. The preservation copy is streamed, fsynced, independently re-hashed, compared to the exact suspect SHA bound to the reviewed proposal, and source/donor are re-attested again before the catalogue checkpoint commits.
+
+The target is never replaced, renamed, moved, deleted, metadata-rewritten, or timestamp-repaired. Donor bytes are not copied in Phase 14.0. Missing targets create an audited `target_missing_no_preservation_required` checkpoint instead of fabricating preservation evidence. Migration 033 adds immutable `archive_recovery_preservation_stages`; successful stages are one-shot per frozen proposal. The dedicated preservation tree is protected from ordinary user-directed exports.
+
+CLI:
+
+```text
+python -m ppa.cli recovery-stage-preservation <proposal-id>
+python -m ppa.cli recovery-stage-preservation <proposal-id> --apply
+python -m ppa.cli recovery-stage-preservation <proposal-id> --apply --note "preserve suspect bytes"
+python -m ppa.cli recovery-stage-preservation <proposal-id> --apply --json preservation-result.json
+```
+
+Without `--apply`, the command is read-only and only shows readiness/evidence. With `--apply`, it may write the verified suspect-byte preservation copy to PPA operational storage, but it still has `target_replacement_authorized=false`, `donor_materialization_authorized=false`, and `recovery execution authorized=false`. See `docs/PHASE14_0_RECOVERY_PRESERVATION.md`.
+
+## Phase 14.1 — Verified Donor Materialization
+
+Phase 14.1 appends the next recovery evidence layer without crossing the source-target write boundary. A committed Phase-14 preservation stage can now materialize the freshly re-attested expected donor bytes into the same protected operational stage as `expected-donor.<ext>`, with an independently hashed donor manifest and immutable migration-034 checkpoint. The Phase-13 proposal, human recovery intent, Phase-14 preservation evidence, donor physical bytes, and target physical state are all revalidated before and again around commit. The original donor is never modified and the target is never created/replaced; all Phase-14.1 plans/results retain `target_replacement_performed=false` and `recovery_execution_authorized=false`. See `docs/PHASE14_1_VERIFIED_DONOR_MATERIALIZATION.md`.
