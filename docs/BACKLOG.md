@@ -3,12 +3,15 @@
 Recorded from adversarial review at Archive Core Hardening sign-off (3.2.4).
 None block Phase 6; they belong to later phases (forensics / Backup & Archive Health).
 
-## 1. Ambiguous restoration among identical missing copies
-If two byte-identical Files of one Photo both go missing and one reappears, the
-hash proves the *content* returned but not *which* physical File it was. Today we
-restore one arbitrarily. Better: model as `REAPPEARED — AMBIGUOUS ORIGIN`, or
-create a new File under the same Photo and leave both originals missing —
-"don't invent certainty." No evidence is lost either way.
+## 1. Ambiguous restoration among identical missing copies — CLOSED in Phase 12.2
+Phase 12.2 no longer chooses one same-hash historical File by catalogue order.
+When multiple absent-path candidates can explain a newly observed path, PPA
+catalogues the observed object as a new File, preserves every candidate, and
+records the complete ambiguity set in the append-only `file_origin_ambiguities`
+ledger. Same-path restoration and a genuinely unique historical candidate retain
+their existing deterministic behaviour. Filesystem object IDs are not used as
+historical authority across absence because inode/file-index values may be reused.
+See `docs/PHASE12_2_AMBIGUOUS_RESTORATION.md`.
 
 ## 2. Hard links look like independent duplicate copies — CLOSED in Phase 12.1
 Phase 12.1 captures current filesystem device/object identity during normal scans
@@ -17,8 +20,12 @@ object. Distinct filesystem objects and distinct device IDs are reported
 separately, while the UI/CLI still refuse to call either proof of independent
 physical backup hardware. See `docs/PHASE12_1_STORAGE_IDENTITY.md`.
 
-## 3. Thumbnail vs current-bytes after a hash mismatch
-After a verified `hash_mismatch`, the cached thumbnail still shows the trusted
-(catalogued) image while the on-disk bytes differ. Health is clearly flagged, so
-this isn't silently misleading, but a reconciliation UI could explicitly show
-"expected/catalogued image" vs "current untrusted bytes" — a useful forensic view.
+## 3. Thumbnail vs current-bytes after a hash mismatch — CLOSED in Phase 12.3
+Phase 12.3 adds an explicit read-only expected/catalogued-vs-current forensic
+comparison. Known mismatches cannot generate a new browsing derivative under the
+trusted catalogue SHA, forensic expected derivatives require tamper-checkable
+`ppa-thumbnail-attestation/1` provenance, legacy cache entries are labelled
+unattested, and a separate current-byte derivative is keyed to the freshly
+observed SHA. Migration 029 records structured Verify mismatch observations so no
+forensic tool parses event prose for hash evidence. See
+`docs/PHASE12_3_HASH_MISMATCH_FORENSICS.md`.

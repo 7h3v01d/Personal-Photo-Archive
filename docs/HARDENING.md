@@ -644,3 +644,40 @@ tells the same truth as the persistence layer at the point of human review.
 
 Tests: evidence-stale confirmed shows STALE; stale proposal offers Refresh not
 Confirm and becomes confirmable after refresh.
+
+
+## Phase 12.3 — hash-mismatch derivative trust boundary
+
+The deferred thumbnail/current-bytes adversarial item is closed. A File already
+flagged `hash_mismatch` cannot create a new ordinary thumbnail under its trusted
+catalogue SHA. Forensic derivatives use source-hash revalidation plus a
+tamper-checkable `ppa-thumbnail-attestation/1` sidecar, and legacy cache files are
+never silently promoted to trusted evidence. Verify also appends structured
+`integrity_mismatch_observations` (migration 029). The investigation UI remains
+read-only with respect to source files and catalogue authority.
+
+Tests: `tests/test_mismatch_investigation.py`, `tests/test_thumbnails.py`,
+`tests/test_integrity.py`.
+
+
+## Phase 12.4.1 — verified-current identity authority (P1 fix, schema v31)
+
+The post-12.4 adversarial pass reproduced false exact-copy validation plus actual
+false logical-Photo merge/split operations after Verify had already proved that a
+File's current bytes differed from its trusted revision. Root cause: older Phase-10
+logic used the `files.sha256` expected-revision mirror as current-byte evidence.
+
+- `ppa.current_identity` now defines one fail-closed verified-current SHA
+  projection (present + healthy + coherent, unsuperseded current FileRevision).
+- Duplicate/divergence, competing identity, merge, split, recovery, lineage and
+  identity-health paths use verified-current identity rather than raw expected SHA.
+- Merge/split/recovery plans bind health, presence, expected SHA, verified-current
+  SHA and current revision; execution re-proves them under reserved transactions.
+- Scanner excludes unhealthy present Files from its positive duplicate index and
+  never clears a known mismatch when expected bytes reappear; Verify reconciles it.
+- Archive Health schema `/4` uses the same current-byte semantics.
+- Migration 031 adds unique, required, immutable `decision_id` values so one
+  reviewed mismatch-resolution plan cannot append duplicate forensic outcomes.
+
+Permanent regressions: `tests/test_verified_current_identity.py` plus the Phase-10,
+scanner, archive-health and mismatch-resolution suites.
