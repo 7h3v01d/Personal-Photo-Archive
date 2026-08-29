@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl, Slot
+from PySide6.QtCore import QModelIndex, QSize, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -64,6 +64,12 @@ from ppa.ui.workers import (
     OrganizationDiscoveryHomeWorker,
     OrganizationHealthWorker,
     ArchiveHealthWorker,
+    MismatchInvestigationWorker,
+    MismatchResolutionWorker,
+    RecoveryPlanningWorker,
+    RecoveryProposalWorker,
+    RecoveryPreservationWorker,
+    RecoveryDonorMaterializationWorker,
     OrganizationSuggestionsWorker,
     OrganizationActivityWorker,
     OrganizationReportWorker,
@@ -92,6 +98,8 @@ def _human_bytes(n: int) -> str:
 
 class InspectorPanel(QScrollArea):
     """Right-hand panel showing everything the catalogue knows about one file."""
+
+    investigate_mismatch_requested = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -201,6 +209,15 @@ class InspectorPanel(QScrollArea):
         self._field("status", d.status, theme.status_colour(d.status))
         if d.health_status and d.health_status != "ok":
             self._field("health", d.health_status, theme.RED)
+        if d.health_status == "hash_mismatch":
+            investigate = QPushButton("Investigate hash mismatch…")
+            investigate.setToolTip(
+                "Compare the expected FileRevision image with the current untrusted on-disk bytes."
+            )
+            investigate.clicked.connect(
+                lambda _checked=False, fid=d.file_id: self.investigate_mismatch_requested.emit(fid)
+            )
+            self._layout.addWidget(investigate)
 
         self._header("FILE")
         self._field("path", d.path)
@@ -670,6 +687,7 @@ class MainWindow(QMainWindow):
         # Inspector
         self._inspector = InspectorPanel()
         self._inspector.setMinimumWidth(300)
+        self._inspector.investigate_mismatch_requested.connect(self._on_investigate_mismatch)
         splitter.addWidget(self._inspector)
 
         splitter.setStretchFactor(0, 0)
@@ -1038,7 +1056,7 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith('.zip'): path += '.zip'
         if self._busy: return
         self._set_busy(True); self._status.showMessage("Organisation Report: building sanitized export…")
-        worker=OrganizationReportWorker(self._config.db_path, library_id, Path(path)); self._org_report_worker=worker
+        worker=OrganizationReportWorker(self._config.db_path, library_id, Path(path), config=self._config); self._org_report_worker=worker
         worker.finished.connect(self._on_organization_report_ready, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._on_organization_report_failed, Qt.ConnectionType.QueuedConnection)
         self._registry.start(worker)
@@ -1705,6 +1723,235 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._warn(f"Archive Health failed: {message}")
         self._status.showMessage("Archive Health failed.")
+
+    @Slot(str)
+    def _on_investigate_mismatch(self, file_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Building hash-mismatch forensic comparison…")
+        worker = MismatchInvestigationWorker(
+            self._config.db_path, file_id, self._cache_dir
+        )
+        worker.finished.connect(
+            self._on_mismatch_investigation_ready, Qt.ConnectionType.QueuedConnection
+        )
+        worker.failed.connect(
+            self._on_mismatch_investigation_failed, Qt.ConnectionType.QueuedConnection
+        )
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_mismatch_investigation_ready(self, investigation) -> None:
+        self._set_busy(False)
+        from ppa.ui.mismatch_investigation_dialog import MismatchInvestigationDialog
+        dialog = MismatchInvestigationDialog(investigation, self)
+        dialog.resolution_requested.connect(
+            lambda action, note, inv=investigation: self._on_mismatch_resolution_requested(inv, action, note)
+        )
+        dialog.recovery_planning_requested.connect(self._on_recovery_planning_requested)
+        dialog.show()
+        self._mismatch_investigation_dialog = dialog
+        self._status.showMessage(
+            "Mismatch investigation ready — current bytes "
+            + investigation.current_state.replace("_", " ")
+            + "."
+        )
+
+    @Slot(str)
+    def _on_mismatch_investigation_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Hash mismatch investigation failed: {message}")
+        self._status.showMessage("Hash mismatch investigation failed.")
+
+    @Slot(str)
+    def _on_recovery_planning_requested(self, file_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Recovery Planning: physically qualifying donor copies…")
+        worker = RecoveryPlanningWorker(self._config.db_path, file_id)
+        worker.finished.connect(self._on_recovery_planning_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_planning_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_planning_ready(self, bundle) -> None:
+        self._set_busy(False)
+        from ppa.ui.recovery_planning_dialog import RecoveryPlanningDialog
+        view, plan = bundle
+        dialog = RecoveryPlanningDialog(view, plan, self)
+        dialog.proposal_requested.connect(self._on_recovery_proposal_requested)
+        dialog.show()
+        self._recovery_planning_dialog = dialog
+        self._status.showMessage(
+            f"Recovery Planning ready — {len(view.qualified_candidates)} qualified donor(s); "
+            "dry-run only."
+        )
+
+    @Slot(str)
+    def _on_recovery_planning_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery planning failed: {message}")
+        self._status.showMessage("Recovery planning failed closed; no source file was changed.")
+
+    def _on_recovery_proposal_requested(self, plan, note: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Revalidating and recording dry-run recovery proposal…")
+        worker = RecoveryProposalWorker(self._config.db_path, plan, note or None)
+        worker.finished.connect(self._on_recovery_proposal_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_proposal_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_proposal_done(self, result) -> None:
+        self._set_busy(False)
+        self._status.showMessage(
+            f"Recovery proposal {result.proposal_id} recorded — proposed but NOT executed."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Stage suspect bytes for recovery?",
+            "Phase 14.0 can now preserve the currently suspect target bytes into PPA's "
+            "operational recovery-preservation store.\n\n"
+            "This WILL write a separate preservation copy outside the source Library, but it "
+            "WILL NOT replace, rename, move, delete, or otherwise modify the source photograph, "
+            "and donor bytes will not be copied.\n\n"
+            "Stage preservation now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._on_recovery_preservation_requested(result.proposal_id)
+
+    def _on_recovery_preservation_requested(self, proposal_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Revalidating recovery proposal and staging suspect-byte preservation…")
+        worker = RecoveryPreservationWorker(self._config.db_path, proposal_id)
+        worker.finished.connect(self._on_recovery_preservation_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_preservation_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_preservation_done(self, result) -> None:
+        self._set_busy(False)
+        if result.preservation_path:
+            self._status.showMessage(
+                f"Suspect bytes preserved for recovery stage {result.stage_id}; source target was NOT replaced."
+            )
+            QMessageBox.information(
+                self,
+                "Recovery preservation staged",
+                f"Suspect target bytes were preserved and verified.\n\n"
+                f"Preservation: {result.preservation_path}\n"
+                f"SHA-256: {result.preserved_sha256}\n\n"
+                "The source target was not replaced and donor bytes were not materialized.",
+            )
+        else:
+            self._status.showMessage(
+                f"Recovery stage {result.stage_id} recorded: target is missing, so no suspect bytes existed to preserve."
+            )
+            QMessageBox.information(
+                self,
+                "Recovery preservation staged",
+                "The target remains missing, so there were no suspect target bytes to preserve. "
+                "The recovery checkpoint was recorded; no source or donor bytes were written.",
+            )
+
+        answer = QMessageBox.question(
+            self,
+            "Materialize verified donor?",
+            "Phase 14.1 can now copy the freshly re-attested expected donor bytes into the "
+            "same protected operational recovery stage.\n\n"
+            "This WILL create a separate verified donor copy in PPA operational storage. "
+            "It WILL NOT replace, create, rename, move, delete, or otherwise modify the source target, "
+            "and it will not modify the original donor.\n\n"
+            "Materialize the verified donor now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._on_recovery_donor_materialization_requested(result.stage_id)
+
+    def _on_recovery_donor_materialization_requested(self, stage_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Revalidating and materializing verified donor bytes into protected staging…")
+        worker = RecoveryDonorMaterializationWorker(self._config.db_path, stage_id)
+        worker.finished.connect(self._on_recovery_donor_materialization_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_donor_materialization_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_donor_materialization_done(self, result) -> None:
+        self._set_busy(False)
+        self._status.showMessage(
+            f"Verified donor materialized for recovery stage {result.stage_id}; source target was NOT replaced."
+        )
+        QMessageBox.information(
+            self,
+            "Verified donor materialized",
+            f"Expected donor bytes were copied into protected PPA operational storage and verified.\n\n"
+            f"Materialized donor: {result.donor_materialization_path}\n"
+            f"SHA-256: {result.donor_materialized_sha256}\n\n"
+            "The original donor was not modified and the source target was not replaced.",
+        )
+
+    @Slot(str)
+    def _on_recovery_donor_materialization_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery donor materialization failed: {message}")
+        self._status.showMessage("Donor materialization failed closed; source target and donor were not modified.")
+
+    @Slot(str)
+    def _on_recovery_preservation_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery preservation staging failed: {message}")
+        self._status.showMessage("Recovery preservation failed closed; source and donor were not modified.")
+
+    @Slot(str)
+    def _on_recovery_proposal_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery proposal was not recorded: {message}")
+        self._status.showMessage("Recovery proposal aborted; evidence changed or was not eligible.")
+
+    def _on_mismatch_resolution_requested(self, investigation, action: str, note: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Revalidating and recording hash-mismatch resolution…")
+        worker = MismatchResolutionWorker(
+            self._config.db_path, investigation, action, note or None
+        )
+        worker.finished.connect(
+            self._on_mismatch_resolution_done, Qt.ConnectionType.QueuedConnection
+        )
+        worker.failed.connect(
+            self._on_mismatch_resolution_failed, Qt.ConnectionType.QueuedConnection
+        )
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_mismatch_resolution_done(self, result) -> None:
+        self._set_busy(False)
+        self.refresh()
+        labels = {
+            "adopt_current_revision": "Current bytes adopted as a new immutable revision.",
+            "retain_expected_recovery_needed": "Expected revision retained; recovery remains needed.",
+            "reviewed_unresolved": "Mismatch review recorded as unresolved.",
+        }
+        self._status.showMessage(labels.get(result.action, "Mismatch resolution recorded."))
+
+    @Slot(str)
+    def _on_mismatch_resolution_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Mismatch resolution was not applied: {message}")
+        self._status.showMessage("Mismatch resolution aborted; review evidence changed or was not eligible.")
 
     def _on_verify(self) -> None:
         if self._busy:

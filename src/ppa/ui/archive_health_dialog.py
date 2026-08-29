@@ -1,4 +1,4 @@
-"""Phase 12.1 — Backup & Archive Health desktop summary."""
+"""Phase 12.2 — Backup & Archive Health desktop summary."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -60,6 +60,7 @@ class ArchiveHealthDialog(QDialog):
             ('Exact sets with hard-link path inflation', health.hardlink_overstated_count, 'hardlinks'),
             ('Exact sets spanning distinct filesystem objects', health.distinct_file_object_count, 'distinct_objects'),
             ('Exact sets spanning distinct filesystem device IDs', health.distinct_device_count, 'distinct_devices'),
+            ('Recorded ambiguous File origins', health.ambiguous_origin_count, 'ambiguous_origin'),
         ]
         for r, (label, count, category) in enumerate(rows):
             grid.addWidget(QLabel(label), r, 0)

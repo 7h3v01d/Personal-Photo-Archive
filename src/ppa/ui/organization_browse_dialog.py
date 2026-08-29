@@ -86,10 +86,10 @@ class OrganizationBrowseDialog(QDialog):
         self._grid.selectionModel().selectionChanged.connect(lambda *_: self._update_open())
         self._render_page()
 
-    def _grid_item(self, item) -> GridItem:
+    def _grid_item(self, item, health_status: str = "unknown") -> GridItem:
         return GridItem(item.file_id, item.photo_id, item.filename, item.path,
                         item.sha256, item.status, item.width_px, item.height_px,
-                        item.size_bytes, item.copy_count)
+                        item.size_bytes, item.copy_count, health_status)
 
     def _apply_filter(self, text: str) -> None:
         self._filtered = self._view.filtered(text)
@@ -99,7 +99,16 @@ class OrganizationBrowseDialog(QDialog):
     def _render_page(self) -> None:
         page = page_items(self._filtered, page=self._page, page_size=self._page_size)
         self._page = page.page
-        self._model.set_items([self._grid_item(i) for i in page.items])
+        ids = [i.file_id for i in page.items]
+        health_by_id = {}
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            health_by_id = {r["id"]: r["health_status"] for r in self._conn.execute(
+                f"SELECT id, health_status FROM files WHERE id IN ({marks})", ids
+            ).fetchall()}
+        self._model.set_items([
+            self._grid_item(i, health_by_id.get(i.file_id, "unknown")) for i in page.items
+        ])
         self._summary.setText(
             f"{len(self._filtered)} of {self._view.total_members} logical photos · "
             f"{self._view.present_members} present · {self._view.missing_only_members} missing-only")

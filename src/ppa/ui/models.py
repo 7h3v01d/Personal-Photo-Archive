@@ -28,7 +28,7 @@ def _placeholder(status: str) -> QPixmap:
 
 
 class PhotoGridModel(QAbstractListModel):
-    request_thumbnail = Signal(str, str, str)  # file_id, path, sha256 ("" if none)
+    request_thumbnail = Signal(str, str, str, bool)  # file_id, path, sha256, allow_generate
 
     def __init__(self) -> None:
         super().__init__()
@@ -73,7 +73,10 @@ class PhotoGridModel(QAbstractListModel):
                 return pm
             if item.file_id not in self._requested and item.status != "missing":
                 self._requested.add(item.file_id)
-                self.request_thumbnail.emit(item.file_id, item.path, item.sha256 or "")
+                self.request_thumbnail.emit(
+                    item.file_id, item.path, item.sha256 or "",
+                    item.health_status != "hash_mismatch",
+                )
             return _placeholder(item.status)
 
         if role == Qt.DisplayRole:

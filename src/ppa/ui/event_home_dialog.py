@@ -25,7 +25,7 @@ _COVER_ID_ROLE = Qt.ItemDataRole.UserRole + 1
 
 class EventHomeDialog(QDialog):
     """Read-only visual index into durable human Event stories."""
-    thumbnail_request = Signal(str, str, str)
+    thumbnail_request = Signal(str, str, str, bool)
     _PAGE_SIZE = 30
 
     def __init__(self, conn, timeline_view, home: EventHomeView, search_index: EventSearchIndex, health_view: EventHealthView, parent=None, *, cache_dir: Path | None = None) -> None:
@@ -237,7 +237,10 @@ class EventHomeDialog(QDialog):
         for fid in cover_ids:
             grid = by_id.get(fid)
             if grid is not None:
-                self.thumbnail_request.emit(grid.file_id, grid.path, grid.sha256 or "")
+                self.thumbnail_request.emit(
+                    grid.file_id, grid.path, grid.sha256 or "",
+                    grid.health_status != "hash_mismatch",
+                )
 
         self._page_label.setText(
             f"{page.start_index + 1 if page.total_items else 0}–{page.end_index} of {page.total_items} · page {page.page + 1}/{page.total_pages}")

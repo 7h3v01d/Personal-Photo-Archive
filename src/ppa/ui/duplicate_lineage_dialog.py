@@ -593,7 +593,7 @@ class DuplicateLineageDialog(QDialog):
         self.identity_health_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.identity_health_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.identity_health_table.horizontalHeader().setStretchLastSection(True)
-        labels={0:"P0",1:"P1",2:"P2",3:"P3",4:"INFO"}
+        labels={0:"P0",1:"P1",2:"P2",3:"P3",4:"P4",5:"INFO"}
         items=self._health.items
         self.identity_health_table.setRowCount(len(items))
         for row,item in enumerate(items):
@@ -614,6 +614,7 @@ class DuplicateLineageDialog(QDialog):
         self.investigate_competing_btn.clicked.connect(self._investigate_competing_identity)
         actions.addWidget(self.investigate_competing_btn); actions.addStretch(1); lay.addLayout(actions)
         summary=QLabel(
+            f"{self._health.integrity_resolution_required_count} integrity-blocked · "
             f"{self._health.competing_identity_count} competing identity · "
             f"{self._health.divergence_count} divergence · "
             f"{self._health.recoverable_split_count} recoverable split · "
@@ -626,12 +627,12 @@ class DuplicateLineageDialog(QDialog):
     def _investigate_competing_identity(self) -> None:
         rows = self.identity_health_table.selectionModel().selectedRows() if self.identity_health_table.selectionModel() else []
         if not rows:
-            QMessageBox.information(self, "Competing Identity Investigation", "Select one P0 Competing Identity row first.")
+            QMessageBox.information(self, "Competing Identity Investigation", "Select one P1 Competing Identity row first.")
             return
         cell = self.identity_health_table.item(rows[0].row(), 0)
         sha = cell.data(_SHA_ROLE) if cell else None
         if not sha:
-            QMessageBox.information(self, "Competing Identity Investigation", "The selected health item is not a P0 competing-identity case.")
+            QMessageBox.information(self, "Competing Identity Investigation", "The selected health item is not a P1 competing-identity case.")
             return
         try:
             investigation = investigate_competing_identity(self._conn, library_id=self._library_id, sha256=sha)

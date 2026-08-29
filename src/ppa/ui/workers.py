@@ -329,7 +329,7 @@ class BatchConfirmWorker(QObject):
 class ThumbnailWorker(QObject):
     """Long-lived worker that services thumbnail requests off a queue.
 
-    request(file_id, path, sha256) is a queued slot; as each thumbnail is
+    request(file_id, path, sha256[, allow_generate]) is a queued slot; as each thumbnail is
     rendered (via the disk-cached ThumbnailCache) it emits ready(file_id,
     QImage). QImage is safe to build off the GUI thread; the receiver turns
     it into a QPixmap on the GUI side.
@@ -342,14 +342,48 @@ class ThumbnailWorker(QObject):
         self._cache = ThumbnailCache(cache_dir, size=size)
 
     @Slot(str, str, str)
-    def request(self, file_id: str, path: str, sha256: str) -> None:
+    @Slot(str, str, str, bool)
+    def request(self, file_id: str, path: str, sha256: str, allow_generate: bool = True) -> None:
         sha = sha256 or None
-        out = self._cache.get_or_create(Path(path), sha)
+        # A verified hash mismatch must never create a new derivative under the
+        # trusted catalogue SHA key. Existing legacy cache entries may still be
+        # shown for ordinary browsing, but Phase 12.3 forensic views will not
+        # call them trusted unless an attestation exists.
+        out = (self._cache.get_or_create(Path(path), sha) if allow_generate
+               else self._cache.cached_path_only(Path(path), sha))
         if out is None:
             return
         img = QImage(str(out))
         if not img.isNull():
             self.ready.emit(file_id, img)
+
+
+class RecoveryDonorMaterializationWorker(QObject):
+    """Execute one explicit Phase-14.1 verified donor materialization off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, stage_id: str, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._stage_id = stage_id
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_donor_materialization import (
+                build_donor_materialization_plan, execute_donor_materialization,
+            )
+            conn = connect(self._db_path)
+            plan = build_donor_materialization_plan(conn, stage_id=self._stage_id)
+            self.finished.emit(execute_donor_materialization(conn, plan, note=self._note))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 class OrganizationSuggestionsWorker(QObject):
@@ -461,7 +495,7 @@ class OrganizationSuggestionRestoreWorker(QObject):
 
 
 class ArchiveHealthWorker(QObject):
-    """Build Phase-12.1 Backup & Archive Health off-thread."""
+    """Build Phase-12.2 Backup & Archive Health off-thread."""
     finished = Signal(object)
     failed = Signal(str)
     def __init__(self, db_path: Path, library_id: int) -> None:
@@ -478,8 +512,75 @@ class ArchiveHealthWorker(QObject):
             if conn is not None: conn.close()
 
 
+class MismatchInvestigationWorker(QObject):
+    """Build one Phase-12.3 hash-mismatch forensic comparison off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, file_id: str, thumbnail_cache_dir: Path) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._file_id = file_id
+        self._thumbnail_cache_dir = thumbnail_cache_dir
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.mismatch_investigation import build_mismatch_investigation
+            conn = connect(self._db_path)
+            result = build_mismatch_investigation(
+                conn,
+                self._file_id,
+                thumbnail_cache_dir=self._thumbnail_cache_dir,
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class MismatchResolutionWorker(QObject):
+    """Execute one Phase-12.4 mismatch disposition off-thread after revalidation."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, investigation, action: str, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._investigation = investigation
+        self._action = action
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.mismatch_resolution import plan_mismatch_resolution, execute_mismatch_resolution
+            conn = connect(self._db_path)
+            inv = self._investigation
+            plan = plan_mismatch_resolution(
+                conn,
+                file_id=inv.file_id,
+                action=self._action,
+                reviewed_expected_revision_id=inv.expected_revision_id,
+                reviewed_expected_sha256=inv.expected_sha256,
+                reviewed_current_state=inv.current_state,
+                reviewed_current_sha256=inv.current_observed_sha256,
+                reviewed_observation_id=inv.verify_observation_id,
+            )
+            self.finished.emit(execute_mismatch_resolution(conn, plan, note=self._note))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 class ArchiveHealthBrowseWorker(QObject):
-    """Build one read-only Phase-12.1 health-category browser off-thread."""
+    """Build one read-only Phase-12.2 health-category browser off-thread."""
     finished = Signal(object)
     failed = Signal(str)
     def __init__(self, db_path: Path, health, category: str) -> None:
@@ -836,7 +937,7 @@ class PilotSessionWorker(QObject):
                     cancel_cb=self._cancel.is_set)
                 if self._cancel.is_set():
                     self.cancelled.emit(); return
-                save_pilot_session(session, self._session_path)
+                save_pilot_session(session, self._session_path, conn=conn)
                 self.finished.emit(session, session.baseline)
                 return
 
@@ -861,7 +962,7 @@ class PilotSessionWorker(QObject):
                     progress_cb=self.progress.emit, cancel_cb=self._cancel.is_set)
                 if self._cancel.is_set():
                     self.cancelled.emit(); return
-                save_pilot_session(updated, self._session_path)
+                save_pilot_session(updated, self._session_path, conn=conn)
                 self.finished.emit(updated, updated.checkpoints[-1].snapshot)
                 return
             if op == "close":
@@ -870,7 +971,7 @@ class PilotSessionWorker(QObject):
                     cancel_cb=self._cancel.is_set)
                 if self._cancel.is_set():
                     self.cancelled.emit(); return
-                save_pilot_session(updated, self._session_path)
+                save_pilot_session(updated, self._session_path, conn=conn)
                 self.finished.emit(updated, updated.final)
                 return
             raise ValueError(f"unknown pilot-session operation: {op}")
@@ -988,15 +1089,15 @@ class OrganizationReportWorker(QObject):
     """Export one sanitized Phase-9.12 organisation report ZIP off-thread."""
     finished = Signal(object)
     failed = Signal(str)
-    def __init__(self, db_path: Path, library_id: int, output_path: Path) -> None:
-        super().__init__(); self._db_path=Path(db_path); self._library_id=library_id; self._output_path=Path(output_path)
+    def __init__(self, db_path: Path, library_id: int, output_path: Path, config=None) -> None:
+        super().__init__(); self._db_path=Path(db_path); self._library_id=library_id; self._output_path=Path(output_path); self._config=config
     @Slot()
     def run(self) -> None:
         conn=None
         try:
             from ppa.organization_report import export_organization_report_zip
             conn=connect(self._db_path)
-            self.finished.emit(export_organization_report_zip(conn,library_id=self._library_id,output_path=self._output_path))
+            self.finished.emit(export_organization_report_zip(conn,library_id=self._library_id,output_path=self._output_path,config=self._config))
         except Exception as exc: self.failed.emit(str(exc))
         finally:
             if conn is not None: conn.close()
@@ -1023,6 +1124,91 @@ class DuplicateLineageReviewWorker(QObject):
                 build_duplicate_identity(conn, library_id=self._library_id),
                 build_identity_health(conn, library_id=self._library_id),
             ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryPlanningWorker(QObject):
+    """Build Phase-13.0 donor qualification and preferred dry-run plan off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, file_id: str) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._file_id = file_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_planning import build_recovery_plan, build_recovery_planning_view
+            conn = connect(self._db_path)
+            view = build_recovery_planning_view(conn, file_id=self._file_id)
+            plan = None
+            if view.preferred_donor_file_id is not None:
+                plan = build_recovery_plan(
+                    conn,
+                    file_id=self._file_id,
+                    donor_file_id=view.preferred_donor_file_id,
+                )
+            self.finished.emit((view, plan))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryProposalWorker(QObject):
+    """Record one Phase-13.0 dry-run proposal after fresh evidence revalidation."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, plan, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._plan = plan
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_planning import record_recovery_plan_proposal
+            conn = connect(self._db_path)
+            self.finished.emit(
+                record_recovery_plan_proposal(conn, self._plan, note=self._note)
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryPreservationWorker(QObject):
+    """Execute one explicit Phase-14.0 suspect-byte preservation stage off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, proposal_id: str, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._proposal_id = proposal_id
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_preservation import build_preservation_plan, execute_preservation_stage
+            conn = connect(self._db_path)
+            plan = build_preservation_plan(conn, proposal_id=self._proposal_id)
+            self.finished.emit(execute_preservation_stage(conn, plan, note=self._note))
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
