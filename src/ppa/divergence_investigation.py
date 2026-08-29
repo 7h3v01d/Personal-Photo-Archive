@@ -10,7 +10,9 @@ import json
 from dataclasses import dataclass
 from sqlite3 import Connection
 
-DIVERGENCE_INVESTIGATION_SCHEMA = "ppa-identity-divergence-investigation/1"
+from ppa.current_identity import verified_current_sha256_sql
+
+DIVERGENCE_INVESTIGATION_SCHEMA = "ppa-identity-divergence-investigation/2"
 MODIFIED_IN_PLACE = "modified_in_place"
 DISTINCT_WHEN_FIRST_OBSERVED = "distinct_when_first_observed"
 INSUFFICIENT_EVIDENCE = "insufficient_evidence"
@@ -37,6 +39,7 @@ class DivergentFileEvidence:
     health_status: str
     first_seen_at: str
     last_seen_at: str
+    expected_sha256: str | None
     current_sha256: str | None
     current_revision_id: str | None
     revisions: tuple[RevisionObservation, ...]
@@ -75,6 +78,8 @@ class DivergenceInvestigation:
                     "health_status": f.health_status,
                     "first_seen_at": f.first_seen_at,
                     "last_seen_at": f.last_seen_at,
+                    "expected_sha256": f.expected_sha256,
+                    "verified_current_sha256": f.current_sha256,
                     "current_sha256": f.current_sha256,
                     "current_revision_id": f.current_revision_id,
                     "modified_in_place": f.modified_in_place,
@@ -92,14 +97,19 @@ def investigate_identity_divergence(conn: Connection, *, library_id: int, photo_
     before = conn.total_changes
     if conn.execute("SELECT 1 FROM libraries WHERE id=?", (library_id,)).fetchone() is None:
         raise ValueError(f"unknown library {library_id}")
+    verified_expr = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        """SELECT id,filename,path,presence_status,health_status,first_seen_at,last_seen_at,
-                  sha256,current_revision_id
-             FROM files WHERE library_id=? AND photo_id=?
-            ORDER BY first_seen_at,filename COLLATE NOCASE,id""", (library_id, photo_id)).fetchall()
+        f"""SELECT f.id,f.filename,f.path,f.presence_status,f.health_status,
+                   f.first_seen_at,f.last_seen_at,f.sha256 AS expected_sha256,
+                   f.current_revision_id,{verified_expr} AS verified_current_sha256
+              FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.library_id=? AND f.photo_id=?
+             ORDER BY f.first_seen_at,f.filename COLLATE NOCASE,f.id""",
+        (library_id, photo_id)).fetchall()
     if not rows:
         raise ValueError("logical Photo is not represented in this Library")
-    current_hashes = {r["sha256"] for r in rows if r["sha256"]}
+    current_hashes = {r["verified_current_sha256"] for r in rows if r["verified_current_sha256"]}
     if len(current_hashes) < 2:
         raise ValueError("logical Photo does not currently have a known hash divergence")
 
@@ -119,7 +129,8 @@ def investigate_identity_divergence(conn: Connection, *, library_id: int, photo_
 
     files = tuple(DivergentFileEvidence(
         r["id"], r["filename"], r["path"], r["presence_status"], r["health_status"],
-        r["first_seen_at"], r["last_seen_at"], r["sha256"], r["current_revision_id"],
+        r["first_seen_at"], r["last_seen_at"], r["expected_sha256"],
+        r["verified_current_sha256"], r["current_revision_id"],
         tuple(by_file[r["id"]])) for r in rows)
 
     changed = [f for f in files if f.modified_in_place]

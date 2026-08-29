@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from sqlite3 import Connection
 
 from ppa.competing_identity import investigate_competing_identity
+from ppa.current_identity import verified_current_sha256_sql
+from ppa.physical_observation import require_expected_physical_bytes
 
-IDENTITY_MERGE_PLAN_SCHEMA = "ppa-identity-merge-plan/1"
+IDENTITY_MERGE_PLAN_SCHEMA = "ppa-identity-merge-plan/3"
 
 
 def _now() -> str:
@@ -29,9 +31,12 @@ class IdentityMergeFile:
     photo_id: str
     library_id: int
     filename: str
+    path: str
     sha256: str | None
+    expected_sha256: str | None
     current_revision_id: str | None
     presence_status: str
+    health_status: str
 
 
 @dataclass(frozen=True)
@@ -74,9 +79,16 @@ class IdentityMergeResult:
 
 
 def _file_state_rows(conn: Connection, photo_ids: tuple[str, str]):
+    verified_expr = verified_current_sha256_sql("f", "r")
     return conn.execute(
-        "SELECT id,photo_id,library_id,filename,sha256,current_revision_id,presence_status "
-        "FROM files WHERE photo_id IN (?,?) ORDER BY photo_id,library_id,filename COLLATE NOCASE,id",
+        f"""SELECT f.id,f.photo_id,f.library_id,f.filename,f.path,
+                   f.sha256 AS expected_sha256,f.current_revision_id,
+                   f.presence_status,f.health_status,
+                   {verified_expr} AS verified_current_sha256
+              FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.photo_id IN (?,?)
+             ORDER BY f.photo_id,f.library_id,f.filename COLLATE NOCASE,f.id""",
         photo_ids,
     ).fetchall()
 
@@ -90,8 +102,12 @@ def _fingerprint(*, library_id: int, sha256: str, survivor: str, retired: str, r
         "files": [
             {
                 "id": r["id"], "photo_id": r["photo_id"], "library_id": int(r["library_id"]),
-                "sha256": r["sha256"], "current_revision_id": r["current_revision_id"],
+                "path": r["path"],
+                "expected_sha256": r["expected_sha256"],
+                "verified_current_sha256": r["verified_current_sha256"],
+                "current_revision_id": r["current_revision_id"],
                 "presence_status": r["presence_status"],
+                "health_status": r["health_status"],
             }
             for r in rows
         ],
@@ -115,15 +131,16 @@ def plan_identity_merge(conn: Connection, *, library_id: int, sha256: str,
         raise ValueError("competing logical Photos no longer have physical Files")
     if any(int(r["library_id"]) != int(library_id) for r in rows):
         raise ValueError("controlled merge requires both logical Photos to remain confined to the reviewed Library")
-    if any(r["sha256"] != sha256 for r in rows):
-        raise ValueError("controlled merge requires every current File under both identities to have the reviewed SHA-256")
+    if any(r["verified_current_sha256"] != sha256 for r in rows):
+        raise ValueError("controlled merge requires every relevant File to have verified current content matching the reviewed SHA-256")
     moved_rows = [r for r in rows if r["photo_id"] == retired]
     survivor_rows = [r for r in rows if r["photo_id"] == survivor_photo_id]
     if not moved_rows or not survivor_rows:
         raise ValueError("both competing logical Photos must still own at least one physical File")
     def cv(r):
-        return IdentityMergeFile(r["id"], r["photo_id"], int(r["library_id"]), r["filename"],
-                                 r["sha256"], r["current_revision_id"], r["presence_status"])
+        return IdentityMergeFile(r["id"], r["photo_id"], int(r["library_id"]), r["filename"], r["path"],
+                                 r["verified_current_sha256"], r["expected_sha256"],
+                                 r["current_revision_id"], r["presence_status"], r["health_status"])
     return IdentityMergePlan(
         IDENTITY_MERGE_PLAN_SCHEMA, int(library_id), sha256, survivor_photo_id, retired,
         tuple(cv(r) for r in moved_rows), tuple(cv(r) for r in survivor_rows),
@@ -139,12 +156,20 @@ def execute_identity_merge(conn: Connection, plan: IdentityMergePlan, *, note: s
         raise ValueError("identity-merge note is too long")
     try:
         conn.execute("BEGIN IMMEDIATE")
-        fresh = plan_identity_merge(conn, library_id=plan.library_id, sha256=plan.sha256,
-                                    survivor_photo_id=plan.survivor_photo_id)
+        try:
+            fresh = plan_identity_merge(conn, library_id=plan.library_id, sha256=plan.sha256,
+                                        survivor_photo_id=plan.survivor_photo_id)
+        except ValueError as exc:
+            raise ValueError("identity merge plan is stale; refresh the competing-identity investigation and review again") from exc
         if (fresh.evidence_fingerprint != plan.evidence_fingerprint or
                 fresh.retired_photo_id != plan.retired_photo_id or
                 fresh.moved_file_ids != plan.moved_file_ids):
             raise ValueError("identity merge plan is stale; refresh the competing-identity investigation and review again")
+        relevant_files = (*fresh.survivor_files, *fresh.moved_files)
+        attestation_inputs = tuple((f.file_id, f.path, str(f.sha256)) for f in relevant_files if f.sha256)
+        if len(attestation_inputs) != len(relevant_files):
+            raise ValueError("identity merge requires verified current content for every relevant physical File")
+        before_physical = require_expected_physical_bytes(attestation_inputs, context="identity merge")
         placeholders = ",".join("?" for _ in fresh.moved_file_ids)
         cur = conn.execute(
             f"UPDATE files SET photo_id=? WHERE id IN ({placeholders}) AND photo_id=?",
@@ -166,6 +191,9 @@ def execute_identity_merge(conn: Connection, plan: IdentityMergePlan, *, note: s
              fresh.retired_photo_id, json.dumps(list(fresh.moved_file_ids), separators=(",", ":")),
              fresh.evidence_fingerprint, note, now),
         )
+        after_physical = require_expected_physical_bytes(attestation_inputs, context="identity merge")
+        if after_physical != before_physical:
+            raise ValueError("identity merge: physical File changed during execution; run Verify / refresh investigation")
         conn.commit()
     except Exception:
         conn.rollback()

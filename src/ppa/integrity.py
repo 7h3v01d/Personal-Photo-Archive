@@ -205,6 +205,26 @@ def verify_library(
                     "or external edit). Recorded revision left intact for investigation.",
                 ),
             )
+            # Phase 12.3 keeps the machine-readable observation separately from
+            # the human prose event.  Forensic tools must never parse an event
+            # message to recover the bytes Verify actually observed.
+            try:
+                st = path.stat()
+                observed_size = int(st.st_size)
+                observed_mtime_ns = int(st.st_mtime_ns)
+            except OSError:
+                observed_size = None
+                observed_mtime_ns = None
+            conn.execute(
+                "INSERT INTO integrity_mismatch_observations "
+                "(file_id, expected_revision_id, expected_sha256, observed_sha256, "
+                " observed_path, observed_size_bytes, observed_mtime_ns) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"], row["current_revision_id"], stored, actual,
+                    str(path), observed_size, observed_mtime_ns,
+                ),
+            )
             report.mismatches += 1
             report.problems.append((str(path), "hash mismatch"))
 

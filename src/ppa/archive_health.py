@@ -1,4 +1,4 @@
-"""Phase 12.1 — read-only Backup & Archive Health with storage identity.
+"""Phase 12.2 — read-only Backup & Archive Health with origin ambiguity.
 
 Archive Health describes what the PPA catalogue can currently prove about copy
 coverage inside one registered Library.  Phase 12.1 adds filesystem-object
@@ -11,6 +11,9 @@ them from distinct filesystem objects.  It still does *not* call either case an
 "independent backup": distinct filesystem device ids are stronger evidence, but
 are not proof of separate physical hardware or failure domains.
 
+Phase 12.2 also surfaces Files that were catalogued under explicit ambiguous-origin
+evidence rather than being arbitrarily mapped onto one historical missing File.
+
 No source files are opened or modified here.  The model reads only catalogue
 state already established by scanning / verification.
 """
@@ -21,9 +24,10 @@ from dataclasses import asdict, dataclass
 import json
 from sqlite3 import Connection, Row
 
+from ppa.current_identity import verified_current_sha256_sql
 from ppa.organization_browse import OrganizationBrowseView, build_membership_browse
 
-ARCHIVE_HEALTH_SCHEMA = "ppa-archive-health/2"
+ARCHIVE_HEALTH_SCHEMA = "ppa-archive-health/4"
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,7 @@ class ArchiveHealth:
     hardlink_overstated_photo_ids: tuple[str, ...]
     distinct_file_object_photo_ids: tuple[str, ...]
     distinct_device_photo_ids: tuple[str, ...]
+    ambiguous_origin_photo_ids: tuple[str, ...]
 
     @property
     def no_present_count(self) -> int:
@@ -92,6 +97,10 @@ class ArchiveHealth:
         return len(self.distinct_device_photo_ids)
 
     @property
+    def ambiguous_origin_count(self) -> int:
+        return len(self.ambiguous_origin_photo_ids)
+
+    @property
     def attention_photo_ids(self) -> tuple[str, ...]:
         # De-duplicate overlapping indicators while preserving deterministic id
         # ordering. Hard-link inflation and unknown storage identity matter here
@@ -104,6 +113,7 @@ class ArchiveHealth:
         ids.update(self.divergent_photo_ids)
         ids.update(self.exact_storage_unknown_photo_ids)
         ids.update(self.hardlink_overstated_photo_ids)
+        ids.update(self.ambiguous_origin_photo_ids)
         return tuple(sorted(ids))
 
     @property
@@ -125,6 +135,7 @@ class ArchiveHealth:
                 "exact_sets_with_hardlink_path_inflation": self.hardlink_overstated_count,
                 "exact_sets_with_distinct_file_objects": self.distinct_file_object_count,
                 "exact_sets_spanning_distinct_device_ids": self.distinct_device_count,
+                "photos_with_recorded_ambiguous_origin": self.ambiguous_origin_count,
                 "attention_photos": self.attention_count,
             },
             "attention_photo_ids": list(self.attention_photo_ids),
@@ -153,7 +164,7 @@ def build_archive_health(conn: Connection, *, library_id: int) -> ArchiveHealth:
     Semantic boundaries:
 
     * ``multiple_exact_present_photo_ids`` means two or more healthy present
-      Files with one known current SHA-256.
+      Files with one shared *verified-current* SHA-256.
     * ``distinct_file_object_photo_ids`` means the latest scan observed at
       least two distinct ``(device, object)`` keys for such an exact set.
     * ``distinct_device_photo_ids`` means the OS reported more than one device
@@ -166,14 +177,24 @@ def build_archive_health(conn: Connection, *, library_id: int) -> ArchiveHealth:
         raise ValueError(f"unknown library {library_id}")
 
     before = conn.total_changes
+    current_sha = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        "SELECT f.photo_id, f.presence_status, f.health_status, "
-        "f.fs_device_id, f.fs_object_id, f.fs_link_count, r.sha256 "
-        "FROM files f "
-        "LEFT JOIN file_revisions r ON r.id=f.current_revision_id AND r.file_id=f.id "
-        "WHERE f.library_id=? ORDER BY f.photo_id, f.id",
+        f"SELECT f.photo_id, f.presence_status, f.health_status, "
+        f"f.fs_device_id, f.fs_object_id, f.fs_link_count, "
+        f"f.sha256 AS expected_sha256, {current_sha} AS verified_current_sha256 "
+        f"FROM files f "
+        f"LEFT JOIN file_revisions r ON r.id=f.current_revision_id AND r.file_id=f.id "
+        f"WHERE f.library_id=? ORDER BY f.photo_id, f.id",
         (library_id,),
     ).fetchall()
+
+    ambiguity_rows = conn.execute(
+        "SELECT DISTINCT f.photo_id FROM file_origin_ambiguities a "
+        "JOIN files f ON f.id=a.observed_file_id "
+        "WHERE a.library_id=? AND f.library_id=? ORDER BY f.photo_id",
+        (library_id, library_id),
+    ).fetchall()
+    ambiguous_origin = tuple(str(r["photo_id"]) for r in ambiguity_rows)
 
     grouped: dict[str, list[Row]] = defaultdict(list)
     for row in rows:
@@ -197,8 +218,14 @@ def build_archive_health(conn: Connection, *, library_id: int) -> ArchiveHealth:
         present = [r for r in photo_rows if r["presence_status"] == "present"]
         missing = [r for r in photo_rows if r["presence_status"] == "missing"]
         unhealthy_now = [r for r in present if r["health_status"] != "ok"]
-        unknown_hash_now = [r for r in present if r["sha256"] is None]
-        known_hashes = {str(r["sha256"]) for r in present if r["sha256"] is not None}
+        # Current-byte identity is fail-closed.  A present File whose expected
+        # revision is mismatched/unhealthy/incoherent has UNKNOWN current SHA
+        # here even though its immutable expected SHA remains catalogued.
+        unknown_hash_now = [r for r in present if r["verified_current_sha256"] is None]
+        known_hashes = {
+            str(r["verified_current_sha256"]) for r in present
+            if r["verified_current_sha256"] is not None
+        }
 
         total_files += len(photo_rows)
         present_files += len(present)
@@ -270,6 +297,7 @@ def build_archive_health(conn: Connection, *, library_id: int) -> ArchiveHealth:
         tuple(hardlink_overstated),
         tuple(distinct_objects),
         tuple(distinct_devices),
+        ambiguous_origin,
     )
 
 
@@ -298,6 +326,8 @@ _CATEGORY_MAP = {
                          "All members have current storage identity and the exact set spans at least two distinct filesystem objects. This is not yet a physical-device independence claim."),
     "distinct_devices": ("distinct_device_photo_ids", "Exact Sets Spanning Distinct Device IDs",
                          "All members have current storage identity and the OS reports at least two device ids. Device ids are filesystem evidence, not proof of separate physical failure domains."),
+    "ambiguous_origin": ("ambiguous_origin_photo_ids", "Recorded Ambiguous File Origins",
+                         "At least one currently catalogued File was observed when multiple byte-identical historical Files could explain its origin. PPA preserved the ambiguity instead of choosing a candidate."),
 }
 
 
@@ -332,12 +362,13 @@ def concise_text(health: ArchiveHealth) -> str:
         f"Multiple exact present Files: {health.multiple_exact_present_count}",
         f"Photos with some catalogued copies missing: {health.missing_copy_photo_count}",
         f"Present-file health warnings: {health.unhealthy_present_count}",
-        f"Present Files without current SHA-256: {health.unknown_hash_count}",
+        f"Present Files without verified current SHA-256: {health.unknown_hash_count}",
         f"Current hash divergence: {health.divergent_count}",
         f"Exact sets with unknown storage identity: {health.exact_storage_unknown_count}",
         f"Exact sets whose path count is inflated by hard links: {health.hardlink_overstated_count}",
         f"Exact sets spanning distinct filesystem objects: {health.distinct_file_object_count}",
         f"Exact sets spanning distinct filesystem device ids: {health.distinct_device_count}",
+        f"Logical photos with recorded ambiguous File origin: {health.ambiguous_origin_count}",
         f"Logical photos needing attention: {health.attention_count}",
         "Filesystem-object/device evidence improves redundancy accounting, but PPA still does not call it proof of independent physical backup hardware.",
     ])

@@ -59,8 +59,10 @@ def _library_roots(db_path: Path) -> list[Path]:
     conn = None
     try:
         conn = connect(db_path)
-        rows = conn.execute("SELECT canonical_path FROM libraries ORDER BY id").fetchall()
-        return [Path(r["canonical_path"]) for r in rows if r["canonical_path"]]
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(libraries)").fetchall()}
+        column = "root_canonical_path" if "root_canonical_path" in columns else "canonical_path"
+        rows = conn.execute(f"SELECT {column} AS canonical_root FROM libraries ORDER BY id").fetchall()
+        return [Path(r["canonical_root"]) for r in rows if r["canonical_root"]]
     except Exception:
         return []
     finally:
@@ -182,10 +184,8 @@ def export_diagnostics(config, destination: Path) -> Path:
         ),
     )
 
-    tmp = destination.with_name(destination.name + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-    try:
+    from ppa.safe_export import safe_export_temp
+    with safe_export_temp(destination, config=config) as (validated, tmp):
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(asdict(manifest), indent=2, sort_keys=True))
             readme = (
@@ -198,8 +198,4 @@ def export_diagnostics(config, destination: Path) -> Path:
             zf.writestr("README.txt", readme)
             for name, text in members:
                 zf.writestr(name, text)
-        os.replace(tmp, destination)
-    finally:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-    return destination
+    return validated

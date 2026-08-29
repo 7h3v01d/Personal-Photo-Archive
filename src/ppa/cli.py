@@ -21,6 +21,7 @@ from ppa.integrity import verify_library
 from ppa.logging_setup import configure_logging, get_logger
 from ppa.metadata import extract_stale
 from ppa.scanner import scan_library
+from ppa.safe_export import ArchiveOutputSafetyError, safe_export_text
 
 
 def _protected_paths(config: Config) -> list[Path]:
@@ -29,7 +30,7 @@ def _protected_paths(config: Config) -> list[Path]:
     return [config.db_path, data_dir / "thumbnails", config.log_path]
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ppa")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -230,6 +231,54 @@ def main(argv: list[str] | None = None) -> int:
     archive_health_parser.add_argument("library_id", type=int, help="Library id to inspect")
     archive_health_parser.add_argument("--json", dest="json_path", default=None,
                                        help="Write structured archive-health JSON")
+
+    recovery_candidates_parser = subparsers.add_parser(
+        "recovery-candidates",
+        help="Inspect Phase-13.0 recovery donor qualification for one recovery-needed File",
+    )
+    recovery_candidates_parser.add_argument("file_id", help="Target File UUID")
+    recovery_candidates_parser.add_argument("--json", dest="json_path", default=None,
+                                            help="Write structured recovery-planning JSON")
+
+    recovery_plan_parser = subparsers.add_parser(
+        "recovery-plan",
+        help="Build a dry-run Phase-13.0 recovery plan; never writes source photographs",
+    )
+    recovery_plan_parser.add_argument("file_id", help="Target File UUID")
+    recovery_plan_parser.add_argument("--donor", dest="donor_file_id", default=None,
+                                      help="Explicit qualified donor File UUID; otherwise choose the preferred donor")
+    recovery_plan_parser.add_argument("--record", action="store_true",
+                                      help="Append the dry-run proposal to the catalogue audit ledger")
+    recovery_plan_parser.add_argument("--note", default=None,
+                                      help="Optional note when --record is used")
+    recovery_plan_parser.add_argument("--json", dest="json_path", default=None,
+                                      help="Write structured recovery-plan JSON")
+
+    recovery_stage_parser = subparsers.add_parser(
+        "recovery-stage-preservation",
+        help="Plan or explicitly stage Phase-14.0 preservation of suspect target bytes; never restores the target",
+    )
+    recovery_stage_parser.add_argument("proposal_id", help="Recorded frozen Phase-13 recovery proposal UUID")
+    recovery_stage_parser.add_argument(
+        "--apply", action="store_true",
+        help="Write the suspect target bytes to PPA operational preservation storage after fresh revalidation",
+    )
+    recovery_stage_parser.add_argument("--note", default=None, help="Optional note when --apply is used")
+    recovery_stage_parser.add_argument("--json", dest="json_path", default=None,
+                                       help="Write structured Phase-14 preservation plan/result JSON")
+
+    recovery_donor_parser = subparsers.add_parser(
+        "recovery-materialize-donor",
+        help="Plan or explicitly materialize the verified Phase-14.1 donor into protected staging; never replaces the target",
+    )
+    recovery_donor_parser.add_argument("stage_id", help="Committed Phase-14 preservation stage UUID")
+    recovery_donor_parser.add_argument(
+        "--apply", action="store_true",
+        help="Copy verified donor bytes into the existing protected recovery stage after fresh revalidation",
+    )
+    recovery_donor_parser.add_argument("--note", default=None, help="Optional note when --apply is used")
+    recovery_donor_parser.add_argument("--json", dest="json_path", default=None,
+                                       help="Write structured Phase-14.1 donor plan/result JSON")
 
     identity_health_parser = subparsers.add_parser(
         "identity-health", help="Build the read-only Phase-10 identity health and resolution queue")
@@ -598,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         floors = CameraFloors.load(args.floors) if args.floors else None
         if args.export:
             from ppa.reconcile import export_reconciliation_csv
-            n = export_reconciliation_csv(conn, args.export, camera_floors=floors)
+            n = export_reconciliation_csv(conn, args.export, camera_floors=floors, config=config)
             print(f"Wrote {n} photo assessment(s) to {args.export} (read-only).")
             return 0
         findings, results = analyse_library_reconciled(conn, camera_floors=floors)
@@ -635,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(timeline_text(view))
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -651,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(cluster_text(result))
         if args.json_path:
-            Path(args.json_path).write_text(result.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, result.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -668,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(story_text(story))
         if args.json_path:
-            Path(args.json_path).write_text(story.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, story.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -681,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(browse_text(index))
         if args.json_path:
-            Path(args.json_path).write_text(index.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, index.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -696,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(home_text(home))
         if args.json_path:
-            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, home.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -709,8 +758,92 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(archive_health_text(health))
         if args.json_path:
-            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, health.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "recovery-candidates":
+        from ppa.recovery_planning import build_recovery_planning_view, concise_planning_text
+        try:
+            view = build_recovery_planning_view(conn, file_id=args.file_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(concise_planning_text(view))
+        if args.json_path:
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
+            print(f"\nWrote {args.json_path}")
+        return 0
+
+    if args.command == "recovery-plan":
+        from ppa.recovery_planning import (
+            build_recovery_plan, concise_plan_text, record_recovery_plan_proposal,
+        )
+        try:
+            plan = build_recovery_plan(
+                conn, file_id=args.file_id, donor_file_id=args.donor_file_id
+            )
+            print(concise_plan_text(plan))
+            if args.record:
+                recorded = record_recovery_plan_proposal(conn, plan, note=args.note)
+                print(
+                    f"\nRecorded dry-run proposal {recorded.proposal_id}; "
+                    "recovery was NOT executed."
+                )
+            elif args.note:
+                print("--note is ignored unless --record is supplied", file=sys.stderr)
+            if args.json_path:
+                safe_export_text(args.json_path, plan.to_json() + "\n", conn=conn, config=config)
+                print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "recovery-stage-preservation":
+        from ppa.recovery_preservation import (
+            build_preservation_plan, concise_preservation_plan_text,
+            concise_preservation_result_text, execute_preservation_stage,
+        )
+        try:
+            stage_plan = build_preservation_plan(conn, proposal_id=args.proposal_id)
+            print(concise_preservation_plan_text(stage_plan))
+            payload = stage_plan.to_json() + "\n"
+            if args.apply:
+                result = execute_preservation_stage(conn, stage_plan, note=args.note)
+                print("\n" + concise_preservation_result_text(result))
+                payload = result.to_json() + "\n"
+            elif args.note:
+                print("--note is ignored unless --apply is supplied", file=sys.stderr)
+            if args.json_path:
+                safe_export_text(args.json_path, payload, conn=conn, config=config)
+                print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "recovery-materialize-donor":
+        from ppa.recovery_donor_materialization import (
+            build_donor_materialization_plan, concise_donor_plan_text,
+            concise_donor_result_text, execute_donor_materialization,
+        )
+        try:
+            donor_plan = build_donor_materialization_plan(conn, stage_id=args.stage_id)
+            print(concise_donor_plan_text(donor_plan))
+            payload = donor_plan.to_json() + "\n"
+            if args.apply:
+                result = execute_donor_materialization(conn, donor_plan, note=args.note)
+                print("\n" + concise_donor_result_text(result))
+                payload = result.to_json() + "\n"
+            elif args.note:
+                print("--note is ignored unless --apply is supplied", file=sys.stderr)
+            if args.json_path:
+                safe_export_text(args.json_path, payload, conn=conn, config=config)
+                print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         return 0
 
     if args.command == "identity-health":
@@ -719,12 +852,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             view = build_identity_health(conn, library_id=args.library_id)
             if args.json_path:
-                Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
             print(f"Identity health: {len(view.items)} item(s)")
-            print(f"P0 competing identity: {view.competing_identity_count}")
-            print(f"P1 divergence: {view.divergence_count}")
-            print(f"P2 recoverable split: {view.recoverable_split_count}")
-            print(f"P3 review-only split: {view.review_only_split_count}")
+            print(f"P0 integrity resolution required: {view.integrity_resolution_required_count}")
+            print(f"P1 competing identity: {view.competing_identity_count}")
+            print(f"P2 divergence: {view.divergence_count}")
+            print(f"P3 recoverable split: {view.recoverable_split_count}")
+            print(f"P4 review-only split: {view.review_only_split_count}")
             print(f"INFO recombined split: {view.recovered_split_count}")
             for item in view.items:
                 print(f"[{item.priority}] {item.kind}: {item.summary} -> {item.next_action}")
@@ -739,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr); return 1
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
         else:
             print(f"Exact duplicate logical Photos: {view.duplicate_photos}")
             print(f"Physical Files in duplicate sets: {view.duplicate_files}")
@@ -761,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr); return 1
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
         else:
             print(f"Classification: {view.classification}")
             print(view.rationale)
@@ -812,7 +946,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr); return 1
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
         else:
             print(f"Classification: {view.classification}")
             print(view.rationale)
@@ -829,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
             plan = plan_identity_split(conn, library_id=args.library_id, source_photo_id=args.source_photo_id, file_ids=tuple(args.file_ids))
             if args.json_path:
                 import json as _json
-                Path(args.json_path).write_text(_json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, _json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n", conn=conn, config=config)
             print(f"Split plan: {len(plan.files)} file(s), SHA-256 {plan.sha256}, {plan.remaining_file_count} file(s) remain on source Photo")
             if not args.apply:
                 print("Dry run only. Re-run with --apply after review.")
@@ -856,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr); return 1
         if args.json_path:
             import json as _json
-            Path(args.json_path).write_text(_json.dumps(view.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, _json.dumps(view.to_dict(), indent=2, sort_keys=True) + "\n", conn=conn, config=config)
         else:
             print(f"Resolution: {view.resolution_id}")
             print(f"Source: {view.source_photo_id}  Split-created: {view.new_photo_id}")
@@ -908,7 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(album_home_text(home))
         if args.json_path:
-            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, home.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -921,7 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr); return 1
         print(tag_home_text(home))
         if args.json_path:
-            Path(args.json_path).write_text(home.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, home.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -933,7 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr); return 1
         print(f"{view.name}: {view.total_members} logical photos")
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -945,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc),file=sys.stderr); return 1
         print(discovery_text(result))
         if args.json_path:
-            Path(args.json_path).write_text(result.to_json()+"\n",encoding="utf-8"); print(f"\nWrote {args.json_path}")
+            safe_export_text(args.json_path, result.to_json()+"\n", conn=conn, config=config); print(f"\nWrote {args.json_path}")
         return 0
 
     if args.command == "organization-suggestions":
@@ -956,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr); return 1
         print(suggestions_text(view))
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -994,7 +1128,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc),file=sys.stderr); return 1
         print(organization_activity_text(view))
         if args.json_path:
-            Path(args.json_path).write_text(view.to_json()+"\n",encoding="utf-8")
+            safe_export_text(args.json_path, view.to_json()+"\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -1009,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "organization-report":
         from ppa.organization_report import export_organization_report_zip
         try:
-            out=export_organization_report_zip(conn,library_id=args.library_id,output_path=args.output_path,activity_limit=args.activity_limit)
+            out=export_organization_report_zip(conn,library_id=args.library_id,output_path=args.output_path,activity_limit=args.activity_limit,config=config)
         except ValueError as exc:
             print(str(exc),file=sys.stderr); return 1
         print(f"Wrote sanitized organisation report: {out}"); return 0
@@ -1022,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr); return 1
         print(organization_health_text(health))
         if args.json_path:
-            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, health.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -1037,7 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(health_text(health))
         if args.json_path:
-            Path(args.json_path).write_text(health.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, health.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -1057,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(search_text(results))
         if args.json_path:
-            Path(args.json_path).write_text(results.to_json() + "\n", encoding="utf-8")
+            safe_export_text(args.json_path, results.to_json() + "\n", conn=conn, config=config)
             print(f"\nWrote {args.json_path}")
         return 0
 
@@ -1132,7 +1266,7 @@ def main(argv: list[str] | None = None) -> int:
                 from ppa.organization_discovery import concise_text as discovery_text
                 print(discovery_text(result))
                 if args.json_path:
-                    Path(args.json_path).write_text(result.to_json()+"\n",encoding="utf-8"); print(f"\nWrote {args.json_path}")
+                    safe_export_text(args.json_path, result.to_json()+"\n", conn=conn, config=config); print(f"\nWrote {args.json_path}")
                 return 0
         except ValueError as exc:
             print(str(exc),file=sys.stderr); return 1
@@ -1173,7 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(str(exc), file=sys.stderr); return 1
             print(search_text(results))
             if args.json_path:
-                Path(args.json_path).write_text(results.to_json() + "\n", encoding="utf-8"); print(f"\nWrote {args.json_path}")
+                safe_export_text(args.json_path, results.to_json() + "\n", conn=conn, config=config); print(f"\nWrote {args.json_path}")
             return 0
 
     if args.command == "pilot":
@@ -1187,7 +1321,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(concise_text(report))
             if args.json_path:
-                Path(args.json_path).write_text(report.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, report.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "queue":
@@ -1200,7 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(queue_text(queue, include_d=args.all))
             if args.json_path:
-                Path(args.json_path).write_text(queue.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, queue.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "questions":
@@ -1213,7 +1347,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(question_text(questions))
             if args.json_path:
-                Path(args.json_path).write_text(questions.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, questions.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "explain":
@@ -1225,7 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(evidence_text(trace))
             if args.json_path:
-                Path(args.json_path).write_text(trace.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, trace.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "unresolved":
@@ -1238,7 +1372,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(unresolved_text(view))
             if args.json_path:
-                Path(args.json_path).write_text(view.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, view.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "audit":
@@ -1251,7 +1385,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(audit_text(snap))
             if args.json_path:
-                Path(args.json_path).write_text(snap.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, snap.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "audit-compare":
@@ -1267,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(comparison_text(comparison))
             if args.json_path:
-                Path(args.json_path).write_text(comparison.to_json() + "\n", encoding="utf-8")
+                safe_export_text(args.json_path, comparison.to_json() + "\n", conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
             return 0
         if args.pilot_command == "session-start":
@@ -1279,7 +1413,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 session = start_pilot_session(conn, library_id=args.library_id,
                                               directory_prefix=args.directory)
-                save_pilot_session(session, path)
+                save_pilot_session(session, path, conn=conn, config=config)
             except (OSError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1293,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 session = load_pilot_session(path)
                 session = checkpoint_pilot_session(conn, session, label=args.label)
-                save_pilot_session(session, path)
+                save_pilot_session(session, path, conn=conn, config=config)
             except (OSError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1316,7 +1450,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 session = load_pilot_session(path)
                 session = close_pilot_session(conn, session)
-                save_pilot_session(session, path)
+                save_pilot_session(session, path, conn=conn, config=config)
             except (OSError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1393,6 +1527,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except ArchiveOutputSafetyError as exc:
+        print(f"Export refused: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

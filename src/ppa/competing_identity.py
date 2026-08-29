@@ -12,7 +12,9 @@ import json
 from dataclasses import dataclass
 from sqlite3 import Connection
 
-COMPETING_IDENTITY_INVESTIGATION_SCHEMA = "ppa-competing-identity-investigation/1"
+from ppa.current_identity import verified_current_sha256_sql
+
+COMPETING_IDENTITY_INVESTIGATION_SCHEMA = "ppa-competing-identity-investigation/2"
 CONVERGED_AFTER_OBSERVED_CHANGE = "converged_after_observed_change"
 BYTE_IDENTICAL_WHEN_FIRST_OBSERVED = "byte_identical_when_first_observed"
 INSUFFICIENT_HISTORY = "insufficient_history"
@@ -38,6 +40,7 @@ class CompetingFileEvidence:
     health_status: str
     first_seen_at: str
     last_seen_at: str
+    expected_sha256: str | None
     current_sha256: str | None
     current_revision_id: str | None
     revisions: tuple[CompetingRevisionEvidence, ...]
@@ -105,6 +108,8 @@ class CompetingIdentityInvestigation:
                             "health_status": f.health_status,
                             "first_seen_at": f.first_seen_at,
                             "last_seen_at": f.last_seen_at,
+                            "expected_sha256": f.expected_sha256,
+                            "verified_current_sha256": f.current_sha256,
                             "current_sha256": f.current_sha256,
                             "current_revision_id": f.current_revision_id,
                             "changed_to_shared_bytes": f.changed_to_shared_bytes,
@@ -139,8 +144,13 @@ def investigate_competing_identity(conn: Connection, *, library_id: int, sha256:
     if not sha256:
         raise ValueError("known current SHA-256 is required")
 
+    verified_expr = verified_current_sha256_sql("f", "r")
     owners = conn.execute(
-        "SELECT DISTINCT photo_id FROM files WHERE library_id=? AND sha256=? ORDER BY photo_id",
+        f"""SELECT DISTINCT f.photo_id
+              FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.library_id=? AND ({verified_expr})=?
+             ORDER BY f.photo_id""",
         (library_id, sha256),
     ).fetchall()
     photo_ids = tuple(r["photo_id"] for r in owners)
@@ -151,11 +161,15 @@ def investigate_competing_identity(conn: Connection, *, library_id: int, sha256:
     photo_rows = conn.execute(
         f"SELECT id,created_at,notes FROM photos WHERE id IN ({ph}) ORDER BY id", photo_ids
     ).fetchall()
+    verified_files_expr = verified_current_sha256_sql("f", "cr")
     file_rows = conn.execute(
-        f"""SELECT id,photo_id,library_id,filename,path,presence_status,health_status,
-                    first_seen_at,last_seen_at,sha256,current_revision_id
-               FROM files WHERE photo_id IN ({ph})
-              ORDER BY photo_id,library_id,first_seen_at,filename COLLATE NOCASE,id""",
+        f"""SELECT f.id,f.photo_id,f.library_id,f.filename,f.path,f.presence_status,f.health_status,
+                    f.first_seen_at,f.last_seen_at,f.sha256 AS expected_sha256,f.current_revision_id,
+                    {verified_files_expr} AS verified_current_sha256
+               FROM files f
+               LEFT JOIN file_revisions cr ON cr.id=f.current_revision_id
+              WHERE f.photo_id IN ({ph})
+              ORDER BY f.photo_id,f.library_id,f.first_seen_at,f.filename COLLATE NOCASE,f.id""",
         photo_ids,
     ).fetchall()
     file_ids = tuple(r["id"] for r in file_rows)
@@ -183,7 +197,8 @@ def investigate_competing_identity(conn: Connection, *, library_id: int, sha256:
         by_photo_files[r["photo_id"]].append(CompetingFileEvidence(
             r["id"], r["photo_id"], int(r["library_id"]), r["filename"], r["path"],
             r["presence_status"], r["health_status"], r["first_seen_at"], r["last_seen_at"],
-            r["sha256"], r["current_revision_id"], tuple(by_rev[r["id"]]),
+            r["expected_sha256"], r["verified_current_sha256"], r["current_revision_id"],
+            tuple(by_rev[r["id"]]),
         ))
     created = {r["id"]: r["created_at"] for r in photo_rows}
     photos = tuple(CompetingPhotoEvidence(pid, created.get(pid, ""), tuple(by_photo_files[pid])) for pid in photo_ids)
@@ -222,7 +237,7 @@ def investigate_competing_identity(conn: Connection, *, library_id: int, sha256:
     if len(photo_ids) != 2:
         blockers.append("controlled merge consideration currently requires exactly two logical Photos")
     if any(f.current_sha256 is None for p in photos for f in p.files):
-        blockers.append("one or more Files have unknown current SHA-256")
+        blockers.append("one or more Files do not have verified current content (missing, unhealthy, or revision-incoherent)")
     if any(f.current_sha256 not in (None, sha256) for p in photos for f in p.files):
         blockers.append("one or more logical Photos also own different known current bytes")
     if any(f.library_id != int(library_id) for p in photos for f in p.files):

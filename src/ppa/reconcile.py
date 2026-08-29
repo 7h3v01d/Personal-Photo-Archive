@@ -368,7 +368,7 @@ def analyse_library_reconciled(
     return findings, reconcile(photos, date_tolerance=date_tolerance)
 
 
-def export_reconciliation_csv(conn, path, *, camera_floors=None) -> int:
+def export_reconciliation_csv(conn, path, *, camera_floors=None, config=None) -> int:
     """Write the full Slice 1→3 assessment to a CSV for reviewing against a real
     collection (read-only). Rows sorted by rating so the doubtful ones surface.
     Returns the number of photos written."""
@@ -381,15 +381,17 @@ def export_reconciliation_csv(conn, path, *, camera_floors=None) -> int:
                  "WHERE presence_status = 'present'")}
     order = {"LIKELY_WRONG": 0, "QUESTIONABLE": 1, "UNKNOWN": 2,
              "PROBABLY_VALID": 3, "TRUSTED": 4}
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = _csv.writer(fh)
-        w.writerow(["file_id", "path", "rating", "candidate_or_anchored_date",
-                    "changed_by_evidence", "reasons", "evidence_conflicts"])
-        for fid, fa in sorted(results.items(),
-                              key=lambda kv: (order.get(kv[1].reliability.value, 9),
-                                              paths.get(kv[0], ""))):
-            w.writerow([fid, paths.get(fid, ""), fa.reliability.value,
-                        fa.date.date().isoformat() if fa.date else "",
-                        "yes" if fa.changed else "",
-                        " | ".join(fa.reasons), " | ".join(fa.evidence_conflicts)])
+    from ppa.safe_export import safe_export_temp
+    with safe_export_temp(path, conn=conn, config=config) as (_out, tmp):
+        with tmp.open("w", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["file_id", "path", "rating", "candidate_or_anchored_date",
+                        "changed_by_evidence", "reasons", "evidence_conflicts"])
+            for fid, fa in sorted(results.items(),
+                                  key=lambda kv: (order.get(kv[1].reliability.value, 9),
+                                                  paths.get(kv[0], ""))):
+                w.writerow([fid, paths.get(fid, ""), fa.reliability.value,
+                            fa.date.date().isoformat() if fa.date else "",
+                            "yes" if fa.changed else "",
+                            " | ".join(fa.reasons), " | ".join(fa.evidence_conflicts)])
     return len(results)

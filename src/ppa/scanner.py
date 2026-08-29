@@ -37,11 +37,14 @@ transition to integrity_events, so nothing is silently overwritten. Phase 12.1
 also retains the device/object/link-count identity already returned by stat(),
 allowing Archive Health to distinguish hard-linked paths from distinct
 filesystem objects without adding another source-file pass.
+Phase 12.2 additionally refuses to choose arbitrarily among multiple same-content
+missing/relocation candidates: ambiguous origin is preserved explicitly instead.
 Read-only with respect to every source file, always.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import Callable
@@ -54,6 +57,7 @@ from PIL import Image, UnidentifiedImageError
 
 from ppa.formats import is_recognised_but_unsupported, supported_extensions
 from ppa.hashing import sha256_file
+from ppa.current_identity import verified_current_sha256_sql
 from ppa.logging_setup import get_logger
 
 log = get_logger("scanner")
@@ -82,6 +86,7 @@ class ScanReport:
     moved_files: int = 0
     duplicate_files: int = 0
     restored_files: int = 0
+    ambiguous_origin_files: int = 0
     missing_files: int = 0
     unsupported_files: int = 0
     deferred_format_files: int = 0
@@ -106,6 +111,7 @@ class ScanReport:
             + self.moved_files
             + self.duplicate_files
             + self.restored_files
+            + self.ambiguous_origin_files
             + self.renamed_candidates
         )
 
@@ -118,6 +124,7 @@ class ScanReport:
             f"  moved:              {self.moved_files}",
             f"  duplicates:         {self.duplicate_files}",
             f"  restored:           {self.restored_files}",
+            f"  ambiguous origin:   {self.ambiguous_origin_files}",
             f"  missing:            {self.missing_files}",
             f"  unsupported:        {self.unsupported_files}",
             f"  deferred format:    {self.deferred_format_files}",
@@ -229,9 +236,15 @@ def scan_library(
     # invisible here, so scanning one library can never mark another's files
     # moved or missing, and identical content in two libraries stays two files.
     try:
+            verified_expr = verified_current_sha256_sql("f", "r")
             cat_rows: list[Row] = conn.execute(
-                "SELECT * FROM files WHERE presence_status IN ('present', 'missing') "
-                "AND (library_id = ? OR (library_id IS NULL AND path LIKE ?))",
+                f"""SELECT f.*, r.sha256 AS current_revision_sha256,
+                           r.superseded_at AS current_revision_superseded_at,
+                           {verified_expr} AS verified_current_sha256
+                      FROM files f
+                      LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+                     WHERE f.presence_status IN ('present', 'missing')
+                       AND (f.library_id = ? OR (f.library_id IS NULL AND f.path LIKE ?))""",
                 (library_id, root_prefix),
             ).fetchall()
             active_by_relkey: dict[str, Row] = {
@@ -317,8 +330,24 @@ def scan_library(
             # original + duplicate rather than two independents.
             hash_index: dict[str, list[Row]] = {}
             for r in cat_rows:
-                if r["sha256"]:
-                    hash_index.setdefault(r["sha256"], []).append(r)
+                # Present Files contribute positive duplicate/current-identity
+                # evidence only when their current bytes are verified. Missing
+                # Files may still contribute coherent expected-revision hashes
+                # as historical restoration candidates. Unhealthy PRESENT rows
+                # are deliberately absent so stale expected hashes cannot create
+                # false duplicate/relocation identity.
+                if r["presence_status"] == "present":
+                    index_sha = r["verified_current_sha256"]
+                else:
+                    coherent_revision = (
+                        r["current_revision_id"]
+                        and r["current_revision_superseded_at"] is None
+                        and r["sha256"]
+                        and r["sha256"] == r["current_revision_sha256"]
+                    )
+                    index_sha = r["current_revision_sha256"] if coherent_revision else None
+                if index_sha:
+                    hash_index.setdefault(index_sha, []).append(r)
 
             # 2a. Files sitting at a path we already know (active). These are the
             #     originals still in place; resolve them before anything else so the
@@ -730,12 +759,12 @@ def _inventory_supported_file(
     # by Verify), the shortcut is poisoned and we always re-read the bytes.
     if (
         known is not None
-        and known["sha256"]
+        and known["verified_current_sha256"]
         and known["size_bytes"] == size_bytes
         and known["fs_mtime"] == fs_mtime
         and known["health_status"] == "ok"
     ):
-        sha = known["sha256"]
+        sha = known["verified_current_sha256"]
         hashed_now = False
     else:
         try:
@@ -809,7 +838,8 @@ def _reconcile_known_path(
             SET sha256 = ?, hash_computed_at = ?, size_bytes = ?, fs_mtime = ?,
                 width_px = ?, height_px = ?, mime_type = ?,
                 path = ?, library_id = ?, relative_path = ?, relative_path_key = ?,
-                status = 'active', presence_status = 'present', health_status = 'ok',
+                status = 'active', presence_status = 'present',
+                health_status = CASE WHEN health_status = 'ok' THEN 'ok' ELSE health_status END,
                 last_seen_at = ?, last_seen_session = ?
             WHERE id = ?
             """,
@@ -838,7 +868,8 @@ def _reconcile_known_path(
             SET last_seen_at = ?, last_seen_session = ?, width_px = ?,
                 height_px = ?, mime_type = ?, fs_mtime = ?, size_bytes = ?,
                 path = ?, library_id = ?, relative_path = ?, relative_path_key = ?,
-                status = 'active', presence_status = 'present', health_status = 'ok'
+                status = 'active', presence_status = 'present',
+                health_status = CASE WHEN health_status = 'ok' THEN 'ok' ELSE health_status END
             WHERE id = ?
             """,
             (now, session_id, df.width, df.height, df.mime_type, df.fs_mtime,
@@ -848,6 +879,13 @@ def _reconcile_known_path(
         # keep the filesystem-date evidence current.
         _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
         _record_storage_identity(conn, row["id"], df, now, session_id)
+        if row["health_status"] == "hash_mismatch":
+            conn.execute(
+                "INSERT INTO integrity_events(file_id,event_type,detail,session_id) VALUES (?,?,?,?)",
+                (row["id"], "expected_content_reobserved_pending_verify",
+                 "Scanner re-hashed the current file and observed the expected revision bytes again; "
+                 "health remains hash_mismatch until Verify reconciles integrity authority.", session_id),
+            )
         return
 
     # Same path, different content. If Verify has already flagged this file as
@@ -906,7 +944,14 @@ def _reconcile_known_path(
 
 
 def _refetch(conn: Connection, file_id: str) -> Row:
-    return conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    verified_expr = verified_current_sha256_sql("f", "r")
+    return conn.execute(
+        f"""SELECT f.*, r.sha256 AS current_revision_sha256,
+                   r.superseded_at AS current_revision_superseded_at,
+                   {verified_expr} AS verified_current_sha256
+              FROM files f LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.id=?""", (file_id,)
+    ).fetchone()
 
 
 def _reconcile_orphan(
@@ -955,18 +1000,39 @@ def _reconcile_orphan(
     # 2. A relocation: same content whose own identity is GONE from disk (moved
     #    here, or reappeared elsewhere after going missing). Never something
     #    already claimed this scan.
-    relocated = next(
-        (r for r in candidates
-         if r["id"] not in matched_row_ids
-         and relkey_of(r) not in disk_relkeys),
-        None,
-    )
+    #
+    #    Phase 12.2: hash equality is content evidence, not enough to choose one
+    #    historical physical File when *multiple* candidates qualify. Current
+    #    filesystem-object identity is not a durable historical key: inode/file
+    #    indexes can be reused after deletion. Therefore only relocate automatically
+    #    when exactly one candidate exists. With
+    #    multiple unresolved candidates, catalogue the observed object as a new
+    #    File and retain every candidate as missing/unmatched.
+    relocation_candidates = [
+        r for r in candidates
+        if r["id"] not in matched_row_ids and relkey_of(r) not in disk_relkeys
+    ]
+
+    # Filesystem object identifiers are intentionally *not* used here to break
+    # a tie across absence.  They are trustworthy current-state evidence for
+    # hard links, but inode/file-index tokens can be reused after deletion; a
+    # stale identity match therefore cannot prove which historical File returned.
+    relocated = relocation_candidates[0] if len(relocation_candidates) == 1 else None
+
     if relocated is not None:
         _apply_relocation(conn, report, session_id, df, relocated, now,
                           library_id, walk_base)
         matched_row_ids.add(relocated["id"])
         _index_remove(hash_index, df.sha256, relocated["id"])
         _index_add(hash_index, df.sha256, _refetch(conn, relocated["id"]))
+        return
+
+    if len(relocation_candidates) > 1:
+        _record_ambiguous_origin(
+            conn=conn, report=report, session_id=session_id, df=df,
+            candidates=relocation_candidates, now=now, hash_index=hash_index,
+            matched_row_ids=matched_row_ids, library_id=library_id, walk_base=walk_base,
+        )
         return
 
     # 3. An exact duplicate: a PRESENT File with this content still on disk, so
@@ -1007,6 +1073,75 @@ def _reconcile_orphan(
     _index_add(hash_index, df.sha256, new_row)
 
 
+
+def _record_ambiguous_origin(
+    *,
+    conn: Connection,
+    report: ScanReport,
+    session_id: str,
+    df: _DiskFile,
+    candidates: list[Row],
+    now: str,
+    hash_index: dict[str, list[Row]],
+    matched_row_ids: set[str],
+    library_id: int,
+    walk_base: str,
+) -> None:
+    """Catalogue a same-content orphan without inventing its historical File.
+
+    More than one unmatched same-hash File can explain this observed path.  If
+    all candidates already belong to one logical Photo, that logical identity is
+    still unambiguous and the new File can safely remain under that Photo.  If
+    candidates span multiple Photos, even logical identity is unresolved, so a
+    fresh Photo is created rather than silently crossing a Phase-10 identity
+    boundary.  In both cases the append-only ambiguity ledger captures the full
+    candidate set exactly as observed.
+    """
+    candidate_ids = sorted(str(r["id"]) for r in candidates)
+    candidate_photo_ids = sorted({str(r["photo_id"]) for r in candidates})
+    all_missing = all(r["presence_status"] == "missing" for r in candidates)
+    kind = "ambiguous_restoration" if all_missing else "ambiguous_relocation"
+
+    if len(candidate_photo_ids) == 1:
+        photo_id = candidate_photo_ids[0]
+    else:
+        photo_id = str(uuid.uuid4())
+        conn.execute("INSERT INTO photos (id) VALUES (?)", (photo_id,))
+
+    new_row = _insert_file(
+        conn, session_id, df, now, photo_id=photo_id,
+        library_id=library_id, walk_base=walk_base,
+    )
+    ambiguity_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO file_origin_ambiguities "
+        "(id,library_id,observed_file_id,sha256,observed_path,"
+        "candidate_file_ids_json,candidate_photo_ids_json,ambiguity_kind,created_at,session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            ambiguity_id, library_id, new_row["id"], df.sha256, df.path,
+            json.dumps(candidate_ids, separators=(",", ":")),
+            json.dumps(candidate_photo_ids, separators=(",", ":")),
+            kind, now, session_id,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO integrity_events (file_id,event_type,detail,session_id) "
+        "VALUES (?, 'origin_ambiguous', ?, ?)",
+        (
+            new_row["id"],
+            f"Byte-identical content appeared at {df.path}, but {len(candidate_ids)} "
+            f"unmatched historical Files could explain its origin. No candidate "
+            f"File was selected. ambiguity_id={ambiguity_id}; kind={kind}.",
+            session_id,
+        ),
+    )
+    report.ambiguous_origin_files += 1
+    matched_row_ids.add(new_row["id"])
+    _index_add(hash_index, df.sha256, new_row)
+
+
+
 def _apply_relocation(
     conn: Connection,
     report: ScanReport,
@@ -1034,7 +1169,8 @@ def _apply_relocation(
         """
         UPDATE files
         SET path = ?, filename = ?, extension = ?, status = 'active',
-            presence_status = 'present', health_status = 'ok',
+            presence_status = 'present',
+            health_status = CASE WHEN health_status = 'ok' THEN 'ok' ELSE health_status END,
             size_bytes = ?, fs_mtime = ?, width_px = ?, height_px = ?,
             mime_type = ?, sha256 = ?, hash_computed_at = COALESCE(hash_computed_at, ?),
             library_id = ?, relative_path = ?, relative_path_key = ?,
@@ -1049,6 +1185,14 @@ def _apply_relocation(
     )
     _record_fs_observation(conn, row["id"], row["current_revision_id"], df.fs_mtime, session_id)
     _record_storage_identity(conn, row["id"], df, now, session_id)
+    if row["health_status"] != "ok":
+        conn.execute(
+            "INSERT INTO integrity_events(file_id,event_type,detail,session_id) VALUES (?,?,?,?)",
+            (row["id"], "expected_content_reobserved_pending_verify",
+             "Scanner re-hashed restored/relocated bytes matching the expected revision; "
+             f"health remains {row['health_status']} until Verify reconciles integrity authority.",
+             session_id),
+        )
     if was_missing:
         report.restored_files += 1
         event, detail = "restored", (
@@ -1110,6 +1254,6 @@ def _insert_file(
     )
     _record_fs_observation(conn, file_id, rev_id, df.fs_mtime, session_id)
     _record_storage_identity(conn, file_id, df, now, session_id)
-    return conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    return _refetch(conn, file_id)
 
 

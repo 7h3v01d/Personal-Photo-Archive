@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlite3 import Connection
 
-DUPLICATE_IDENTITY_SCHEMA = "ppa-duplicate-identity/1"
+from ppa.current_identity import verified_current_sha256_sql
+from ppa.physical_observation import require_expected_physical_bytes
+
+DUPLICATE_IDENTITY_SCHEMA = "ppa-duplicate-identity/2"
 LINEAGE_SCHEMA = "ppa-photo-lineage/1"
 RELATION_TYPES = (
     "derived_copy",
@@ -37,6 +40,7 @@ class ExactCopy:
     presence_status: str
     health_status: str
     sha256: str | None
+    expected_sha256: str | None
     revision_id: str | None
 
 
@@ -137,18 +141,23 @@ def _require_photo(conn: Connection, photo_id: str) -> None:
 
 
 def build_duplicate_identity(conn: Connection, *, library_id: int) -> DuplicateIdentityView:
-    """Return current exact-copy clusters plus logical-identity divergences.
+    """Return verified-current exact-copy clusters and identity divergences.
 
-    Exact-copy membership requires the same logical Photo *and* the same known
-    current SHA-256. A Photo with multiple distinct known current hashes is
-    surfaced as an identity divergence; this projection never repairs/splits it.
+    ``files.sha256`` is expected/revision authority, not unconditional proof of
+    current bytes.  Only Files with a verified-current SHA participate in
+    current duplicate/divergence claims.  Missing or unhealthy Files remain
+    historical catalogue evidence but are excluded from positive byte-identity
+    assertions.
     """
     _require_library(conn, library_id)
+    verified_expr = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        """
+        f"""
         SELECT f.id, f.photo_id, f.filename, f.library_id, f.presence_status,
-               f.health_status, f.sha256, f.current_revision_id
+               f.health_status, f.sha256 AS expected_sha256, f.current_revision_id,
+               {verified_expr} AS verified_current_sha256
           FROM files f
+          LEFT JOIN file_revisions r ON r.id=f.current_revision_id
          WHERE f.library_id=?
          ORDER BY f.photo_id, CASE f.presence_status WHEN 'present' THEN 0 ELSE 1 END,
                   f.filename COLLATE NOCASE, f.id
@@ -161,22 +170,25 @@ def build_duplicate_identity(conn: Connection, *, library_id: int) -> DuplicateI
     sets: list[ExactDuplicateSet] = []
     divergences: list[IdentityDivergence] = []
     for photo_id, photo_rows in sorted(by_photo.items()):
-        known_hashes = sorted({r["sha256"] for r in photo_rows if r["sha256"]})
+        known_hashes = sorted({r["verified_current_sha256"] for r in photo_rows
+                               if r["verified_current_sha256"]})
         if len(known_hashes) > 1:
             divergences.append(IdentityDivergence(
-                photo_id, tuple(known_hashes), tuple(sorted(r["id"] for r in photo_rows))))
+                photo_id, tuple(known_hashes),
+                tuple(sorted(r["id"] for r in photo_rows if r["verified_current_sha256"]))))
         by_hash: dict[str, list] = {}
         for r in photo_rows:
-            if r["sha256"]:
-                by_hash.setdefault(r["sha256"], []).append(r)
+            sha = r["verified_current_sha256"]
+            if sha:
+                by_hash.setdefault(sha, []).append(r)
         for sha, same_rows in sorted(by_hash.items()):
             if len(same_rows) < 2:
                 continue
             copies = tuple(ExactCopy(
                 file_id=r["id"], photo_id=r["photo_id"], filename=r["filename"],
                 library_id=r["library_id"], presence_status=r["presence_status"],
-                health_status=r["health_status"], sha256=r["sha256"],
-                revision_id=r["current_revision_id"],
+                health_status=r["health_status"], sha256=r["verified_current_sha256"],
+                expected_sha256=r["expected_sha256"], revision_id=r["current_revision_id"],
             ) for r in same_rows)
             sets.append(ExactDuplicateSet(photo_id, copies))
     return DuplicateIdentityView(DUPLICATE_IDENTITY_SCHEMA, library_id, tuple(sets), tuple(divergences))
@@ -223,12 +235,20 @@ def add_lineage(conn: Connection, *, parent_photo_id: str, child_photo_id: str,
     # Byte-identical Files already share a logical Photo. Distinct Photos with
     # an equal current hash indicate inconsistent catalogue identity; refuse to
     # paper over that invariant with a lineage edge.
+    verified_a = verified_current_sha256_sql("a", "ar")
+    verified_b = verified_current_sha256_sql("b", "br")
     equal_hash = conn.execute(
-        """
+        f"""
         SELECT 1
-          FROM files a JOIN files b ON a.sha256=b.sha256
-         WHERE a.photo_id=? AND b.photo_id=? AND a.sha256 IS NOT NULL LIMIT 1
-        """, (parent_photo_id, child_photo_id)
+          FROM files a
+          LEFT JOIN file_revisions ar ON ar.id=a.current_revision_id
+          JOIN files b ON b.photo_id=?
+          LEFT JOIN file_revisions br ON br.id=b.current_revision_id
+         WHERE a.photo_id=?
+           AND ({verified_a}) IS NOT NULL
+           AND ({verified_a})=({verified_b})
+         LIMIT 1
+        """, (child_photo_id, parent_photo_id)
     ).fetchone()
     if equal_hash is not None:
         raise ValueError("byte-identical content must share one logical Photo; lineage refused")
@@ -293,21 +313,25 @@ def list_lineage_history(conn: Connection, *, lineage_id: str | None = None) -> 
 
 def validate_exact_copy_pair(conn: Connection, *, library_id: int,
                              file_ids: tuple[str, str] | list[str]) -> tuple[ExactCopy, ExactCopy]:
-    """Prove two selected Files are current exact copies before comparison.
+    """Prove two selected Files are verified-current exact copies.
 
-    Review UI must not treat logical-Photo identity alone as proof of current
-    byte equality: a File can diverge after its original catalogue assignment.
+    Expected revision hashes remain historical/catalogue authority after a
+    mismatch and therefore cannot satisfy this validator.
     """
     ids = tuple(file_ids)
     if len(ids) != 2 or ids[0] == ids[1]:
         raise ValueError("select exactly two distinct physical Files")
     _require_library(conn, library_id)
+    verified_expr = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        """
-        SELECT id,photo_id,filename,library_id,presence_status,health_status,sha256,current_revision_id
-          FROM files
-         WHERE id IN (?,?)
-         ORDER BY id
+        f"""
+        SELECT f.id,f.photo_id,f.filename,f.path,f.library_id,f.presence_status,f.health_status,
+               f.sha256 AS expected_sha256,f.current_revision_id,
+               {verified_expr} AS verified_current_sha256
+          FROM files f
+          LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+         WHERE f.id IN (?,?)
+         ORDER BY f.id
         """, ids,
     ).fetchall()
     if len(rows) != 2:
@@ -316,12 +340,17 @@ def validate_exact_copy_pair(conn: Connection, *, library_id: int,
         raise ValueError("selected Files must belong to the current Library")
     if rows[0]["photo_id"] != rows[1]["photo_id"]:
         raise ValueError("selected Files do not share one logical Photo")
-    sha = rows[0]["sha256"]
-    if not sha or rows[1]["sha256"] != sha:
+    sha = rows[0]["verified_current_sha256"]
+    if not sha or rows[1]["verified_current_sha256"] != sha:
         raise ValueError("selected Files are not proven current exact copies")
+    require_expected_physical_bytes(
+        tuple((r["id"], r["path"], str(r["verified_current_sha256"])) for r in rows),
+        context="exact-copy validation",
+    )
     return tuple(ExactCopy(
         file_id=r["id"], photo_id=r["photo_id"], filename=r["filename"],
         library_id=r["library_id"], presence_status=r["presence_status"],
-        health_status=r["health_status"], sha256=r["sha256"],
-        revision_id=r["current_revision_id"],
+        health_status=r["health_status"], sha256=r["verified_current_sha256"],
+        expected_sha256=r["expected_sha256"], revision_id=r["current_revision_id"],
     ) for r in rows)  # type: ignore[return-value]
+

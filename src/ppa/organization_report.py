@@ -244,24 +244,18 @@ def markdown_text(report: OrganizationReport) -> str:
 
 def export_organization_report_zip(conn: Connection, *, library_id: int,
                                    output_path: str | Path,
-                                   activity_limit: int = 100) -> Path:
+                                   activity_limit: int = 100, config=None) -> Path:
     report = build_organization_report(conn, library_id=library_id, activity_limit=activity_limit)
-    out = Path(output_path).expanduser().resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
+    from ppa.safe_export import safe_export_temp
+    out = Path(output_path).expanduser()
     readme = (
         "Personal Photo Archive — Shareable Organisation Report\n\n"
         "This ZIP intentionally excludes source photographs, thumbnails, database files, "
         "filesystem paths, archive identifiers and hashes.\n"
     )
-    fd, tmp_name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=str(out.parent))
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
+    with safe_export_temp(out, conn=conn, config=config) as (validated, tmp):
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("organization-report.json", report.to_json() + "\n")
             zf.writestr("organization-report.md", markdown_text(report))
             zf.writestr("README.txt", readme)
-        os.replace(tmp, out)
-    finally:
-        if tmp.exists(): tmp.unlink(missing_ok=True)
-    return out
+    return validated

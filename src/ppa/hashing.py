@@ -11,7 +11,10 @@ Design notes:
   * Read-only. Hashing opens the file for reading only and never touches
     mtime/atime semantics beyond what a plain read does (see the safety
     contract — reading bytes is explicitly permitted).
-  * The hash is lowercase hex, stored verbatim in files.sha256.
+  * The hash is lowercase hex. When bytes become trusted catalogue authority it
+    is mirrored in files.sha256 and the immutable current FileRevision. After a
+    Verify mismatch, files.sha256 intentionally remains the expected revision
+    hash rather than being overwritten with untrusted observed bytes.
 """
 
 from __future__ import annotations

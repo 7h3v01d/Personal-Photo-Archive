@@ -144,9 +144,13 @@ def start_pilot_session(conn: Connection, *, library_id: int,
     )
 
 
-def save_pilot_session(session: PilotSession, path: Path) -> None:
+def save_pilot_session(session: PilotSession, path: Path, *, conn=None, config=None) -> None:
     _validate_session(session)
-    _atomic_write(Path(path), session.to_json(pretty=True))
+    from ppa.safe_export import safe_export_text
+    text = session.to_json(pretty=True)
+    if not text.endswith("\n"):
+        text += "\n"
+    safe_export_text(Path(path), text, conn=conn, config=config)
 
 
 def _comparison_from_dict(data: dict | None) -> PilotAuditComparison | None:

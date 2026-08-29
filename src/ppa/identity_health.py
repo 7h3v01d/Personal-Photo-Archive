@@ -10,7 +10,9 @@ import json
 from dataclasses import dataclass
 from sqlite3 import Connection
 
-IDENTITY_HEALTH_SCHEMA = "ppa-identity-health/1"
+from ppa.current_identity import verified_current_sha256_sql
+
+IDENTITY_HEALTH_SCHEMA = "ppa-identity-health/2"
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,10 @@ class IdentityHealthView:
     schema: str
     library_id: int
     items: tuple[IdentityHealthItem, ...]
+
+    @property
+    def integrity_resolution_required_count(self) -> int:
+        return sum(i.kind == "integrity_resolution_required" for i in self.items)
 
     @property
     def competing_identity_count(self) -> int:
@@ -58,6 +64,7 @@ class IdentityHealthView:
             "schema": self.schema,
             "library_id": self.library_id,
             "counts": {
+                "integrity_resolution_required": self.integrity_resolution_required_count,
                 "competing_identity": self.competing_identity_count,
                 "identity_divergence": self.divergence_count,
                 "recoverable_split": self.recoverable_split_count,
@@ -96,9 +103,15 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
 
     if touched:
         ph, args = _in_clause(touched)
+        verified_expr = verified_current_sha256_sql("f", "r")
         files = conn.execute(
-            f"SELECT id,photo_id,library_id,sha256,presence_status FROM files "
-            f"WHERE library_id=? OR photo_id IN ({ph}) ORDER BY photo_id,id",
+            f"""SELECT f.id,f.photo_id,f.library_id,f.sha256 AS expected_sha256,
+                       f.presence_status,f.health_status,f.current_revision_id,
+                       {verified_expr} AS sha256
+                  FROM files f
+                  LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+                 WHERE f.library_id=? OR f.photo_id IN ({ph})
+                 ORDER BY f.photo_id,f.id""",
             (library_id, *args),
         ).fetchall()
         org_history = conn.execute(
@@ -116,8 +129,14 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
             (*args, *args),
         ).fetchall()
     else:
+        verified_expr = verified_current_sha256_sql("f", "r")
         files = conn.execute(
-            "SELECT id,photo_id,library_id,sha256,presence_status FROM files WHERE library_id=? ORDER BY photo_id,id",
+            f"""SELECT f.id,f.photo_id,f.library_id,f.sha256 AS expected_sha256,
+                       f.presence_status,f.health_status,f.current_revision_id,
+                       {verified_expr} AS sha256
+                  FROM files f
+                  LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+                 WHERE f.library_id=? ORDER BY f.photo_id,f.id""",
             (library_id,),
         ).fetchall()
         org_history = (); lineage_history = (); all_resolutions = ()
@@ -130,7 +149,23 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
     library_files = [r for r in files if int(r["library_id"]) == int(library_id)]
     items: list[IdentityHealthItem] = []
 
-    # P0: the same current bytes are represented by multiple logical Photos.
+    # P0: no logical-identity advice may treat expected/stale hashes as current
+    # byte proof. Surface the uncertainty explicitly instead.
+    unverified_by_photo: dict[str, list] = {}
+    for r in library_files:
+        if r["sha256"] is None:
+            unverified_by_photo.setdefault(r["photo_id"], []).append(r)
+    for pid, rows in sorted(unverified_by_photo.items()):
+        healths = ", ".join(sorted({str(r["health_status"]) for r in rows}))
+        items.append(IdentityHealthItem(
+            "integrity_resolution_required", 0, "blocked",
+            f"Current-byte identity is unverified for {len(rows)} physical File(s) (health: {healths}).",
+            "Resolve integrity/availability and re-verify current bytes before merge, split, recovery, or exact-copy decisions.",
+            (pid,), tuple(sorted(r["id"] for r in rows)), None,
+            reason="verified current SHA-256 is unknown",
+        ))
+
+    # P1: the same verified current bytes are represented by multiple logical Photos.
     by_sha: dict[str, list] = {}
     for r in library_files:
         if r["sha256"]:
@@ -139,7 +174,7 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
         photos = tuple(sorted({r["photo_id"] for r in rows}))
         if len(photos) > 1:
             items.append(IdentityHealthItem(
-                "competing_identity", 0, "review_required",
+                "competing_identity", 1, "review_required",
                 f"Identical current bytes are assigned to {len(photos)} logical Photos.",
                 "Review competing logical Photo identity before creating lineage or splitting further.",
                 photos, tuple(sorted(r["id"] for r in rows)), sha,
@@ -153,7 +188,7 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
         hashes = tuple(sorted({r["sha256"] for r in rows if r["sha256"]}))
         if len(hashes) > 1:
             items.append(IdentityHealthItem(
-                "identity_divergence", 1, "review_required",
+                "identity_divergence", 2, "review_required",
                 f"One logical Photo currently contains {len(hashes)} distinct known byte states.",
                 "Investigate immutable revision evidence, then use controlled split only if human review supports it.",
                 (pid,), tuple(sorted(r["id"] for r in rows)), None,
@@ -176,7 +211,7 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
         source = row["source_photo_id"]; new = row["new_photo_id"]; created = row["created_at"]
         if rid in recovered:
             items.append(IdentityHealthItem(
-                "recombined_split", 4, "complete",
+                "recombined_split", 5, "complete",
                 "An audited identity split was later safely recombined.",
                 "No action required; retain as identity-resolution history.",
                 (source, new), resolution_id=rid,
@@ -196,6 +231,8 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
             eligible=False; reason="split-created Photo no longer contains exactly the originally moved File cohort"
         elif any(int(r["library_id"]) != int(library_id) for r in new_files):
             eligible=False; reason="one or more moved Files changed Library ownership"
+        elif any(r["sha256"] is None for r in (*source_files, *new_files)):
+            eligible=False; reason="one or more Files lack verified current content; integrity/availability resolution is required"
         elif any(r["sha256"] != row["sha256"] for r in new_files):
             eligible=False; reason="one or more moved Files changed bytes after the split"
         elif any(ts > created for pid in (source,new) for ts in org_by_photo.get(pid,())):
@@ -211,14 +248,14 @@ def build_identity_health(conn: Connection, *, library_id: int) -> IdentityHealt
 
         if eligible:
             items.append(IdentityHealthItem(
-                "recoverable_split", 2, "actionable",
+                "recoverable_split", 3, "actionable",
                 "An audited split remains provably reversible.",
                 "Inspect the resolution topology; recombination is available through the controlled recovery workflow.",
                 (source,new), moved, row["sha256"], rid, reason,
             ))
         else:
             items.append(IdentityHealthItem(
-                "review_only_split", 3, "review_only",
+                "review_only_split", 4, "review_only",
                 "An audited split is no longer safe to recombine automatically.",
                 "Inspect the resolution history and current topology; automatic recombination is intentionally disabled.",
                 (source,new), moved, row["sha256"], rid, reason,

@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlite3 import Connection
 
-IDENTITY_SPLIT_SCHEMA = "ppa-identity-split-plan/1"
+from ppa.current_identity import verified_current_sha256_sql
+from ppa.physical_observation import require_expected_physical_bytes
+
+IDENTITY_SPLIT_SCHEMA = "ppa-identity-split-plan/3"
 
 
 def _now() -> str:
@@ -27,9 +30,12 @@ class SplitFile:
     file_id: str
     library_id: int
     filename: str
+    path: str
     sha256: str
+    expected_sha256: str | None
     current_revision_id: str | None
     presence_status: str
+    health_status: str
 
 
 @dataclass(frozen=True)
@@ -72,8 +78,11 @@ def _fingerprint(source_photo_id: str, rows: list) -> str:
         "files": [
             {
                 "id": r["id"], "library_id": r["library_id"], "photo_id": r["photo_id"],
-                "sha256": r["sha256"], "current_revision_id": r["current_revision_id"],
-                "presence_status": r["presence_status"],
+                "path": r["path"],
+                "expected_sha256": r["expected_sha256"],
+                "verified_current_sha256": r["verified_current_sha256"],
+                "current_revision_id": r["current_revision_id"],
+                "presence_status": r["presence_status"], "health_status": r["health_status"],
             }
             for r in sorted(rows, key=lambda x: x["id"])
         ],
@@ -92,9 +101,14 @@ def plan_identity_split(conn: Connection, *, library_id: int, source_photo_id: s
     if conn.execute("SELECT 1 FROM photos WHERE id=?", (source_photo_id,)).fetchone() is None:
         raise ValueError(f"unknown logical Photo {source_photo_id}")
 
+    verified_expr = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        "SELECT id,library_id,photo_id,filename,sha256,current_revision_id,presence_status "
-        "FROM files WHERE photo_id=? ORDER BY id", (source_photo_id,),
+        f"""SELECT f.id,f.library_id,f.photo_id,f.filename,f.path,f.sha256 AS expected_sha256,
+                   f.current_revision_id,f.presence_status,f.health_status,
+                   {verified_expr} AS verified_current_sha256
+              FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.photo_id=? ORDER BY f.id""", (source_photo_id,),
     ).fetchall()
     if len(rows) < 2:
         raise ValueError("identity split requires the source Photo to have at least two physical Files")
@@ -104,23 +118,28 @@ def plan_identity_split(conn: Connection, *, library_id: int, source_photo_id: s
     selected = [by_id[fid] for fid in ids]
     if any(r["library_id"] != library_id for r in selected):
         raise ValueError("selected Files must belong to the requested Library")
-    hashes = {r["sha256"] for r in selected}
+    if any(r["verified_current_sha256"] is None for r in rows):
+        raise ValueError("identity split requires verified current content for every physical File on the source logical Photo")
+    hashes = {r["verified_current_sha256"] for r in selected}
     if None in hashes or "" in hashes or len(hashes) != 1:
         raise ValueError("selected Files must share one known current SHA-256")
     sha = next(iter(hashes))
 
-    known_source_hashes = {r["sha256"] for r in rows if r["sha256"]}
+    known_source_hashes = {r["verified_current_sha256"] for r in rows if r["verified_current_sha256"]}
     if len(known_source_hashes) < 2:
         raise ValueError("source logical Photo is not currently hash-divergent")
 
+    other_verified = verified_current_sha256_sql("f", "r")
     competing = conn.execute(
-        "SELECT DISTINCT photo_id FROM files WHERE sha256=? AND photo_id<>? LIMIT 1",
+        f"""SELECT DISTINCT f.photo_id FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE ({other_verified})=? AND f.photo_id<>? LIMIT 1""",
         (sha, source_photo_id),
     ).fetchone()
     if competing is not None:
         raise ValueError("identical current bytes already belong to another logical Photo; resolve that identity inconsistency before splitting")
 
-    cohort = [r for r in rows if r["sha256"] == sha]
+    cohort = [r for r in rows if r["verified_current_sha256"] == sha]
     cohort_ids = {r["id"] for r in cohort}
     if any(r["library_id"] != library_id for r in cohort):
         raise ValueError("this hash cohort spans multiple Libraries; cross-Library identity resolution is not permitted in Phase 10.3")
@@ -148,9 +167,10 @@ def plan_identity_split(conn: Connection, *, library_id: int, source_photo_id: s
             raise ValueError("split would strand existing Album/Tag membership for the source Photo in this Library")
 
     split_files = tuple(SplitFile(
-        r["id"], r["library_id"], r["filename"], r["sha256"], r["current_revision_id"], r["presence_status"]
+        r["id"], r["library_id"], r["filename"], r["path"], r["verified_current_sha256"],
+        r["expected_sha256"], r["current_revision_id"], r["presence_status"], r["health_status"]
     ) for r in cohort)
-    remaining_hashes = tuple(sorted({r["sha256"] for r in remaining if r["sha256"]}))
+    remaining_hashes = tuple(sorted({r["verified_current_sha256"] for r in remaining if r["verified_current_sha256"]}))
     return IdentitySplitPlan(
         IDENTITY_SPLIT_SCHEMA, library_id, source_photo_id, sha, split_files,
         len(remaining), remaining_hashes, _fingerprint(source_photo_id, rows),
@@ -165,10 +185,27 @@ def execute_identity_split(conn: Connection, plan: IdentitySplitPlan, *, note: s
     file_ids = tuple(f.file_id for f in plan.files)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        fresh = plan_identity_split(conn, library_id=plan.library_id,
-                                    source_photo_id=plan.source_photo_id, file_ids=file_ids)
+        try:
+            fresh = plan_identity_split(conn, library_id=plan.library_id,
+                                        source_photo_id=plan.source_photo_id, file_ids=file_ids)
+        except ValueError as exc:
+            raise ValueError("identity split plan is stale; refresh the divergence and review again") from exc
         if fresh.evidence_fingerprint != plan.evidence_fingerprint or fresh.sha256 != plan.sha256:
             raise ValueError("identity split plan is stale; refresh the divergence and review again")
+        verified_expr = verified_current_sha256_sql("f", "r")
+        physical_rows = conn.execute(
+            f"""SELECT f.id,f.path,{verified_expr} AS verified_current_sha256
+                  FROM files f
+                  LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+                 WHERE f.photo_id=? ORDER BY f.id""",
+            (fresh.source_photo_id,),
+        ).fetchall()
+        if any(r["verified_current_sha256"] is None for r in physical_rows):
+            raise ValueError("identity split requires verified current content for every physical File on the source logical Photo")
+        attestation_inputs = tuple(
+            (r["id"], r["path"], str(r["verified_current_sha256"])) for r in physical_rows
+        )
+        before_physical = require_expected_physical_bytes(attestation_inputs, context="identity split")
         new_photo_id = str(uuid.uuid4())
         resolution_id = str(uuid.uuid4())
         now = _now()
@@ -187,6 +224,9 @@ def execute_identity_split(conn: Connection, plan: IdentitySplitPlan, *, note: s
             (resolution_id, plan.library_id, plan.source_photo_id, new_photo_id, plan.sha256,
              json.dumps(list(file_ids), separators=(",", ":")), plan.evidence_fingerprint, note, now),
         )
+        after_physical = require_expected_physical_bytes(attestation_inputs, context="identity split")
+        if after_physical != before_physical:
+            raise ValueError("identity split: physical File changed during execution; run Verify / refresh investigation")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -202,18 +242,21 @@ def list_identity_resolutions(conn: Connection, *, photo_id: str | None = None):
         (photo_id, photo_id),
     ).fetchall()
 
-IDENTITY_RESOLUTION_REVIEW_SCHEMA = "ppa-identity-resolution-review/1"
-IDENTITY_RECOVERY_SCHEMA = "ppa-identity-recovery-plan/1"
+IDENTITY_RESOLUTION_REVIEW_SCHEMA = "ppa-identity-resolution-review/3"
+IDENTITY_RECOVERY_SCHEMA = "ppa-identity-recovery-plan/3"
 
 @dataclass(frozen=True)
 class ResolutionFileState:
     file_id: str
     filename: str
+    path: str
     library_id: int
     photo_id: str
     sha256: str | None
+    expected_sha256: str | None
     current_revision_id: str | None
     presence_status: str
+    health_status: str
 
 @dataclass(frozen=True)
 class IdentityResolutionReview:
@@ -281,12 +324,19 @@ def _parse_file_ids(raw: str) -> tuple[str, ...]:
 
 
 def _file_states(conn: Connection, photo_id: str) -> tuple[ResolutionFileState, ...]:
+    verified_expr = verified_current_sha256_sql("f", "r")
     rows = conn.execute(
-        "SELECT id,filename,library_id,photo_id,sha256,current_revision_id,presence_status "
-        "FROM files WHERE photo_id=? ORDER BY library_id,filename COLLATE NOCASE,id", (photo_id,),
+        f"""SELECT f.id,f.filename,f.path,f.library_id,f.photo_id,f.sha256 AS expected_sha256,
+                   f.current_revision_id,f.presence_status,f.health_status,
+                   {verified_expr} AS verified_current_sha256
+              FROM files f
+              LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+             WHERE f.photo_id=? ORDER BY f.library_id,f.filename COLLATE NOCASE,f.id""", (photo_id,),
     ).fetchall()
-    return tuple(ResolutionFileState(r['id'], r['filename'], r['library_id'], r['photo_id'], r['sha256'],
-                                     r['current_revision_id'], r['presence_status']) for r in rows)
+    return tuple(ResolutionFileState(
+        r['id'], r['filename'], r['path'], r['library_id'], r['photo_id'], r['verified_current_sha256'],
+        r['expected_sha256'], r['current_revision_id'], r['presence_status'], r['health_status']
+    ) for r in rows)
 
 
 def _later_identity_dependent_change(conn: Connection, *, source_photo_id: str, new_photo_id: str,
@@ -337,6 +387,8 @@ def review_identity_resolution(conn: Connection, resolution_id: str) -> Identity
         eligible = False; reason = "split-created Photo no longer contains exactly the originally moved File cohort"
     elif any(f.library_id != row['library_id'] for f in new_files):
         eligible = False; reason = "one or more moved Files changed Library ownership"
+    elif any(f.sha256 is None for f in (*source_files, *new_files)):
+        eligible = False; reason = "one or more Files do not have verified current content; resolve integrity/availability first"
     elif any(f.sha256 != row['sha256'] for f in new_files):
         eligible = False; reason = "one or more moved Files changed bytes after the split"
     else:
@@ -345,8 +397,11 @@ def review_identity_resolution(conn: Connection, resolution_id: str) -> Identity
         if later:
             eligible = False; reason = later
         else:
+            verified_expr = verified_current_sha256_sql("f", "r")
             competing = conn.execute(
-                "SELECT 1 FROM files WHERE sha256=? AND photo_id NOT IN (?,?) LIMIT 1",
+                f"""SELECT 1 FROM files f
+                      LEFT JOIN file_revisions r ON r.id=f.current_revision_id
+                     WHERE ({verified_expr})=? AND f.photo_id NOT IN (?,?) LIMIT 1""",
                 (row['sha256'], row['source_photo_id'], row['new_photo_id']),
             ).fetchone()
             if competing is not None:
@@ -379,9 +434,17 @@ def execute_identity_recovery(conn: Connection, plan: IdentityRecoveryPlan, *, n
         raise ValueError("identity-recovery note is too long")
     try:
         conn.execute("BEGIN IMMEDIATE")
-        fresh = plan_identity_recovery(conn, plan.resolution_id)
+        try:
+            fresh = plan_identity_recovery(conn, plan.resolution_id)
+        except ValueError as exc:
+            raise ValueError("identity recovery plan is stale; refresh and review again") from exc
         if fresh.evidence_fingerprint != plan.evidence_fingerprint:
             raise ValueError("identity recovery plan is stale; refresh and review again")
+        physical_states = (*_file_states(conn, fresh.source_photo_id), *_file_states(conn, fresh.new_photo_id))
+        if any(f.sha256 is None for f in physical_states):
+            raise ValueError("identity recovery requires verified current content for every relevant physical File")
+        attestation_inputs = tuple((f.file_id, f.path, str(f.sha256)) for f in physical_states)
+        before_physical = require_expected_physical_bytes(attestation_inputs, context="identity recovery")
         placeholders = ",".join("?" for _ in fresh.moved_file_ids)
         cur = conn.execute(
             f"UPDATE files SET photo_id=? WHERE id IN ({placeholders}) AND photo_id=?",
@@ -401,6 +464,9 @@ def execute_identity_recovery(conn: Connection, plan: IdentityRecoveryPlan, *, n
             (recovery_id, fresh.resolution_id, fresh.library_id, fresh.source_photo_id, fresh.new_photo_id,
              json.dumps(list(fresh.moved_file_ids), separators=(",", ":")), fresh.evidence_fingerprint, note, now),
         )
+        after_physical = require_expected_physical_bytes(attestation_inputs, context="identity recovery")
+        if after_physical != before_physical:
+            raise ValueError("identity recovery: physical File changed during execution; run Verify / refresh investigation")
         conn.commit()
     except Exception:
         conn.rollback(); raise

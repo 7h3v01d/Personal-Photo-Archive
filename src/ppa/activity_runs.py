@@ -145,14 +145,10 @@ def export_run_transcript(config, run_id: str, destination: Path) -> Path:
     destination = Path(destination)
     if destination.suffix.lower() != ".json":
         destination = destination.with_suffix(".json")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_name(destination.name + ".tmp")
-    try:
-        tmp.write_text(json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return destination
+    from ppa.safe_export import safe_export_text
+    return safe_export_text(
+        destination, json.dumps(envelope, indent=2, sort_keys=True), config=config
+    )
 
 
 def concise_runs_text(runs: Iterable[ActivityRun]) -> str:

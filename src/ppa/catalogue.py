@@ -60,6 +60,7 @@ class GridItem:
     height_px: int | None
     size_bytes: int
     copy_count: int  # files sharing this Photo (1 == unique)
+    health_status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -247,6 +248,7 @@ def _grid_item(row) -> GridItem:
         height_px=row["height_px"],
         size_bytes=row["size_bytes"],
         copy_count=row["copy_count"],
+        health_status=row["health_status"],
     )
 
 

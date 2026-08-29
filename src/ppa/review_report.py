@@ -244,15 +244,11 @@ def export_review_progress(config, session: PilotSession,
     """Create a shareable ZIP report; never include DB/photo/session bytes."""
     runs = load_activity_runs(config.log_path, limit=10000)
     report = build_review_progress_report(session, current, activity_runs=runs)
+    from ppa.safe_export import safe_export_temp
     destination = Path(destination)
     if destination.suffix.lower() != ".zip":
         destination = destination.with_suffix(".zip")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp",
-                                    dir=str(destination.parent))
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
+    with safe_export_temp(destination, config=config) as (validated, tmp):
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("review-progress.md", markdown_text(report))
             zf.writestr("review-progress.json", report.to_json(pretty=True) + "\n")
@@ -261,7 +257,4 @@ def export_review_progress(config, session: PilotSession,
                         "Contains aggregate review/audit metrics and matching operational run summaries only.\n"
                         "It does not contain the catalogue database, source photographs, thumbnails, photo IDs, "
                         "raw paths, raw log messages, or the pilot-session artifact.\n")
-        os.replace(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return destination
+    return validated
