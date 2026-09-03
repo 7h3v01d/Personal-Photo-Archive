@@ -353,3 +353,14 @@ def test_recovery_cli_json_cannot_overwrite_qualified_donor(tmp_path: Path, monk
     assert donor.read_bytes() == donor_before
     with Image.open(donor) as image:
         image.verify()
+
+
+def test_recorded_recovery_proposal_cannot_be_deleted(tmp_path: Path) -> None:
+    import sqlite3
+    conn, rows, *_ = _recovery_case(tmp_path)
+    plan = build_recovery_plan(conn, file_id=rows["target.jpg"]["id"])
+    record_recovery_plan_proposal(conn, plan)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only|cannot be deleted"):
+        conn.execute("DELETE FROM archive_recovery_plan_proposals WHERE proposal_id=?", (plan.proposal_id,))
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM archive_recovery_plan_proposals WHERE proposal_id=?", (plan.proposal_id,)).fetchone()[0] == 1

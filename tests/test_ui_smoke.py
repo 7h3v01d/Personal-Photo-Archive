@@ -897,7 +897,10 @@ def test_phase10_competing_identity_investigation_dialog_constructs(app, tmp_pat
     try:
         dialog.show(); evidence.show(); app.processEvents()
         assert dialog.tabs.count()==5
-        assert dialog.identity_health_table.item(0,0).text()=='P0'
+        # This fixture creates coherent current FileRevisions for both Files, so
+        # current-byte identity is verified. The first issue is therefore the
+        # competing-identity P1, not the P0 unverified-current gate.
+        assert dialog.identity_health_table.item(0,0).text()=='P1'
         dialog.identity_health_table.selectRow(0); app.processEvents()
         assert dialog.investigate_competing_btn.text()=='Investigate competing identity…'
         assert evidence.windowTitle()=='Competing Identity Investigation'

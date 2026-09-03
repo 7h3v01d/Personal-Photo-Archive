@@ -200,6 +200,8 @@ def test_export_reconciliation_csv(tmp_path):
     _jpg(lib / "reset.jpg", "2001:01:01 09:00:00", "Canon", "A70")
     conn = _catalogue(tmp_path)
     scan_library(conn, lib); metadata.extract_stale(conn)
+    from ppa.safe_export import enroll_export_root
+    enroll_export_root(tmp_path, conn=conn)
     out = tmp_path / "report.csv"
     n = export_reconciliation_csv(conn, out)
     assert n == 2 and out.exists()

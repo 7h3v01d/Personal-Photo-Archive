@@ -2,25 +2,25 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import zipfile
 from pathlib import Path
 
 from ppa.config import Config
 from ppa.diagnostics import export_diagnostics, sanitize_text, structured_log_path, tail_text
 from ppa.logging_setup import configure_logging, get_logger
+from ppa.db import connect
+from ppa.scanner import scan_library
+from ppa.safe_export import enroll_export_root
 
 
 def _config(tmp_path: Path) -> Config:
     db = tmp_path / "data" / "catalogue.sqlite3"
     db.parent.mkdir(parents=True)
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-    conn.execute("INSERT INTO schema_version VALUES (12)")
-    conn.execute("CREATE TABLE libraries (id INTEGER PRIMARY KEY, canonical_path TEXT, display_path TEXT)")
     lib = tmp_path / "photos" / "family"
-    conn.execute("INSERT INTO libraries(id, canonical_path, display_path) VALUES (1, ?, ?)", (str(lib), str(lib)))
-    conn.commit(); conn.close()
+    lib.mkdir(parents=True)
+    conn = connect(db)
+    scan_library(conn, lib)
+    conn.close()
     return Config(db_path=db, log_level="INFO", log_path=tmp_path / "data" / "logs" / "ppa.log", library_directories=[])
 
 
@@ -60,6 +60,7 @@ def test_export_is_sanitized_and_excludes_db_and_photo_content(tmp_path):
     photo.parent.mkdir(parents=True, exist_ok=True)
     photo.write_bytes(b"SECRET_PHOTO_BYTES")
 
+    _c = connect(cfg.db_path); enroll_export_root(tmp_path, conn=_c, config=cfg); _c.close()
     out = export_diagnostics(cfg, tmp_path / "share.zip")
     with zipfile.ZipFile(out) as zf:
         names = set(zf.namelist())

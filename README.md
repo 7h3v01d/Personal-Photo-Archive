@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12 adversarially ACCEPTED/FROZEN at 12.4.2; Phase 13 adversarially ACCEPTED/FROZEN at 13.0.1; Phase 14.0.1 recovery preservation staging hardening active.**
+Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12 adversarially ACCEPTED/FROZEN at 12.4.2; Phase 13 adversarially ACCEPTED/FROZEN at 13.0.1; Phase 14.1.17.1 exact destructive child authority Windows-gate correction active.**
 
 The Library -> File -> FileRevision -> Observation model remains the archive-core
 provenance boundary. Later chronology, Event, organisation, identity, navigation,
@@ -17,7 +17,7 @@ execution boundaries.
 
 See `docs/HARDENING.md` for the Archive Core findings -> fix -> test map, and `docs/PHASE8_14_1_PRE_PHASE9_HARDENING.md` for the independent pre-Phase-9 UI/integration hardening pass. Per the reviewer, Phase 6 (Date Reliability Engine) can
 unblock once a confirming adversarial pass on this build comes back clean.
-Source-file safety was never implicated: no path writes to originals.
+Pre-freeze adversarial Phase-14 reviews did expose and close source-safety defects in temporary-write and cleanup authority. The current safety contract therefore treats those historical findings as regression requirements rather than erasing them; accepted/frozen phases still prohibit source-photo mutation except where a future explicitly authorised recovery phase says otherwise.
 
 ## Setup
 
@@ -777,6 +777,91 @@ python -m ppa.cli recovery-stage-preservation <proposal-id> --apply --json prese
 
 Without `--apply`, the command is read-only and only shows readiness/evidence. With `--apply`, it may write the verified suspect-byte preservation copy to PPA operational storage, but it still has `target_replacement_authorized=false`, `donor_materialization_authorized=false`, and `recovery execution authorized=false`. See `docs/PHASE14_0_RECOVERY_PRESERVATION.md`.
 
+## Phase 14.1.3 — Directory-Handle Cleanup Hardening
+
+A further adversarial pass confirmed the Phase-14.1.2 transaction fixes but demonstrated a directory-level TOCTOU: cleanup verified the stage directory pathname and later unlinked children through that pathname, so a rename followed by a symlink substitution could redirect deletion into a source Library. Phase 14.1.3 introduces `ppa.secure_write.BoundDirectory`; destructive child operations are descriptor-relative to the exact operational directory object PPA opened, and cleanup receives child names rather than complete paths. Phase-14.0 rollback, Phase-14.1 rollback and donor-orphan reconciliation are converted to this authority model; shared temporary/cache cleanup is hardened on the same principle. Platforms without safe descriptor-relative mutation fail closed and leave operational debris instead of falling back to pathname deletion. Schema remains v35 and no target-replacement authority is introduced. See `docs/PHASE14_1_3_DIRECTORY_HANDLE_CLEANUP_HARDENING.md`.
+
+## Phase 14.1.2 — Recovery Commit-Boundary Hardening
+
+A follow-up adversarial review confirmed the Phase-14.1.1 descriptor-bound source-write repair, then found two narrower recovery-consistency races. Phase 14.1.2 makes preservation/materialization rollback cleanup explicitly commit-aware: once an immutable checkpoint is durably committed, exception cleanup can no longer delete the evidence it records, including the tiny commit→Python-flag interruption interval. Donor-orphan reconciliation now holds `BEGIN IMMEDIATE`, rechecks checkpoint authority immediately before unlink, and therefore serializes with donor materialization. The shared secured-install primitive also restores a pre-existing destination if a close/install pathname substitution is detected after destination-side effects. Schema remains v35 and no source-target recovery write authority is introduced. See `docs/PHASE14_1_2_RECOVERY_COMMIT_BOUNDARY_HARDENING.md`.
+
+## Phase 14.1.1 — Filesystem Write-Identity Hardening
+
+An adversarial review of Phase 14.1 found a shared low-level TOCTOU class: several writers created a secure temporary file and then later reopened its pathname, allowing a hard-link/symlink substitution to redirect bytes into a source photograph before later verification could roll the database back. Phase 14.1.1 introduces `ppa.secure_write.BoundTemporaryFile`: the `mkstemp()` descriptor remains the write authority, all bytes are written through that exact file object, pathname↔descriptor identity is re-proved before atomic installation, and the installed object is identity-checked again. The same primitive now protects safe exports, Phase-14.0 preservation, Phase-14.1 donor materialization, manifests and thumbnails. Migration 035 also makes Phase-13/14 recovery checkpoints DELETE-immutable, Phase-14.1 has explicit crash/orphan reconciliation, and wheel builds now package and bootstrap all SQL migrations. See `docs/PHASE14_1_1_FILESYSTEM_WRITE_IDENTITY_HARDENING.md`.
+
 ## Phase 14.1 — Verified Donor Materialization
 
 Phase 14.1 appends the next recovery evidence layer without crossing the source-target write boundary. A committed Phase-14 preservation stage can now materialize the freshly re-attested expected donor bytes into the same protected operational stage as `expected-donor.<ext>`, with an independently hashed donor manifest and immutable migration-034 checkpoint. The Phase-13 proposal, human recovery intent, Phase-14 preservation evidence, donor physical bytes, and target physical state are all revalidated before and again around commit. The original donor is never modified and the target is never created/replaced; all Phase-14.1 plans/results retain `target_replacement_performed=false` and `recovery_execution_authorized=false`. See `docs/PHASE14_1_VERIFIED_DONOR_MATERIALIZATION.md`.
+
+
+
+## Phase 14.1.6 — Windows Native Gate Corrections
+
+The first real Windows/NTFS full-suite run of the conditionally accepted 14.1.5 artifact executed 672 tests and exposed cross-platform test-contract failures rather than a new reproduced source-authority bypass. Phase 14.1.6 makes rollback/orphan expectations capability-aware: POSIX retains descriptor-bound cleanup requirements, while Windows continues to leave uncheckpointed debris rather than delete through unbound pathnames and proves the verified orphan-forward path instead. Native junction rejection is classified explicitly as unsafe reparse traversal; POSIX-only `BoundDirectory` race tests no longer run where that primitive is intentionally unavailable. The wheel regression now exercises the declared setuptools backend directly/offline, and a previously unexecuted PySide6 smoke assertion is corrected to the current verified-identity P1 semantics. No schema change and no target-replacement authority are introduced. See `docs/PHASE14_1_6_WINDOWS_NATIVE_GATE_CORRECTIONS.md`.
+
+## Phase 14.1.5 — Windows Adoption Write-Authority Hardening
+
+A follow-up Windows adversarial pass confirmed that 14.1.4 fixed the stranded-orphan dead end and reparse/junction handling, but demonstrated a remaining real-directory substitution gap: the unsupported Windows orphan-adoption path could still create a missing `donor-materialization.json` through an unbound stage pathname. Phase 14.1.5 removes that filesystem write. When no valid manifest already exists, the canonical `ppa-recovery-donor-manifest/1` payload and its SHA-256 are stored directly in the immutable catalogue checkpoint (`donor_manifest_storage='catalogue_embedded'`); the filesystem manifest remains absent. Migration 036 records that representation explicitly. Normal descriptor-bound materialisation remains filesystem-backed. No target replacement authority is introduced. See `docs/PHASE14_1_5_WINDOWS_ADOPTION_WRITE_AUTHORITY_HARDENING.md`.
+
+## Phase 14.1.4 — Windows Orphan Recovery Hardening
+
+A Windows-focused adversarial pass confirmed the POSIX `BoundDirectory` repair but found a liveness dead end: Windows correctly refused unsafe pathname deletion after an interrupted donor materialisation, yet had no application-controlled way to move a stranded verified final donor artifact forward. Phase 14.1.4 keeps Windows deletion authority disabled and adds **verified orphan adoption** instead. When descriptor-bound directory mutation is unavailable, reconciliation may append the missing immutable materialisation checkpoint only after freshly proving the committed Phase-14 stage, immutable expected SHA/size, current source donor, current target state, single-link non-reparse orphan identity, and absence of ambiguous temporary debris. Invalid or ambiguous debris is left untouched for explicit manual intervention.
+
+Windows junction/reparse handling is now explicit: operational recovery, secure-write and cache authority reject Windows reparse points (including junctions) and existing reparse components in protected paths. Native Windows regressions are included for interrupted donor adoption and stage-junction substitution; they are skipped on non-Windows runners and should be run on the normal NTFS/Windows release machine. No target replacement authority is introduced. Schema remains v35. See `docs/PHASE14_1_4_WINDOWS_ORPHAN_RECOVERY_HARDENING.md`.
+
+## Phase 14.1.7 — Parent Write-Authority Binding
+
+14.1.7 introduced expected-parent identity propagation and POSIX descriptor-relative child creation. Its attempted Windows share-mode directory pin proved insufficient on the native Windows gate: NTFS still permitted the tested directory rename while the handle was open. The identity propagation and POSIX design remain valid, but the Windows write-authority mechanism is superseded by Phase 14.1.8. See `docs/PHASE14_1_7_PARENT_WRITE_AUTHORITY_BINDING.md`.
+
+## Phase 14.1.8 — Windows Handle-Relative Write Authority
+
+The native 14.1.7 gate proved that preventing directory rename through Win32 share modes is not a reliable authority primitive for this project. Phase 14.1.8 removes the dependency on rename blocking. Windows now opens the exact authorised directory object and creates temporary children with `NtCreateFile` relative to that directory handle; final installation, rollback, and backup namespace changes use handle-relative rename/delete operations against the same directory object. A directory may be renamed and another ordinary directory may occupy its former pathname, but recovery/output writes cannot be redirected into that replacement object. The lexical pathname is revalidated only to decide whether the operation may report success. POSIX continues to use `BoundDirectory`/`dir_fd`. Schema remains v36 and no source-photo or recovery-target write authority is added. See `docs/PHASE14_1_8_WINDOWS_HANDLE_RELATIVE_WRITE_AUTHORITY.md`.
+
+## Phase 14.1.10 — Native Windows Regression Harness Correction
+
+The real Windows 10 full-suite gate for 14.1.9 completed with 667 passing tests and only two failures. Both failures were in regressions that no longer matched the hardened Windows authority model: the safe-export rollback test still monkeypatched `os.rename`, although Windows installation now uses native handle-relative rename; and the native handle-relative placement test tried to reopen the still-open native temp child by pathname, which Windows can legitimately reject under the handle's sharing mode.
+
+Phase 14.1.10 changes no production filesystem authority and no recovery evidence semantics. It retargets the Windows safe-export rollback regression to the actual `WindowsDirectoryPin.rename_fd` final-install boundary and verifies that an injected native install failure restores the previous export. The native directory-substitution regression now verifies live bytes through the authorised descriptor, verifies create/rename namespace state through the authorised directory handle, closes the child descriptor, and only then reopens `stage.parked/installed.txt` by pathname. POSIX retains the original descriptor-relative hard-link substitution attack. Schema remains v36. See `docs/PHASE14_1_10_WINDOWS_REGRESSION_HARNESS_CORRECTION.md`.
+
+## Phase 14.1.9 — Windows NT-Native Rename Correction
+
+The native 14.1.8 Windows run exposed a defect in the first handle-relative installation implementation: child creation through `NtCreateFile` was viable, but the `SetFileInformationByHandle(FILE_RENAME_INFO)` rename buffer/call returned `ERROR_INVALID_PARAMETER (87)` on Windows 10, breaking safe exports and thumbnail installation. Phase 14.1.9 keeps the already-authorised directory-handle model and replaces that rename half with `NtSetInformationFile(FileRenameInformation)` using the same `RootDirectory` handle and a correctly sized/aligned `FILE_RENAME_INFORMATION` buffer. No recovery evidence semantics change; schema remains v36. The Windows test procedure must use a dedicated spacious `--basetemp` because repeated full-suite runs exhausted the user's C: temporary volume and caused a large collateral failure cascade unrelated to catalogue semantics. See `docs/PHASE14_1_9_WINDOWS_NT_NATIVE_RENAME_CORRECTION.md`.
+
+## Phase 14.1.11 — Authority Bootstrap Binding
+
+The 14.1.10 adversarial review confirmed the POSIX descriptor-bound and Windows `NtCreateFile` / `NtSetInformationFile` writer layers, but reproduced a one-operation-earlier authority-bootstrap TOCTOU: a registered Library could be renamed onto an apparently safe output/cache/preservation pathname **before** PPA captured the directory identity, causing the secure writer to faithfully bind the wrong object. Phase 14.1.11 reverses that trust order. Directory objects are now selected/bound first and the exact object is then validated before it receives namespace authority. Missing directory components are created relative to an already-bound parent; Phase-14 UUID stages are no longer created with raw `Path.mkdir()`.
+
+Migration 037 persists verified Library-root filesystem identity (`root_fs_device_id`, `root_fs_object_id`, `root_fs_verified_at`) and prevents silent ordinary rebinds. Safe export rejects a bound parent whose object identity is a registered Library root. Thumbnail cache bootstrap is handle/descriptor-relative and requires PPA operational cache state before writes. Existing unverified Library-root identities remain UNKNOWN and block authority-sensitive output/recovery until verified. Schema is now **v37**. See `docs/PHASE14_1_11_AUTHORITY_BOOTSTRAP_BINDING.md`.
+
+
+## Phase 14.1.12 — Thumbnail Authority Classification
+
+The 14.1.11 adversarial review confirmed the shared authority-bootstrap primitive, safe-export binding, Phase-14 preservation-root binding, Library filesystem-identity persistence and scanner no-rebind protection. It then reproduced one remaining caller-classification bypass: `ThumbnailCache` could authorise a registered source Library merely because the bound directory was empty, carried the cache marker, or contained cache-shaped filenames. An empty Library therefore received `.ppa-thumbnail-cache-v1`, and a deliberately cache-shaped but genuinely catalogued source PNG could be replaced by a generated derivative.
+
+Phase 14.1.12 changes no filesystem primitive and no recovery evidence model. Writable thumbnail caches now require explicit catalogue-backed authority context. A `ThumbnailAuthorityPolicy` snapshots every registered Library root path and verified filesystem-object identity; `ensure_directory_authority(..., validator=...)` validates each exact bound ancestor/child before any missing cache component can be created. A bound object matching a Library root identity, or resolving inside a registered Library root, fails closed before marker, PNG or attestation creation. Cache markers and cache-shaped filenames remain operational hygiene only and are explicitly **not authority credentials**. `ThumbnailWorker` and forensic mismatch caches now propagate catalogue context explicitly. Permanent regressions cover omitted authority context, a missing cache path inside a Library, an empty Library swapped onto the cache pathname, and a cache-shaped catalogued PNG that must remain byte-identical. Schema remains **v37**. See `docs/PHASE14_1_12_THUMBNAIL_AUTHORITY_CLASSIFICATION.md`.
+
+## Phase 14.1.13 — Source-Tree Object Authority
+
+The 14.1.12 adversarial review confirmed that catalogue-backed thumbnail authority classification closes the root-level cache substitution attacks, but reproduced the same topology transition with a **Library child directory**: after `Library/subdir` was scanned and then renamed onto the cache pathname, its object identity no longer matched the Library root and its current pathname no longer sat beneath that root. A cache-shaped catalogued source PNG inside that moved directory was therefore overwritten.
+
+Phase 14.1.13 makes source authority tree-aware rather than root-only. Migration 038 adds `library_directory_identities` plus a per-Library source-tree completeness state. Complete scans record the filesystem identity of every traversed directory, including empty folders; those identities remain historically source-associated even after the directory disappears from its original pathname, until the Library is explicitly forgotten. `SourceTreeAuthorityPolicy` is shared by thumbnails, safe export and Phase-14 preservation-root bootstrap, so any exact bound directory object previously observed inside a Library is rejected as writable operational authority regardless of its current pathname. Incomplete/upgraded source-tree inventories fail closed until a complete rescan. Schema is now **v38**. See `docs/PHASE14_1_13_SOURCE_TREE_OBJECT_AUTHORITY.md`.
+
+
+
+## Phase 14.1.14 — Positive Operational Authority
+
+Phase 14.1.14 introduced durable positive ownership for operational directories and files through migration 039. Operational roots are no longer writable merely because they are outside a registered Library or have a cache/export-shaped pathname. The model is retained by later phases; see `docs/PHASE14_1_14_POSITIVE_OPERATIONAL_AUTHORITY.md`.
+
+## Phase 14.1.15 — Positive Ownership Proof Binding
+
+Phase 14.1.15 bound ownership evidence to the exact secure creation/installation operation. Directory enrollment uses creator-issued provenance, export replacement is tied to the exact previously owned filesystem identity, post-install ownership recording uses the installed temporary object's identity, and thumbnail children require per-object positive ownership. Schema remains v39. See `docs/PHASE14_1_15_POSITIVE_OWNERSHIP_PROOF_BINDING.md`.
+
+## Phase 14.1.16 — Atomic Namespace Install / Non-Destructive Rollback
+
+Phase 14.1.16 closes the shared installer races found after 14.1.15. POSIX final installation and backup parking use filesystem-enforced atomic no-replace rename semantics rather than check-then-`rename()`. Rollback never unlinks or overwrites an unexpected destination; if safe restoration cannot be proven, both the unexpected object and the previous PPA-owned object are left intact, with the latter retained as rollback debris. Windows rollback restoration now uses `replace=False` and preserves the parked object when the destination becomes occupied. POSIX backup and failed-temporary cleanup deliberately retain operational debris because a general inode-bound compare-and-unlink primitive is unavailable. Schema remains **v39**. See `docs/PHASE14_1_16_ATOMIC_NAMESPACE_INSTALL.md`.
+
+## Phase 14.1.17 — Exact Destructive Child Authority
+
+Phase 14.1.17 applies the same exact-object rule to cleanup. POSIX recovery rollback no longer performs child-name unlink or stage-name rmdir after an earlier identity check; directory-child creation failure also retains debris rather than deleting a substituted replacement. Donor orphan reconciliation is non-destructive on every platform: verified final artifacts can be adopted forward, while temporary/invalid/ambiguous debris is retained for manual intervention. Windows may retain exact-handle deletion where the destructive operation is bound to the object itself. Schema remains **v39**. See `docs/PHASE14_1_17_EXACT_DESTRUCTIVE_CHILD_AUTHORITY.md`.
+
+**14.1.17.1 Windows gate correction:** the POSIX-only directory-child failure regression is now explicitly skipped on Windows, and native `ERROR_FILE_EXISTS` / `ERROR_ALREADY_EXISTS` from the final Windows no-replace rename is normalized into `SecureWriteError` so higher layers report the expected archive-safety refusal. The native no-replace behavior itself was already correct; this correction changes error-contract handling only. Schema remains **v39**.

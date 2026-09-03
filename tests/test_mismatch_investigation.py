@@ -42,7 +42,7 @@ def test_mismatch_investigation_uses_attested_expected_and_fresh_current(tmp_pat
     expected_sha = row["sha"]
     cache_dir = tmp_path / "thumbs"
 
-    cache = ThumbnailCache(cache_dir, size=256)
+    cache = ThumbnailCache(cache_dir, size=256, conn=conn)
     expected_png = cache.get_or_create_attested(image, expected_sha)
     assert expected_png is not None
 
@@ -79,7 +79,7 @@ def test_legacy_catalogue_cache_is_shown_but_not_called_attested(tmp_path: Path)
     scan_library(conn, library)
     row = _file_row(conn, image)
     cache_dir = tmp_path / "thumbs"
-    cache = ThumbnailCache(cache_dir, size=256)
+    cache = ThumbnailCache(cache_dir, size=256, conn=conn)
     legacy = cache.get_or_create(image, row["sha"])
     assert legacy is not None
     assert cache.attested_cached_path(image, row["sha"]) is None
@@ -118,7 +118,7 @@ def test_exact_copy_can_reestablish_expected_visual_reference(tmp_path: Path) ->
     assert inv.expected_reference_file_id == good_row["id"]
     assert inv.expected_reference_attested is True
     assert Path(inv.expected_reference_path).is_file()
-    assert ThumbnailCache(cache_dir, size=256).attested_cached_path(
+    assert ThumbnailCache(cache_dir, size=256, conn=conn).attested_cached_path(
         good_copy, bad_row["sha"]
     ) is not None
 

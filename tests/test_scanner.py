@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from ppa.db import connect
@@ -333,3 +334,128 @@ def test_unchanged_rescan_does_not_rehash(tmp_path: Path) -> None:
     second = scan_library(conn, library)  # nothing touched
     assert second.known_files == 1
     assert second.hashed_files == 0  # trusted stored hash, no re-read
+
+
+def test_library_root_filesystem_identity_is_persisted_and_not_silently_rebound(tmp_path: Path) -> None:
+    import os
+    from ppa.scanner import LibraryRootIdentityChangedError
+
+    library = tmp_path / "library"
+    _make_image(library / "a.jpg")
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    scan_library(conn, library)
+    row = conn.execute(
+        "SELECT root_fs_device_id,root_fs_object_id,root_fs_verified_at FROM libraries"
+    ).fetchone()
+    assert row["root_fs_device_id"] is not None
+    assert row["root_fs_object_id"] is not None
+    assert row["root_fs_verified_at"] is not None
+    original_identity = (row["root_fs_device_id"], row["root_fs_object_id"])
+
+    parked = tmp_path / "library.parked"
+    os.rename(library, parked)
+    library.mkdir()
+    _make_image(library / "replacement.jpg", color="blue")
+    try:
+        with pytest.raises(LibraryRootIdentityChangedError, match="different filesystem object|rebinding"):
+            scan_library(conn, library)
+    finally:
+        # The failed scan must not redefine the stored source boundary.
+        replacement = tmp_path / "replacement"
+        os.rename(library, replacement)
+        os.rename(parked, library)
+
+    row2 = conn.execute(
+        "SELECT root_fs_device_id,root_fs_object_id FROM libraries"
+    ).fetchone()
+    assert (row2["root_fs_device_id"], row2["root_fs_object_id"]) == original_identity
+
+
+def test_library_root_filesystem_identity_cannot_be_silently_updated(tmp_path: Path) -> None:
+    import sqlite3
+
+    library = tmp_path / "library"
+    _make_image(library / "a.jpg")
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    scan_library(conn, library)
+    row = conn.execute(
+        "SELECT id,root_fs_device_id,root_fs_object_id FROM libraries"
+    ).fetchone()
+    with pytest.raises(sqlite3.IntegrityError, match="immutable|rebind"):
+        conn.execute(
+            "UPDATE libraries SET root_fs_device_id=?,root_fs_object_id=? WHERE id=?",
+            ("other-device", "other-object", row["id"]),
+        )
+    conn.rollback()
+    row2 = conn.execute(
+        "SELECT root_fs_device_id,root_fs_object_id FROM libraries WHERE id=?",
+        (row["id"],),
+    ).fetchone()
+    assert (row2[0], row2[1]) == (row["root_fs_device_id"], row["root_fs_object_id"])
+
+
+
+def test_source_tree_directory_identities_are_persisted_historically(tmp_path: Path) -> None:
+    """Complete scans retain directory-object authority after a child moves away."""
+    import os
+
+    library = tmp_path / "library"
+    child = library / "family" / "2004"
+    empty = library / "empty"
+    child.mkdir(parents=True)
+    empty.mkdir(parents=True)
+    _make_image(child / "a.jpg")
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    scan_library(conn, library)
+
+    lib = conn.execute(
+        "SELECT id,source_tree_identity_complete,source_tree_identity_verified_at FROM libraries"
+    ).fetchone()
+    assert lib["source_tree_identity_complete"] == 1
+    assert lib["source_tree_identity_verified_at"] is not None
+    rows = conn.execute(
+        "SELECT canonical_path,fs_device_id,fs_object_id FROM library_directory_identities "
+        "WHERE library_id=? ORDER BY canonical_path", (lib["id"],)
+    ).fetchall()
+    paths = {r["canonical_path"] for r in rows}
+    expected = {
+        os.path.normcase(os.path.realpath(str(library))),
+        os.path.normcase(os.path.realpath(str(library / "family"))),
+        os.path.normcase(os.path.realpath(str(child))),
+        os.path.normcase(os.path.realpath(str(empty))),
+    }
+    assert expected.issubset(paths)
+    child_identity = next(
+        (r["fs_device_id"], r["fs_object_id"]) for r in rows
+        if r["canonical_path"] == os.path.normcase(os.path.realpath(str(child)))
+    )
+
+    moved = tmp_path / "moved-2004"
+    os.rename(child, moved)
+    scan_library(conn, library)
+    retained = conn.execute(
+        "SELECT 1 FROM library_directory_identities "
+        "WHERE library_id=? AND fs_device_id=? AND fs_object_id=?",
+        (lib["id"], *child_identity),
+    ).fetchone()
+    assert retained is not None
+
+
+def test_source_tree_authority_is_incomplete_until_successful_scan(tmp_path: Path) -> None:
+    """Migration-038 state is not permission before a complete directory inventory."""
+    import os
+    from ppa.source_tree_authority import SourceTreeAuthorityError, SourceTreeAuthorityPolicy
+
+    library = tmp_path / "library"
+    library.mkdir()
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    # Directly registered row simulates an upgraded/unfinished catalogue before rescan.
+    st = library.stat()
+    conn.execute(
+        "INSERT INTO libraries (root_display_path,root_canonical_path,root_fs_device_id,root_fs_object_id,root_fs_verified_at) "
+        "VALUES (?,?,?,?,datetime('now'))",
+        (str(library), os.path.normcase(os.path.realpath(str(library))), str(st.st_dev), str(st.st_ino)),
+    )
+    conn.commit()
+    with pytest.raises(SourceTreeAuthorityError, match="not completely verified|rescan"):
+        SourceTreeAuthorityPolicy.from_connection(conn)

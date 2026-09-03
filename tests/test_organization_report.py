@@ -6,6 +6,7 @@ from ppa.db import connect
 from ppa.organization import create_album, create_tag, add_photo_to_album, tag_photo
 from ppa.organization_report import build_organization_report, export_organization_report_zip
 from ppa.organization_views import save_organization_view
+from ppa.safe_export import enroll_export_root
 
 
 def _fixture(tmp_path: Path):
@@ -64,7 +65,7 @@ def test_report_summarises_health_saved_views_and_activity_without_ids(tmp_path)
 def test_export_does_not_touch_source_bytes_or_mtime(tmp_path):
     conn,lib,pids,root,cfg=_fixture(tmp_path)
     source=next(root.iterdir()); before=source.read_bytes(); mt=source.stat().st_mtime_ns
-    export_organization_report_zip(conn,library_id=lib,output_path=tmp_path/'out.zip')
+    enroll_export_root(tmp_path, conn=conn); export_organization_report_zip(conn,library_id=lib,output_path=tmp_path/'out.zip')
     assert source.read_bytes()==before and source.stat().st_mtime_ns==mt
     conn.close()
 
