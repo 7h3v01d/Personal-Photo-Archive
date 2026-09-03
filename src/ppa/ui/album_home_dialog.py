@@ -65,7 +65,7 @@ class AlbumHomeDialog(QDialog):
         self._open = QPushButton('Open album'); self._open.clicked.connect(self._open_selected); bottom.addWidget(self._open)
         close = QPushButton('Close'); close.clicked.connect(self.close); bottom.addWidget(close); root.addLayout(bottom)
 
-        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=220)
+        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=220, conn=self._conn)
         self._thumb_worker.ready.connect(self._thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(self._thumb_worker)
         self._render_page()

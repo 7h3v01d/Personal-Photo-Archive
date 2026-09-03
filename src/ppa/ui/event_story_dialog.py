@@ -185,7 +185,7 @@ class EventStoryDialog(QDialog):
         bottom.addWidget(close)
         root.addLayout(bottom)
 
-        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=200)
+        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=200, conn=self._conn)
         self._thumb_worker.ready.connect(self._thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(self._thumb_worker)
         self._model.request_thumbnail.connect(

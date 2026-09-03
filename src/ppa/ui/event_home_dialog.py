@@ -144,7 +144,7 @@ class EventHomeDialog(QDialog):
         bottom = QHBoxLayout(); bottom.addStretch(1)
         close = QPushButton("Close"); close.clicked.connect(self.close); bottom.addWidget(close); root.addLayout(bottom)
 
-        worker = ThumbnailWorker(self._cache_dir, size=240)
+        worker = ThumbnailWorker(self._cache_dir, size=240, conn=self._conn)
         worker.ready.connect(self._thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(worker)
         self.thumbnail_request.connect(worker.request, Qt.ConnectionType.QueuedConnection)

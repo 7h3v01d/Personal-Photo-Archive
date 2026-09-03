@@ -701,7 +701,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Ready.")
 
     def _start_thumbnail_worker(self) -> None:
-        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=256)
+        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=256, conn=self._conn)
         self._thumb_worker.ready.connect(self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(self._thumb_worker)
         # Genuine cross-thread dispatch: the model's request signal is

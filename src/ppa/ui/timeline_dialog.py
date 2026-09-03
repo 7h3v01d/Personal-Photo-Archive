@@ -411,7 +411,7 @@ class TimelineDialog(QDialog):
         # safe to enable tab-change callbacks.
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
-        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=180)
+        self._thumb_worker = ThumbnailWorker(self._cache_dir, size=180, conn=self._conn)
         self._thumb_worker.ready.connect(self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._registry.start_persistent(self._thumb_worker)
         for model in self._models.values():

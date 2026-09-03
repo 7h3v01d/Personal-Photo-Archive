@@ -337,9 +337,11 @@ class ThumbnailWorker(QObject):
 
     ready = Signal(str, QImage)
 
-    def __init__(self, cache_dir: Path, size: int = 256) -> None:
+    def __init__(self, cache_dir: Path, size: int = 256, *, conn) -> None:
         super().__init__()
-        self._cache = ThumbnailCache(cache_dir, size=size)
+        # Snapshot registered Library authority while still on the caller thread;
+        # ThumbnailCache stores no SQLite connection and remains thread-safe.
+        self._cache = ThumbnailCache(cache_dir, size=size, conn=conn)
 
     @Slot(str, str, str)
     @Slot(str, str, str, bool)
