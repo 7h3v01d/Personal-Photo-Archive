@@ -1,5 +1,7 @@
 # Phase 14.1 — Verified Donor Materialization
 
+> **Hardening note (Phase 14.1.1):** the evidence/authority model below remains current, but all temporary writes are now descriptor-bound through `ppa.secure_write`; the older create-close-reopen pathname pattern is forbidden. Recovery checkpoint DELETE immutability, crash-orphan reconciliation, and wheel migration packaging are documented in `PHASE14_1_1_FILESYSTEM_WRITE_IDENTITY_HARDENING.md`.
+
 Phase 14.0/14.0.1 created an immutable preservation checkpoint for the suspect target bytes. Phase 14.1 adds the next recovery boundary: copying the already-qualified expected donor bytes into that protected operational stage **without writing to the source target and without modifying the original donor**.
 
 ## Authority chain
