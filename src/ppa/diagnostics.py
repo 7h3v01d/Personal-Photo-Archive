@@ -185,8 +185,8 @@ def export_diagnostics(config, destination: Path) -> Path:
     )
 
     from ppa.safe_export import safe_export_temp
-    with safe_export_temp(destination, config=config) as (validated, tmp):
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with safe_export_temp(destination, config=config) as (validated, writer):
+        with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(asdict(manifest), indent=2, sort_keys=True))
             readme = (
                 "Personal Photo Archive diagnostics export\n"

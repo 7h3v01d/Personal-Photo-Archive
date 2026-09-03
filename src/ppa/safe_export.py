@@ -8,11 +8,20 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from sqlite3 import Connection
-from typing import Callable, Iterator
+
+from ppa.secure_write import (
+    BoundTemporaryFile, SecureWriteError, bind_directory_authority,
+    ensure_directory_authority,
+)
+from ppa.source_tree_authority import SourceTreeAuthorityError, SourceTreeAuthorityPolicy
+from ppa.operational_authority import (
+    OperationalAuthorityError, enroll_existing_directory, owned_file_identity,
+    record_owned_file_identity, require_directory,
+)
+from typing import BinaryIO, Iterator
 
 
 class ArchiveOutputSafetyError(ValueError):
@@ -81,6 +90,44 @@ def _library_roots(conn: Connection | None, config) -> tuple[str, ...]:
         for path in getattr(config, "library_directories", ()) or ():
             roots.add(_canonical(Path(path)))
     return tuple(sorted(roots))
+
+
+def _source_tree_policy(conn: Connection | None, config) -> SourceTreeAuthorityPolicy:
+    """Return one immutable source-tree authority snapshot for this export."""
+    borrowed, must_close = _borrow_conn(conn, config)
+    try:
+        if borrowed is not None:
+            try:
+                return SourceTreeAuthorityPolicy.from_connection(borrowed)
+            except SourceTreeAuthorityError as exc:
+                raise ArchiveOutputSafetyError(str(exc)) from exc
+    finally:
+        if must_close and borrowed is not None:
+            borrowed.close()
+
+    configured = tuple(getattr(config, "library_directories", ()) or ()) if config is not None else ()
+    if configured:
+        # Root-only best effort would recreate the moved-child bypass.  Without
+        # catalogue history there is no sound way to classify the full source tree.
+        raise ArchiveOutputSafetyError(
+            "Archive-safe output requires catalogue-backed source-tree filesystem identity; "
+            "open/rescan the registered Libraries before exporting."
+        )
+    return SourceTreeAuthorityPolicy.empty()
+
+
+def _validate_bound_export_parent(
+    authority, destination: Path, *, conn, config, source_policy: SourceTreeAuthorityPolicy
+) -> None:
+    """Prove the already-bound parent object is not source-tree authority."""
+    try:
+        source_policy.validate_authority(authority, purpose="export parent")
+    except SourceTreeAuthorityError as exc:
+        raise ArchiveOutputSafetyError(str(exc)) from exc
+    # Path/topology policy remains useful, but is evaluated after exact object
+    # selection and while that object remains pinned.
+    validate_export_destination(destination, conn=conn, config=config)
+    authority.verify_pathname()
 
 
 def _operational_paths(conn: Connection | None, config) -> tuple[tuple[str, bool], ...]:
@@ -199,30 +246,156 @@ def validate_export_destination(
     return absolute.resolve(strict=False)
 
 
+def enroll_export_root(path: str | Path, *, conn: Connection, config=None) -> Path:
+    """Explicitly enroll an existing user-selected export directory object.
+
+    Enrollment is a trust decision, never an implicit side effect of export.
+    The exact object is first bound and proven outside all source/operational
+    trees, then its identity is persisted for future exports.
+    """
+    root = Path(path).expanduser()
+    absolute = root if root.is_absolute() else Path.cwd() / root
+    if not absolute.exists() or not absolute.is_dir():
+        raise ArchiveOutputSafetyError("export root enrollment requires an existing directory")
+    policy = _source_tree_policy(conn, config)
+    authority = None
+    try:
+        authority = bind_directory_authority(absolute)
+        try:
+            policy.validate_authority(authority, purpose="export root")
+        except SourceTreeAuthorityError as exc:
+            raise ArchiveOutputSafetyError(str(exc)) from exc
+        # Validate a synthetic child so operational/source path policy is reused.
+        validate_export_destination(absolute / ".ppa-export-enrollment-probe", conn=conn, config=config)
+        try:
+            enroll_existing_directory(conn, "export_root", authority, allow_multiple=True)
+        except OperationalAuthorityError as exc:
+            raise ArchiveOutputSafetyError(str(exc)) from exc
+        return absolute.resolve(strict=False)
+    except SecureWriteError as exc:
+        raise ArchiveOutputSafetyError(str(exc)) from exc
+    finally:
+        if authority is not None:
+            authority.close()
+
+
 @contextmanager
 def safe_export_temp(
     destination: str | Path,
     *,
     conn: Connection | None = None,
     config=None,
-) -> Iterator[tuple[Path, Path]]:
-    """Yield (validated destination, sibling temp path), then atomically commit.
+) -> Iterator[tuple[Path, BinaryIO]]:
+    """Yield a descriptor-bound export temporary under positive ownership.
 
-    The existing destination is never opened for writing.  A second validation
-    is performed immediately before ``os.replace`` so ordinary path changes
-    during export also fail closed.
+    The export parent must either be an already-enrolled exact export-root
+    object or be newly created by this operation. Existing destination files
+    are replaceable only when their exact filesystem object is already recorded
+    as a PPA-created export.
     """
-    out = validate_export_destination(destination, conn=conn, config=config)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=str(out.parent))
-    os.close(fd)
-    tmp = Path(tmp_name)
+    borrowed, must_close = _borrow_conn(conn, config)
+    if borrowed is None:
+        configured = tuple(getattr(config, "library_directories", ()) or ()) if config is not None else ()
+        if configured:
+            raise ArchiveOutputSafetyError(
+                "Archive-safe export requires a file-backed catalogue when source Libraries are configured"
+            )
+        # Utility/report mode with no catalogue and no registered source context:
+        # retain descriptor-bound atomic output, but there is no durable PPA
+        # authority database in which ownership could be enrolled.
+        out = validate_export_destination(destination, conn=None, config=config)
+        parent_authority = None
+        temp = None
+        try:
+            parent_authority = ensure_directory_authority(out.parent)
+            expected = tuple(parent_authority.identity)
+            temp = BoundTemporaryFile.create(out.parent, prefix=out.name + ".", suffix=".tmp", expected_parent_identity=expected)
+            parent_authority.close(); parent_authority = None
+            with temp.binary_writer() as writer:
+                yield out, writer
+            temp.sync_and_verify()
+            validate_export_destination(out, conn=None, config=config)
+            temp.install(out, replace=True)
+            return
+        except SecureWriteError as exc:
+            raise ArchiveOutputSafetyError(str(exc)) from exc
+        finally:
+            if temp is not None:
+                temp.cleanup()
+            if parent_authority is not None:
+                parent_authority.close()
+    effective_conn = borrowed
+    parent_authority = None
+    temp: BoundTemporaryFile | None = None
     try:
-        yield out, tmp
-        validate_export_destination(out, conn=conn, config=config)
-        os.replace(tmp, out)
+        out = validate_export_destination(destination, conn=effective_conn, config=config)
+        try:
+            source_policy = SourceTreeAuthorityPolicy.from_connection(effective_conn)
+        except SourceTreeAuthorityError as exc:
+            raise ArchiveOutputSafetyError(str(exc)) from exc
+        parent_authority = ensure_directory_authority(
+            out.parent,
+            validator=lambda authority: _validate_bound_export_parent(
+                authority, out, conn=effective_conn, config=config, source_policy=source_policy
+            ),
+        )
+        try:
+            require_directory(
+                effective_conn, "export_root", parent_authority, allow_multiple=True,
+            )
+        except OperationalAuthorityError as exc:
+            raise ArchiveOutputSafetyError(str(exc)) from exc
+
+        destination_existed = os.path.lexists(os.fspath(out))
+        if destination_existed and owned_file_identity(effective_conn, "export", out) is None:
+            raise ArchiveOutputSafetyError(
+                "existing export destination is not a positively owned PPA export; refusing replacement"
+            )
+
+        # Capture the intended record key before installation.  Ownership will be
+        # persisted from temp.identity, never re-learned by statting this pathname.
+        owned_canonical_path = _canonical(out)
+        approved_parent_identity = tuple(parent_authority.identity)
+        parent_authority.verify_pathname()
+        temp = BoundTemporaryFile.create(
+            out.parent, prefix=out.name + ".", suffix=".tmp",
+            expected_parent_identity=approved_parent_identity,
+        )
+        parent_authority.close(); parent_authority = None
+        with temp.binary_writer() as writer:
+            yield out, writer
+        temp.sync_and_verify()
+        validate_export_destination(out, conn=effective_conn, config=config)
+        # Derive a specific expected identity immediately before installation.
+        # The installer itself re-verifies that exact object before parking it,
+        # closing the ownership-check -> replace TOCTOU window.
+        if os.path.lexists(os.fspath(out)):
+            expected_existing_identity = owned_file_identity(effective_conn, "export", out)
+            if expected_existing_identity is None:
+                raise ArchiveOutputSafetyError(
+                    "export destination object appeared or changed and is not PPA-owned"
+                )
+            replace = True
+        else:
+            expected_existing_identity = None
+            replace = False
+        temp.install(
+            out, replace=replace,
+            expected_existing_identity=expected_existing_identity,
+        )
+        record_owned_file_identity(
+            effective_conn, "export", out, tuple(temp.identity),
+            canonical_path=owned_canonical_path,
+        )
+    except SecureWriteError as exc:
+        raise ArchiveOutputSafetyError(str(exc)) from exc
     finally:
-        tmp.unlink(missing_ok=True)
+        if temp is not None:
+            temp.cleanup()
+        if parent_authority is not None:
+            parent_authority.close()
+        if must_close:
+            effective_conn.close()
 
 
 def safe_export_text(
@@ -233,11 +406,8 @@ def safe_export_text(
     config=None,
     encoding: str = "utf-8",
 ) -> Path:
-    with safe_export_temp(destination, conn=conn, config=config) as (out, tmp):
-        with tmp.open("w", encoding=encoding, newline="") as fh:
-            fh.write(contents)
-            fh.flush()
-            os.fsync(fh.fileno())
+    with safe_export_temp(destination, conn=conn, config=config) as (out, writer):
+        writer.write(contents.encode(encoding))
     return out
 
 
@@ -248,9 +418,6 @@ def safe_export_bytes(
     conn: Connection | None = None,
     config=None,
 ) -> Path:
-    with safe_export_temp(destination, conn=conn, config=config) as (out, tmp):
-        with tmp.open("wb") as fh:
-            fh.write(contents)
-            fh.flush()
-            os.fsync(fh.fileno())
+    with safe_export_temp(destination, conn=conn, config=config) as (out, writer):
+        writer.write(contents)
     return out

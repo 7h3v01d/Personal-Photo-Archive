@@ -121,6 +121,12 @@ def build_mismatch_investigation(
     ).fetchone()
     notes: list[str] = []
 
+    # Establish/enroll the primary forensic cache root before any nested cache
+    # creates it merely as an intermediate directory.
+    expected_cache = ThumbnailCache(
+        Path(thumbnail_cache_dir), size=expected_size, conn=conn
+    )
+
     current_sha: str | None = None
     current_preview: Path | None = None
     if not path.is_file():
@@ -145,12 +151,12 @@ def build_mismatch_investigation(
             current_cache = ThumbnailCache(
                 Path(thumbnail_cache_dir) / "forensic-current",
                 size=current_preview_size,
+                conn=conn,
             )
             current_preview = current_cache.get_or_create_attested(path, current_sha)
             if current_preview is None:
                 notes.append("Current bytes changed while the forensic preview was being established, or could not be rendered.")
 
-    expected_cache = ThumbnailCache(Path(thumbnail_cache_dir), size=expected_size)
     expected_reference = expected_cache.attested_cached_path(path, expected_sha)
     reference_status = "attested_cache" if expected_reference is not None else "unavailable"
     reference_file_id: str | None = None

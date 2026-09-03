@@ -248,8 +248,8 @@ def export_review_progress(config, session: PilotSession,
     destination = Path(destination)
     if destination.suffix.lower() != ".zip":
         destination = destination.with_suffix(".zip")
-    with safe_export_temp(destination, config=config) as (validated, tmp):
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with safe_export_temp(destination, config=config) as (validated, writer):
+        with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("review-progress.md", markdown_text(report))
             zf.writestr("review-progress.json", report.to_json(pretty=True) + "\n")
             zf.writestr("README.txt",

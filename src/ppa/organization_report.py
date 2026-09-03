@@ -253,8 +253,8 @@ def export_organization_report_zip(conn: Connection, *, library_id: int,
         "This ZIP intentionally excludes source photographs, thumbnails, database files, "
         "filesystem paths, archive identifiers and hashes.\n"
     )
-    with safe_export_temp(out, conn=conn, config=config) as (validated, tmp):
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with safe_export_temp(out, conn=conn, config=config) as (validated, writer):
+        with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("organization-report.json", report.to_json() + "\n")
             zf.writestr("organization-report.md", markdown_text(report))
             zf.writestr("README.txt", readme)

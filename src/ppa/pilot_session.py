@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -103,25 +101,6 @@ class PilotSession:
     def to_json(self, *, pretty: bool = True) -> str:
         return json.dumps(self.to_dict(), indent=2 if pretty else None,
                           sort_keys=True, separators=None if pretty else (",", ":"))
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
 
 
 def start_pilot_session(conn: Connection, *, library_id: int,

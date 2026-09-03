@@ -373,6 +373,7 @@ def export_reconciliation_csv(conn, path, *, camera_floors=None, config=None) ->
     collection (read-only). Rows sorted by rating so the doubtful ones surface.
     Returns the number of photos written."""
     import csv as _csv
+    import io
 
     _, results = analyse_library_reconciled(conn, camera_floors=camera_floors)
     paths = {r["id"]: (r["relative_path"] or r["filename"])
@@ -382,8 +383,8 @@ def export_reconciliation_csv(conn, path, *, camera_floors=None, config=None) ->
     order = {"LIKELY_WRONG": 0, "QUESTIONABLE": 1, "UNKNOWN": 2,
              "PROBABLY_VALID": 3, "TRUSTED": 4}
     from ppa.safe_export import safe_export_temp
-    with safe_export_temp(path, conn=conn, config=config) as (_out, tmp):
-        with tmp.open("w", newline="", encoding="utf-8") as fh:
+    with safe_export_temp(path, conn=conn, config=config) as (_out, raw):
+        with io.TextIOWrapper(raw, encoding="utf-8", newline="", write_through=True) as fh:
             w = _csv.writer(fh)
             w.writerow(["file_id", "path", "rating", "candidate_or_anchored_date",
                         "changed_by_evidence", "reasons", "evidence_conflicts"])

@@ -21,12 +21,18 @@ from pathlib import Path
 import shutil
 from sqlite3 import Connection
 import stat
-import tempfile
 import uuid
 
 from ppa.hashing import sha256_file
 from ppa.physical_observation import PhysicalObservationError, StableFileObservation, observe_stable_image
 from ppa.recovery_planning import RecoveryPlanningError, build_recovery_plan
+from ppa.secure_write import (
+    BoundDirectory, BoundTemporaryFile, SecureWriteError, atomic_write_bytes,
+    ensure_directory_authority, is_windows_reparse_point_stat,
+    windows_path_has_reparse_component,
+)
+from ppa.source_tree_authority import SourceTreeAuthorityError, SourceTreeAuthorityPolicy
+from ppa.operational_authority import OperationalAuthorityError, require_directory
 
 PRESERVATION_PLAN_SCHEMA = "ppa-recovery-preservation-plan/1"
 PRESERVATION_RESULT_SCHEMA = "ppa-recovery-preservation-stage/1"
@@ -76,6 +82,18 @@ def _library_roots(conn: Connection) -> tuple[str, ...]:
     return tuple(_canonical(Path(row[0])) for row in rows if row[0])
 
 
+def _validate_bound_preservation_root(
+    authority, root: Path, conn: Connection, source_policy: SourceTreeAuthorityPolicy
+) -> None:
+    """Validate the exact already-bound operational root object."""
+    try:
+        source_policy.validate_authority(authority, purpose="recovery preservation storage")
+    except SourceTreeAuthorityError as exc:
+        raise RecoveryPreservationError(str(exc)) from exc
+    _validate_preservation_root(conn, root)
+    authority.verify_pathname()
+
+
 def _validate_preservation_root(conn: Connection, root: Path) -> Path:
     """Return an absolute operational root that cannot resolve into source data."""
     root = Path(root).expanduser()
@@ -94,10 +112,21 @@ def _validate_preservation_root(conn: Connection, root: Path) -> Path:
 
     # The dedicated root may exist only as a real directory.  Refusing a leaf
     # symlink keeps the operational store's identity simple and auditable.
-    if absolute.exists() and absolute.is_symlink():
-        raise RecoveryPreservationError("recovery preservation root may not be a symbolic link")
-    if absolute.exists() and not absolute.is_dir():
-        raise RecoveryPreservationError("recovery preservation root is not a directory")
+    if windows_path_has_reparse_component(absolute):
+        raise RecoveryPreservationError(
+            "recovery preservation storage traverses a Windows junction or reparse point"
+        )
+    if absolute.exists():
+        try:
+            root_st = absolute.lstat()
+        except OSError as exc:
+            raise RecoveryPreservationError("recovery preservation root cannot be inspected safely") from exc
+        if stat.S_ISLNK(root_st.st_mode) or is_windows_reparse_point_stat(root_st):
+            raise RecoveryPreservationError(
+                "recovery preservation root may not be a symbolic link, junction, or reparse point"
+            )
+        if not stat.S_ISDIR(root_st.st_mode):
+            raise RecoveryPreservationError("recovery preservation root is not a directory")
     return absolute.resolve(strict=False)
 
 
@@ -164,21 +193,33 @@ def _validated_stage_id(stage_id: str | None) -> str:
 
 
 def _directory_identity(path: Path) -> tuple[int, int]:
+    if windows_path_has_reparse_component(path):
+        raise RecoveryPreservationError("preservation stage directory is unsafe because it traverses a Windows reparse point")
     try:
         st = path.lstat()
     except OSError as exc:
         raise RecoveryPreservationError("preservation stage directory disappeared") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or is_windows_reparse_point_stat(st)
+        or not stat.S_ISDIR(st.st_mode)
+    ):
         raise RecoveryPreservationError("preservation stage directory identity is unsafe")
     return int(st.st_dev), int(st.st_ino)
 
 
 def _regular_file_identity(path: Path) -> tuple[int, int]:
+    if windows_path_has_reparse_component(path):
+        raise RecoveryPreservationError("preservation evidence path traverses a Windows reparse point")
     try:
         st = path.lstat()
     except OSError as exc:
         raise RecoveryPreservationError("preservation evidence file disappeared") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or is_windows_reparse_point_stat(st)
+        or not stat.S_ISREG(st.st_mode)
+    ):
         raise RecoveryPreservationError("preservation evidence file identity is unsafe")
     return int(st.st_dev), int(st.st_ino)
 
@@ -208,58 +249,29 @@ def _chmod_mode_if_same(path: Path, expected_identity: tuple[int, int], mode: in
 
 
 def _safe_cleanup_created_stage(
-    stage_dir: Path | None,
+    bound_stage: BoundDirectory | None,
     *,
-    root: Path | None,
-    expected_identity: tuple[int, int] | None,
     owned_paths: set[Path],
 ) -> None:
-    """Best-effort rollback cleanup without recursive traversal.
+    """Retain failed POSIX preservation stages instead of deleting by child name.
 
-    Cleanup is deliberately narrower than ``shutil.rmtree``.  It only operates
-    when the stage directory is still the exact directory object PPA created,
-    and only unlinks known PPA-owned artifacts.  Unexpected children are left
-    in place for later diagnosis rather than chmodded/traversed recursively.
+    Binding the stage directory protects where observation occurs, but it does
+    not provide exact-object authority for ``unlink(child-name)`` or for a later
+    ``rmdir(stage-name)``.  Either namespace slot can be substituted after an
+    identity check.  Phase 14.1.17 therefore treats failed-stage debris as a
+    manual-recovery artifact on POSIX.
     """
-    if stage_dir is None or root is None or expected_identity is None:
+    if bound_stage is None:
         return
-    try:
-        if os.path.dirname(_canonical(stage_dir)) != _canonical(root):
-            return
-        st = stage_dir.lstat()
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            return
-        if (int(st.st_dev), int(st.st_ino)) != expected_identity:
-            return
-    except OSError:
-        return
-
+    bound_stage.verify_handle()
     for owned in tuple(owned_paths):
         try:
-            # Never follow an alias during cleanup.  The path itself must still
-            # be a direct child of the identity-bound stage directory.
-            if owned.parent != stage_dir:
-                continue
-            lst = owned.lstat()
-            if stat.S_ISDIR(lst.st_mode) and not stat.S_ISLNK(lst.st_mode):
-                # Phase 14.0 creates no child directories.
-                continue
-            try:
-                owned.unlink()
-            except PermissionError:
-                if not stat.S_ISLNK(lst.st_mode) and stat.S_ISREG(lst.st_mode):
-                    _chmod_mode_if_same(owned, (int(lst.st_dev), int(lst.st_ino)), 0o600)
-                owned.unlink(missing_ok=True)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-
-    try:
-        # rmdir succeeds only when no unexpected content is present.
-        stage_dir.rmdir()
-    except OSError:
-        pass
+            if owned.parent == bound_stage.path:
+                BoundDirectory.validate_child_name(owned.name)
+        except (SecureWriteError, ValueError):
+            continue
+    # Intentionally do not unlink children or rmdir the stage.  Debris is
+    # recoverable; deleting a substituted source object is not.
 
 
 @dataclass(frozen=True)
@@ -481,10 +493,11 @@ def build_preservation_plan(
     )
 
 
-def _copy_preserved_bytes(source: Path, temporary: Path) -> tuple[str, int]:
+def _copy_preserved_bytes(source: Path, temporary: BoundTemporaryFile) -> tuple[str, int]:
+    """Copy source bytes through the exact descriptor-bound temporary object."""
     digest = hashlib.sha256()
     total = 0
-    with source.open("rb") as src, temporary.open("wb") as dst:
+    with source.open("rb") as src, temporary.binary_writer() as dst:
         while True:
             chunk = src.read(1024 * 1024)
             if not chunk:
@@ -492,8 +505,7 @@ def _copy_preserved_bytes(source: Path, temporary: Path) -> tuple[str, int]:
             digest.update(chunk)
             dst.write(chunk)
             total += len(chunk)
-        dst.flush()
-        os.fsync(dst.fileno())
+    temporary.sync_and_verify()
     return digest.hexdigest(), total
 
 
@@ -513,19 +525,17 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _write_manifest(path: Path, payload: dict) -> str:
+def _write_manifest(
+    path: Path, payload: dict, expected_parent_identity: tuple[int, int] | None = None
+) -> str:
     raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    fd, name = tempfile.mkstemp(prefix="manifest.", suffix=".tmp", dir=str(path.parent))
-    tmp = Path(name)
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(raw)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        _fsync_directory(path.parent)
-    finally:
-        tmp.unlink(missing_ok=True)
+        atomic_write_bytes(
+            path, raw, prefix="manifest.", suffix=".tmp", replace=True,
+            expected_parent_identity=expected_parent_identity,
+        )
+    except SecureWriteError as exc:
+        raise RecoveryPreservationError("preservation manifest temporary identity changed") from exc
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -533,6 +543,29 @@ def _chmod_read_only(path: Path, expected_identity: tuple[int, int]) -> None:
     # Descriptor-bound chmod avoids following a path that was replaced with a
     # symlink/hardlink alias after the preservation transaction committed.
     _chmod_mode_if_same(path, expected_identity, 0o444)
+
+
+def _preservation_checkpoint_is_durable(conn: Connection, stage_id: str | None) -> bool:
+    """Return whether the stage checkpoint is already committed.
+
+    This helper is used only from exception handling.  If this connection is
+    still inside a transaction, its INSERT is not durable and must not be
+    mistaken for committed authority merely because the connection can read its
+    own uncommitted row.  Once ``in_transaction`` is false, a visible checkpoint
+    is committed catalogue state and filesystem rollback cleanup must stop.
+    """
+    if stage_id is None or conn.in_transaction:
+        return False
+    try:
+        return conn.execute(
+            "SELECT 1 FROM archive_recovery_preservation_stages WHERE stage_id=? LIMIT 1",
+            (stage_id,),
+        ).fetchone() is not None
+    except Exception:
+        # Ambiguity must preserve evidence, not destroy it.  If transaction state
+        # says commit may already have completed but the checkpoint cannot be
+        # queried safely, fail closed by withholding cleanup.
+        return True
 
 
 def execute_preservation_stage(
@@ -559,7 +592,12 @@ def execute_preservation_stage(
     stage_dir: Path | None = None
     stage_root: Path | None = None
     stage_dir_identity: tuple[int, int] | None = None
+    root_authority = None
+    stage_authority = None
+    bound_stage: BoundDirectory | None = None
     owned_stage_paths: set[Path] = set()
+    checkpoint_stage_id: str | None = None
+    checkpoint_committed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         rebuilt = build_preservation_plan(
@@ -574,31 +612,63 @@ def execute_preservation_stage(
             )
         if rebuilt.phase13_evidence_fingerprint != plan.phase13_evidence_fingerprint:
             raise RecoveryPreservationError("Phase-13 recovery proposal evidence changed")
+        checkpoint_stage_id = rebuilt.stage_id
 
+        try:
+            source_policy = SourceTreeAuthorityPolicy.from_connection(conn)
+        except SourceTreeAuthorityError as exc:
+            raise RecoveryPreservationError(str(exc)) from exc
         root = _validate_preservation_root(conn, Path(plan.preservation_root))
-        root.mkdir(parents=True, exist_ok=True)
-        root = _validate_preservation_root(conn, root)
+        # Bootstrap authority by selecting/pinning the root object first and
+        # validating THAT exact object before it can create the stage namespace.
+        try:
+            root_authority = ensure_directory_authority(
+                root,
+                validator=lambda authority: _validate_bound_preservation_root(
+                    authority, root, conn, source_policy
+                ),
+            )
+        except (OSError, SecureWriteError) as exc:
+            raise RecoveryPreservationError(
+                "could not establish safe preservation-root authority"
+            ) from exc
+        try:
+            require_directory(conn, "recovery_preservation", root_authority)
+        except OperationalAuthorityError as exc:
+            root_authority.close()
+            raise RecoveryPreservationError(str(exc)) from exc
         stage_root = root
+
         # Revalidate even caller-supplied plans before using the identifier as a
-        # path component.  A plan object is evidence, not filesystem authority.
+        # child component.  The child directory is created *relative to the
+        # already-validated root authority*, never by Path.mkdir().
         stage_id = _validated_stage_id(plan.stage_id)
         if stage_id != rebuilt.stage_id:
             raise RecoveryPreservationError("preservation stage ID changed while rebuilding the plan")
         stage_dir = root / stage_id
-        if stage_dir.exists() or stage_dir.is_symlink():
-            raise RecoveryPreservationError("preservation stage destination already exists")
-        stage_dir.mkdir(mode=0o700)
-        stage_dir_identity = _directory_identity(stage_dir)
-        # Persist the parent directory entry before any preservation evidence is
-        # allowed to become a committed catalogue checkpoint.
+        try:
+            stage_authority = root_authority.create_directory_child(stage_id)
+        except (OSError, SecureWriteError) as exc:
+            raise RecoveryPreservationError(
+                "preservation stage destination already exists or could not be created safely"
+            ) from exc
+        stage_dir_identity = tuple(stage_authority.identity)
+        if isinstance(stage_authority, BoundDirectory):
+            # POSIX rollback may mutate only through this exact descriptor.
+            bound_stage = stage_authority
+
+        # Persist/check the exact authority objects before any source-derived
+        # bytes are copied.
         _fsync_directory(root)
-        # Revalidate the root after creating the child so a parent-path change
-        # cannot silently redirect the operational store into a source Library.
-        root = _validate_preservation_root(conn, root)
-        if stage_dir.is_symlink() or os.path.dirname(_canonical(stage_dir)) != _canonical(root):
-            raise RecoveryPreservationError("preservation stage directory identity is unsafe")
-        if _directory_identity(stage_dir) != stage_dir_identity:
-            raise RecoveryPreservationError("preservation stage directory changed after creation")
+        try:
+            _validate_bound_preservation_root(root_authority, root, conn, source_policy)
+            stage_authority.verify_pathname()
+        except SecureWriteError as exc:
+            raise RecoveryPreservationError(
+                "preservation root/stage authority changed during bound stage creation"
+            ) from exc
+        if tuple(stage_authority.identity) != stage_dir_identity:
+            raise RecoveryPreservationError("preservation stage directory authority changed after creation")
 
         # Re-check free space after creating the operational directory and before
         # copying any source-derived bytes.
@@ -623,22 +693,31 @@ def execute_preservation_stage(
 
         if rebuilt.preservation_required:
             assert preservation_path is not None
-            fd, temp_name = tempfile.mkstemp(
-                prefix="suspect-source.", suffix=".pending", dir=str(stage_dir)
-            )
-            os.close(fd)
-            temp_path = Path(temp_name)
-            owned_stage_paths.add(temp_path)
             try:
-                copied_sha, copied_size = _copy_preserved_bytes(Path(rebuilt.target_path), temp_path)
+                temp = BoundTemporaryFile.create(
+                    stage_dir, prefix="suspect-source.", suffix=".pending",
+                    expected_parent_identity=stage_dir_identity,
+                )
+            except SecureWriteError as exc:
+                raise RecoveryPreservationError(
+                    "preservation stage write authority changed before temporary creation"
+                ) from exc
+            try:
+                try:
+                    copied_sha, copied_size = _copy_preserved_bytes(Path(rebuilt.target_path), temp)
+                except SecureWriteError as exc:
+                    raise RecoveryPreservationError(
+                        "preservation temporary identity changed while suspect bytes were copied"
+                    ) from exc
                 if copied_sha != rebuilt.target_observed_sha256 or copied_size != rebuilt.target_size_bytes:
                     raise RecoveryPreservationError(
                         "target changed while suspect bytes were being preserved; staged bytes discarded"
                     )
-                # Independent readback proves the actual preservation file, not
-                # merely the streaming digest calculated while writing it.
-                readback_sha = sha256_file(temp_path)
-                if readback_sha != copied_sha or temp_path.stat().st_size != copied_size:
+                # Independent readback is descriptor-bound too: a substituted
+                # pathname can neither receive writes nor become the evidence
+                # object we hash.
+                readback_sha, readback_size = temp.hash_and_size()
+                if readback_sha != copied_sha or readback_size != copied_size:
                     raise RecoveryPreservationError("preservation readback verification failed")
 
                 try:
@@ -654,14 +733,17 @@ def execute_preservation_stage(
                         "target changed during suspect-byte preservation; staged bytes discarded"
                     )
 
-                os.replace(temp_path, preservation_path)
-                owned_stage_paths.discard(temp_path)
+                try:
+                    temp.install(preservation_path, replace=False)
+                except SecureWriteError as exc:
+                    raise RecoveryPreservationError(
+                        "preservation temporary identity/path changed before installation"
+                    ) from exc
                 owned_stage_paths.add(preservation_path)
-                _fsync_directory(stage_dir)
                 preserved_sha = readback_sha
                 preserved_size = copied_size
             finally:
-                temp_path.unlink(missing_ok=True)
+                temp.cleanup()
         else:
             # Missing-target staging is valid only if it remained missing.
             if target_before.state != "missing":
@@ -708,7 +790,9 @@ def execute_preservation_stage(
             "staged_at": staged_at,
         }
         manifest_path = Path(rebuilt.manifest_path)
-        manifest_sha = _write_manifest(manifest_path, manifest_payload)
+        manifest_sha = _write_manifest(
+            manifest_path, manifest_payload, stage_dir_identity
+        )
         owned_stage_paths.add(manifest_path)
 
         # Final physical re-attestation before the catalogue checkpoint commits.
@@ -800,6 +884,7 @@ def execute_preservation_stage(
             ),
         )
         conn.commit()
+        checkpoint_committed = True
 
         if preservation_path is not None and preservation_identity is not None:
             _chmod_read_only(preservation_path, preservation_identity)
@@ -819,17 +904,36 @@ def execute_preservation_stage(
             staged_at=staged_at,
             evidence_fingerprint=result_fingerprint,
         )
-    except Exception:
-        try:
-            conn.rollback()
-        finally:
-            _safe_cleanup_created_stage(
-                stage_dir,
-                root=stage_root,
-                expected_identity=stage_dir_identity,
-                owned_paths=owned_stage_paths,
-            )
+    except BaseException:
+        # Filesystem cleanup is valid only while the catalogue checkpoint is
+        # still rollback-able.  An interruption can happen after SQLite commits
+        # but before post-commit chmod/return; deleting evidence at that point
+        # would leave an immutable DB row pointing at missing files.
+        durable = checkpoint_committed or _preservation_checkpoint_is_durable(
+            conn, checkpoint_stage_id
+        )
+        if not durable:
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+            finally:
+                _safe_cleanup_created_stage(
+                    bound_stage,
+                    owned_paths=owned_stage_paths,
+                )
         raise
+    finally:
+        # ``bound_stage`` is the POSIX stage_authority object; close it only once.
+        if stage_authority is not None:
+            try:
+                stage_authority.close()
+            except Exception:
+                pass
+        if root_authority is not None:
+            try:
+                root_authority.close()
+            except Exception:
+                pass
 
 
 def list_preservation_stages(conn: Connection, *, target_file_id: str | None = None):

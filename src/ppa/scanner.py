@@ -59,6 +59,8 @@ from ppa.formats import is_recognised_but_unsupported, supported_extensions
 from ppa.hashing import sha256_file
 from ppa.current_identity import verified_current_sha256_sql
 from ppa.logging_setup import get_logger
+from ppa.secure_write import SecureWriteError, bind_directory_authority, directory_identity
+from ppa.source_tree_authority import record_library_directory_identity
 
 log = get_logger("scanner")
 
@@ -223,6 +225,15 @@ def scan_library(
     # changes.
     root_prefix = walk_base.rstrip(os.sep) + os.sep + "%"
 
+    # A source-tree inventory is security authority. Mark it incomplete before
+    # traversal begins so concurrent writable operational callers fail closed
+    # until this scan reaches a complete commit. Historical directory rows are
+    # retained; only the completeness claim is withdrawn during scanning.
+    conn.execute(
+        "UPDATE libraries SET source_tree_identity_complete=0, "
+        "source_tree_identity_verified_at=NULL WHERE id=?",
+        (library_id,),
+    )
     conn.execute(
         "INSERT INTO import_sessions (id, library_path, started_at, scan_status) "
         "VALUES (?, ?, ?, 'running')",
@@ -267,6 +278,28 @@ def scan_library(
 
             seen_count = 0
             for root, _dirs, filenames in os.walk(library_path, onerror=_on_walk_error):
+                # Phase 14.1.13: directory objects are historical source authority.
+                # Record every real directory actually traversed, including empty
+                # directories. The identity persists even if the object later
+                # disappears from this pathname.
+                root_real = os.path.realpath(str(root))
+                if not _is_inside(os.path.normcase(root_real), os.path.normcase(walk_base)):
+                    traversal_errors.append(f"directory resolves outside Library: {root}")
+                    log.warning("Skipping directory outside Library source tree: %s -> %s", root, root_real)
+                    _dirs[:] = []
+                    continue
+                try:
+                    dir_dev, dir_obj = directory_identity(root_real)
+                except (OSError, SecureWriteError) as exc:
+                    traversal_errors.append(str(exc))
+                    log.warning("Could not establish source-directory identity: %s: %s", root, exc)
+                    _dirs[:] = []
+                    continue
+                record_library_directory_identity(
+                    conn, library_id=library_id, canonical_path=root_real,
+                    fs_device_id=dir_dev, fs_object_id=dir_obj, observed_at=_now(),
+                )
+
                 for name in sorted(filenames):  # sorted -> reproducible ordering
                     path = Path(root) / name
                     ext = path.suffix.lower()
@@ -425,8 +458,10 @@ def scan_library(
 
             report.completed_at = _now()
             conn.execute(
-                "UPDATE libraries SET last_scan_at = ?, state = 'active' WHERE id = ?",
-                (report.completed_at, library_id),
+                "UPDATE libraries SET last_scan_at = ?, state = 'active', "
+                "source_tree_identity_complete=?, source_tree_identity_verified_at=? WHERE id = ?",
+                (report.completed_at, 1 if scan_complete else 0,
+                 report.completed_at if scan_complete else None, library_id),
             )
             conn.execute(
                 """
@@ -480,6 +515,10 @@ class LibraryUnavailableError(RuntimeError):
     and no existing Library record corresponds to it."""
 
 
+class LibraryRootIdentityChangedError(RuntimeError):
+    """The configured Library pathname now names a different directory object."""
+
+
 def _relkey(rel: str) -> str:
     """Canonical within-library identity for a relative path: case- and
     separator-normalised so the same file is identified consistently however
@@ -498,48 +537,77 @@ def _is_inside(child_canonical: str, parent_canonical: str) -> bool:
 def _resolve_library(
     conn: Connection, root_path: Path, protected_paths: list[Path] | None = None
 ) -> tuple[int, str]:
-    """Return (library_id, canonical_root) for ``root_path``, creating the
-    library row on first sight. Fails closed if the root overlaps an existing
-    library (one nested inside the other) or if any operational path (catalogue
-    DB, thumbnail cache, logs) would live inside the library.
+    """Return ``(library_id, canonical_root)`` for one verified Library root.
+
+    Phase 14.1.11 treats the filesystem object as Library identity and the path
+    as location.  The directory is bound first; only then are its exact object
+    identity and pathname accepted.  An existing Library whose pathname now
+    names a different object fails closed rather than silently redefining the
+    source boundary.
     """
-    # Canonical identity key: resolve symlinks, then normalise case/separators
-    # so D:\Family Photos and d:\family photos are recognised as one library on
-    # Windows. The display path is stored separately, unchanged.
-    canonical = os.path.normcase(os.path.realpath(str(root_path)))
+    resolved_root = Path(os.path.realpath(str(root_path)))
+    try:
+        authority = bind_directory_authority(resolved_root)
+    except (OSError, SecureWriteError) as exc:
+        raise LibraryUnavailableError(
+            f"Library root is not an accessible safe directory: {root_path}"
+        ) from exc
+    try:
+        authority.verify_pathname()
+        root_identity = tuple(authority.identity)
+        canonical = os.path.normcase(os.path.realpath(str(resolved_root)))
 
-    # Archive machinery must never live inside an archival source library, or a
-    # scan would catalogue its own catalogue/thumbnails (a feedback loop).
-    for prot in protected_paths or []:
-        prot_canonical = os.path.normcase(os.path.realpath(str(prot)))
-        if _is_inside(prot_canonical, canonical):
-            raise ArchiveInsideLibraryError(
-                f"Operational path {prot_canonical!r} is inside the library "
-                f"{canonical!r}. Keep the catalogue DB, thumbnail cache, and logs "
-                "outside any photo library."
-            )
+        # Archive machinery must never live inside an archival source library.
+        for prot in protected_paths or []:
+            prot_canonical = os.path.normcase(os.path.realpath(str(prot)))
+            if _is_inside(prot_canonical, canonical):
+                raise ArchiveInsideLibraryError(
+                    f"Operational path {prot_canonical!r} is inside the library "
+                    f"{canonical!r}. Keep the catalogue DB, thumbnail cache, and logs "
+                    "outside any photo library."
+                )
 
-    row = conn.execute(
-        "SELECT id FROM libraries WHERE root_canonical_path = ?", (canonical,)
-    ).fetchone()
-    if row is not None:
-        return row["id"], canonical
+        row = conn.execute(
+            "SELECT id,root_fs_device_id,root_fs_object_id "
+            "FROM libraries WHERE root_canonical_path = ?",
+            (canonical,),
+        ).fetchone()
+        if row is not None:
+            stored = (row["root_fs_device_id"], row["root_fs_object_id"])
+            if stored[0] is not None or stored[1] is not None:
+                if stored != (str(root_identity[0]), str(root_identity[1])):
+                    raise LibraryRootIdentityChangedError(
+                        "Library root pathname now names a different filesystem object; "
+                        "refusing silent Library rebinding"
+                    )
+            else:
+                conn.execute(
+                    "UPDATE libraries SET root_fs_device_id=?,root_fs_object_id=?,"
+                    "root_fs_verified_at=? WHERE id=?",
+                    (str(root_identity[0]), str(root_identity[1]), _now(), row["id"]),
+                )
+            authority.verify_pathname()
+            return int(row["id"]), canonical
 
-    # Fail closed on overlapping roots (either direction).
-    for other in conn.execute("SELECT root_canonical_path FROM libraries").fetchall():
-        existing = other["root_canonical_path"]
-        if _is_inside(canonical, existing) or _is_inside(existing, canonical):
-            raise OverlappingLibraryError(
-                f"Library root {canonical!r} overlaps existing library {existing!r}. "
-                "Nested/overlapping libraries are not allowed."
-            )
+        # Fail closed on overlapping roots (either direction).
+        for other in conn.execute("SELECT root_canonical_path FROM libraries").fetchall():
+            existing = other["root_canonical_path"]
+            if _is_inside(canonical, existing) or _is_inside(existing, canonical):
+                raise OverlappingLibraryError(
+                    f"Library root {canonical!r} overlaps existing library {existing!r}. "
+                    "Nested/overlapping libraries are not allowed."
+                )
 
-    cur = conn.execute(
-        "INSERT INTO libraries (root_display_path, root_canonical_path) VALUES (?, ?)",
-        (str(root_path), canonical),
-    )
-    return int(cur.lastrowid), canonical
-
+        cur = conn.execute(
+            "INSERT INTO libraries "
+            "(root_display_path,root_canonical_path,root_fs_device_id,root_fs_object_id,root_fs_verified_at) "
+            "VALUES (?,?,?,?,?)",
+            (str(root_path), canonical, str(root_identity[0]), str(root_identity[1]), _now()),
+        )
+        authority.verify_pathname()
+        return int(cur.lastrowid), canonical
+    finally:
+        authority.close()
 
 def _relative_to(path: str, walk_base: str) -> str:
     try:

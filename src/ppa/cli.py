@@ -280,6 +280,12 @@ def _main(argv: list[str] | None = None) -> int:
     recovery_donor_parser.add_argument("--json", dest="json_path", default=None,
                                        help="Write structured Phase-14.1 donor plan/result JSON")
 
+    recovery_orphan_parser = subparsers.add_parser(
+        "recovery-reconcile-donor-orphans",
+        help="Reconcile Phase-14.1 interruption debris: descriptor-bound cleanup where available, otherwise verified orphan adoption",
+    )
+    recovery_orphan_parser.add_argument("stage_id", help="Committed Phase-14 preservation stage UUID")
+
     identity_health_parser = subparsers.add_parser(
         "identity-health", help="Build the read-only Phase-10 identity health and resolution queue")
     identity_health_parser.add_argument("library_id", type=int)
@@ -841,6 +847,22 @@ def _main(argv: list[str] | None = None) -> int:
             if args.json_path:
                 safe_export_text(args.json_path, payload, conn=conn, config=config)
                 print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "recovery-reconcile-donor-orphans":
+        from ppa.recovery_donor_materialization import reconcile_donor_materialization_orphans
+        try:
+            result = reconcile_donor_materialization_orphans(conn, stage_id=args.stage_id)
+            print(f"Donor orphan reconciliation: {result['state']}")
+            for name in result.get("removed", []):
+                print(f"  removed operational artifact: {name}")
+            for name in result.get("adopted", []):
+                print(f"  adopted verified operational artifact: {name}")
+            if result.get("materialization_id"):
+                print(f"  materialization checkpoint: {result['materialization_id']}")
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
