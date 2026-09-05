@@ -30,6 +30,20 @@ class SecureWriteError(RuntimeError):
     """A temporary/output file lost its proven filesystem identity."""
 
 
+class SecureWriteTransitionError(SecureWriteError):
+    """A secure-write operation failed after a namespace transition occurred.
+
+    Callers must not interpret this exception as proof that the destination
+    namespace remained untouched.  ``target_name_acquired`` is true when the
+    exact secured temporary object successfully acquired the requested target
+    name before a later durability/attestation step failed.
+    """
+
+    def __init__(self, message: str, *, target_name_acquired: bool = False) -> None:
+        super().__init__(message)
+        self.target_name_acquired = bool(target_name_acquired)
+
+
 # Capture platform capability once.  Adversarial tests intentionally monkeypatch
 # os.rename/os.unlink to inject races; capability detection must not accidentally
 # change merely because the function object was wrapped after import.
@@ -988,11 +1002,13 @@ class BoundDirectory:
                 f"could not rename bound child {source_name} -> {destination_name}"
             ) from exc
 
-    def rename_child_noreplace(self, source_name: str, destination_name: str) -> None:
-        """Atomically rename one child only when the destination is absent.
+    def rename_child_noreplace_atomic(self, source_name: str, destination_name: str) -> None:
+        """Perform only the atomic no-replace namespace transition.
 
-        The no-replace condition is enforced by the filesystem operation itself;
-        callers must never emulate it with ``exists()`` followed by ``rename()``.
+        Successful return proves that ``destination_name`` has been acquired.
+        Directory durability is deliberately *not* bundled into this method so
+        callers can record transition provenance before any later fsync or
+        identity verification can fail.
         """
         self.verify_handle()
         source_name = self.validate_child_name(source_name)
@@ -1002,7 +1018,6 @@ class BoundDirectory:
                 source_name, destination_name,
                 source_dir_fd=self.fd, destination_dir_fd=self.fd,
             )
-            self.fsync()
         except FileExistsError:
             raise
         except SecureWriteError:
@@ -1010,6 +1025,23 @@ class BoundDirectory:
         except (OSError, TypeError, NotImplementedError) as exc:
             raise SecureWriteError(
                 f"could not atomically rename bound child without replacement: {source_name} -> {destination_name}"
+            ) from exc
+
+    def rename_child_noreplace(self, source_name: str, destination_name: str) -> None:
+        """Atomically rename one child only when the destination is absent.
+
+        The no-replace condition is enforced by the filesystem operation itself.
+        If durability fails after the rename, a transition-aware exception is
+        raised so callers cannot mistake that failure for a pre-transition abort.
+        """
+        self.rename_child_noreplace_atomic(source_name, destination_name)
+        try:
+            self.fsync()
+        except BaseException as exc:
+            raise SecureWriteTransitionError(
+                f"bound child acquired destination name but directory durability failed: "
+                f"{source_name} -> {destination_name}",
+                target_name_acquired=True,
             ) from exc
 
     def verify_pathname(self) -> None:
@@ -1593,13 +1625,26 @@ class BoundTemporaryFile:
             self.close_control()
             return destination
         except BaseException as exc:
+            target_name_acquired = bool(installed)
             try:
                 if installed or backup_moved:
                     restore_previous_destination()
             except BaseException as restore_exc:
+                if target_name_acquired:
+                    raise SecureWriteTransitionError(
+                        "Windows secured installation acquired the destination name and rollback could not prove recovery",
+                        target_name_acquired=True,
+                    ) from restore_exc
                 raise SecureWriteError(
                     "Windows secured installation failed and previous destination could not be restored"
                 ) from restore_exc
+            if target_name_acquired:
+                if isinstance(exc, SecureWriteTransitionError):
+                    raise
+                raise SecureWriteTransitionError(
+                    "Windows secured installation acquired the destination name before a later operation failed",
+                    target_name_acquired=True,
+                ) from exc
             if isinstance(exc, SecureWriteError):
                 raise
             raise
@@ -1763,6 +1808,14 @@ class BoundTemporaryFile:
                 raise SecureWriteError(
                     "destination appeared during secured installation; no object was replaced"
                 ) from exc
+            except SecureWriteTransitionError:
+                # rename_child_noreplace() reports that its atomic rename succeeded
+                # before a later directory-durability failure.  Preserve that fact
+                # across this install boundary even though the helper did not return.
+                installed = True
+                raise
+            # Successful return means both atomic acquisition and the helper's
+            # immediate parent-directory durability step completed.
             installed = True
 
             if parent_bound is not None:
@@ -1793,13 +1846,26 @@ class BoundTemporaryFile:
                 self.close_control()
             return destination
         except BaseException as exc:
+            transition_occurred = bool(installed)
             try:
                 if installed or backup is not None:
                     restore_previous_destination()
             except BaseException as restore_exc:
+                if transition_occurred:
+                    raise SecureWriteTransitionError(
+                        "secured installation acquired the destination name and rollback could not prove recovery",
+                        target_name_acquired=True,
+                    ) from restore_exc
                 raise SecureWriteError(
                     "secured installation failed and previous destination could not be restored"
                 ) from restore_exc
+            if transition_occurred:
+                if isinstance(exc, SecureWriteTransitionError):
+                    raise
+                raise SecureWriteTransitionError(
+                    "secured installation acquired the destination name before a later operation failed",
+                    target_name_acquired=True,
+                ) from exc
             if isinstance(exc, SecureWriteError):
                 raise
             raise

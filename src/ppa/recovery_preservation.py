@@ -224,26 +224,67 @@ def _regular_file_identity(path: Path) -> tuple[int, int]:
     return int(st.st_dev), int(st.st_ino)
 
 
-def _chmod_mode_if_same(path: Path, expected_identity: tuple[int, int], mode: int) -> bool:
-    """Change mode only through a descriptor proven to be the expected object."""
-    flags = os.O_RDONLY
+def _attest_single_link_evidence(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_sha256: str,
+    expected_size: int | None = None,
+    label: str = "recovery evidence",
+) -> tuple[int, int]:
+    """Re-attest the exact evidence object immediately before checkpoint commit.
+
+    Phase 14.1.17.4 treats single-link topology as part of evidence authority.
+    The file is opened without following symlinks where the platform supports
+    that flag, then identity, regular-file type and link count are checked both
+    before and after descriptor-bound hashing.  A late hard-link therefore
+    invalidates the checkpoint instead of gaining a post-commit metadata write
+    through a source-Library alias.
+    """
+    if windows_path_has_reparse_component(path):
+        raise RecoveryPreservationError(f"{label} traverses a Windows reparse point")
+    # Descriptor hashing must be byte-exact on every platform.  On Windows,
+    # CRT file descriptors default to text mode unless O_BINARY is supplied;
+    # os.read() can otherwise translate CRLF / honour CTRL-Z and make a valid
+    # binary evidence file appear to have changed size or content.
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return False
+    except OSError as exc:
+        raise RecoveryPreservationError(f"{label} disappeared before checkpoint commit") from exc
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return False
-        if (int(st.st_dev), int(st.st_ino)) != expected_identity:
-            return False
-        try:
-            os.fchmod(fd, mode)
-        except (OSError, AttributeError):
-            return False
-        return True
+        before = os.fstat(fd)
+        identity = (int(before.st_dev), int(before.st_ino))
+        if not stat.S_ISREG(before.st_mode) or is_windows_reparse_point_stat(before):
+            raise RecoveryPreservationError(f"{label} is not a safe regular file")
+        if identity != tuple(expected_identity):
+            raise RecoveryPreservationError(f"{label} filesystem identity changed before checkpoint commit")
+        if int(getattr(before, "st_nlink", 1) or 1) != 1:
+            raise RecoveryPreservationError(f"{label} gained a hard-link alias before checkpoint commit")
+
+        digest = hashlib.sha256()
+        size = 0
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+
+        after = os.fstat(fd)
+        after_identity = (int(after.st_dev), int(after.st_ino))
+        if after_identity != identity:
+            raise RecoveryPreservationError(f"{label} filesystem identity changed during final attestation")
+        if int(getattr(after, "st_nlink", 1) or 1) != 1:
+            raise RecoveryPreservationError(f"{label} gained a hard-link alias during final attestation")
+        if expected_size is not None and size != int(expected_size):
+            raise RecoveryPreservationError(f"{label} changed before checkpoint commit (size mismatch)")
+        if digest.hexdigest() != str(expected_sha256):
+            raise RecoveryPreservationError(f"{label} changed before checkpoint commit (content mismatch)")
+        return identity
     finally:
         os.close(fd)
 
@@ -539,12 +580,6 @@ def _write_manifest(
     return hashlib.sha256(raw).hexdigest()
 
 
-def _chmod_read_only(path: Path, expected_identity: tuple[int, int]) -> None:
-    # Descriptor-bound chmod avoids following a path that was replaced with a
-    # symlink/hardlink alias after the preservation transaction committed.
-    _chmod_mode_if_same(path, expected_identity, 0o444)
-
-
 def _preservation_checkpoint_is_durable(conn: Connection, stage_id: str | None) -> bool:
     """Return whether the stage checkpoint is already committed.
 
@@ -678,6 +713,7 @@ def execute_preservation_stage(
 
         preserved_sha: str | None = None
         preserved_size: int | None = None
+        preservation_identity: tuple[int, int] | None = None
         preservation_path = Path(rebuilt.preservation_path) if rebuilt.preservation_path else None
 
         # Fresh pre-copy observations after the stage directory exists.
@@ -742,6 +778,7 @@ def execute_preservation_stage(
                 owned_stage_paths.add(preservation_path)
                 preserved_sha = readback_sha
                 preserved_size = copied_size
+                preservation_identity = _regular_file_identity(preservation_path)
             finally:
                 temp.cleanup()
         else:
@@ -794,6 +831,7 @@ def execute_preservation_stage(
             manifest_path, manifest_payload, stage_dir_identity
         )
         owned_stage_paths.add(manifest_path)
+        manifest_identity = _regular_file_identity(manifest_path)
 
         # Final physical re-attestation before the catalogue checkpoint commits.
         try:
@@ -812,26 +850,25 @@ def execute_preservation_stage(
                 "donor changed after preservation staging; preservation checkpoint rolled back"
             )
 
-        # Prove the operational evidence itself one final time immediately before
-        # the catalogue checkpoint.  A staged file/manifest that changed after
-        # initial write verification is not accepted as preservation evidence.
-        preservation_identity: tuple[int, int] | None = None
+        # Final identity/content/link-topology attestation.  This is deliberately
+        # performed after source re-observation and immediately before the
+        # catalogue checkpoint is constructed.  Single-link status is evidence,
+        # not a one-time creation assumption.
         if preservation_path is not None:
-            try:
-                final_preserved_sha = sha256_file(preservation_path)
-                final_preserved_size = int(preservation_path.stat().st_size)
-            except OSError as exc:
-                raise RecoveryPreservationError("preservation copy disappeared before commit") from exc
-            if final_preserved_sha != preserved_sha or final_preserved_size != preserved_size:
-                raise RecoveryPreservationError("preservation copy changed before commit; checkpoint rolled back")
-            preservation_identity = _regular_file_identity(preservation_path)
-        try:
-            final_manifest_sha = sha256_file(manifest_path)
-        except OSError as exc:
-            raise RecoveryPreservationError("preservation manifest disappeared before commit") from exc
-        if final_manifest_sha != manifest_sha:
-            raise RecoveryPreservationError("preservation manifest changed before commit; checkpoint rolled back")
-        manifest_identity = _regular_file_identity(manifest_path)
+            assert preservation_identity is not None and preserved_sha is not None
+            _attest_single_link_evidence(
+                preservation_path,
+                expected_identity=preservation_identity,
+                expected_sha256=preserved_sha,
+                expected_size=preserved_size,
+                label="preservation copy",
+            )
+        _attest_single_link_evidence(
+            manifest_path,
+            expected_identity=manifest_identity,
+            expected_sha256=manifest_sha,
+            label="preservation manifest",
+        )
 
         result_evidence = {
             "plan_fingerprint": rebuilt.evidence_fingerprint,
@@ -886,9 +923,9 @@ def execute_preservation_stage(
         conn.commit()
         checkpoint_committed = True
 
-        if preservation_path is not None and preservation_identity is not None:
-            _chmod_read_only(preservation_path, preservation_identity)
-        _chmod_read_only(manifest_path, manifest_identity)
+        # Phase 14.1.17.4: the immutable catalogue checkpoint is the authority.
+        # Do not mutate evidence metadata after commit; advisory chmod created a
+        # hard-link side-effect boundary without adding real authority.
         return RecoveryPreservationResult(
             schema=PRESERVATION_RESULT_SCHEMA,
             stage_id=rebuilt.stage_id,
@@ -907,7 +944,7 @@ def execute_preservation_stage(
     except BaseException:
         # Filesystem cleanup is valid only while the catalogue checkpoint is
         # still rollback-able.  An interruption can happen after SQLite commits
-        # but before post-commit chmod/return; deleting evidence at that point
+        # but before returning to the caller; deleting evidence at that point
         # would leave an immutable DB row pointing at missing files.
         durable = checkpoint_committed or _preservation_checkpoint_is_durable(
             conn, checkpoint_stage_id

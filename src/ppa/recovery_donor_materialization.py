@@ -27,8 +27,8 @@ from ppa.physical_observation import PhysicalObservationError, StableFileObserva
 from ppa.recovery_planning import RecoveryPlanningError, build_recovery_plan
 from ppa.recovery_preservation import (
     RecoveryPreservationError,
+    _attest_single_link_evidence,
     _canonical,
-    _chmod_read_only,
     _copy_preserved_bytes,
     _directory_identity,
     _fingerprint,
@@ -235,6 +235,43 @@ def _same_fs_object(a, b) -> bool:
     return (int(a.st_dev), int(a.st_ino)) == (int(b.st_dev), int(b.st_ino))
 
 
+def _filesystem_identity_has_source_authority(
+    conn: Connection, identity: tuple[int, int]
+) -> bool:
+    """Return whether an exact filesystem object is or was a registered source File.
+
+    Phase 14.1.17.2 treats source authority as historical: moving a source object
+    away from its catalogued pathname, or later observing a replacement object at
+    that pathname, must not make the original object eligible for operational
+    orphan adoption.  History rows cascade with their owning File when a Library
+    is explicitly forgotten, so only still-registered source authority survives.
+    """
+    device_id, object_id = (str(identity[0]), str(identity[1]))
+    current = conn.execute(
+        "SELECT 1 FROM files WHERE fs_device_id=? AND fs_object_id=? LIMIT 1",
+        (device_id, object_id),
+    ).fetchone()
+    if current is not None:
+        return True
+    historical = conn.execute(
+        "SELECT 1 FROM file_storage_identity_history h "
+        "JOIN files f ON f.id=h.file_id "
+        "WHERE h.device_id=? AND h.object_id=? LIMIT 1",
+        (device_id, object_id),
+    ).fetchone()
+    return historical is not None
+
+
+def _reject_source_authority(
+    conn: Connection, identity: tuple[int, int], *, label: str
+) -> None:
+    if _filesystem_identity_has_source_authority(conn, identity):
+        raise RecoveryDonorMaterializationError(
+            f"{label} is a filesystem object known to PPA as source-library evidence; "
+            "automatic operational adoption is forbidden and manual intervention is required"
+        )
+
+
 def _orphan_manifest_payload(
     plan: RecoveryDonorMaterializationPlan,
     donor_source_observation: StableFileObservation,
@@ -271,12 +308,13 @@ def _canonical_manifest_json(payload: dict) -> tuple[str, str]:
 
 
 def _validated_existing_orphan_manifest(
+    conn: Connection,
     manifest: Path,
     *,
     row,
     destination: Path,
     expected_size: int,
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, tuple[int, int]] | None:
     """Validate an already-written pre-checkpoint manifest without modifying it."""
     if not os.path.lexists(os.fspath(manifest)):
         return None
@@ -285,6 +323,8 @@ def _validated_existing_orphan_manifest(
         raise RecoveryDonorMaterializationError(
             "orphan donor manifest has multiple hard links; manual intervention required"
         )
+    manifest_identity = (int(manifest_st.st_dev), int(manifest_st.st_ino))
+    _reject_source_authority(conn, manifest_identity, label="orphan donor manifest")
     try:
         raw = manifest.read_bytes()
         payload = json.loads(raw.decode("utf-8"))
@@ -322,7 +362,7 @@ def _validated_existing_orphan_manifest(
         raise RecoveryDonorMaterializationError(
             "uncheckpointed donor manifest lacks materialization time; manual intervention required"
         )
-    return mid, materialized_at, hashlib.sha256(raw).hexdigest()
+    return mid, materialized_at, hashlib.sha256(raw).hexdigest(), manifest_identity
 
 
 def _adopt_verified_donor_orphan_without_delete(
@@ -390,6 +430,9 @@ def _adopt_verified_donor_orphan_without_delete(
             "orphan donor materialization has multiple hard links; refusing adoption"
         )
     orphan_identity = (int(orphan_st.st_dev), int(orphan_st.st_ino))
+    _reject_source_authority(
+        conn, orphan_identity, label="orphan donor materialization"
+    )
 
     # Existing source paths must not be the same filesystem object as the orphan.
     for source_label, source_path in (
@@ -418,6 +461,7 @@ def _adopt_verified_donor_orphan_without_delete(
             )
 
     manifest_info = _validated_existing_orphan_manifest(
+        conn,
         manifest,
         row=row,
         destination=destination,
@@ -484,6 +528,10 @@ def _adopt_verified_donor_orphan_without_delete(
         raise RecoveryDonorMaterializationError("orphan donor changed before checkpoint commit")
     if manifest_storage == MANIFEST_FILESYSTEM:
         manifest_identity = _regular_file_identity(manifest)
+        if manifest_identity != manifest_info[3]:
+            raise RecoveryDonorMaterializationError(
+                "orphan donor manifest filesystem object changed before checkpoint commit"
+            )
         if sha256_file(manifest) != manifest_sha:
             raise RecoveryDonorMaterializationError("orphan donor manifest changed before checkpoint commit")
     else:
@@ -504,6 +552,24 @@ def _adopt_verified_donor_orphan_without_delete(
         raise RecoveryDonorMaterializationError("target changed before orphan checkpoint commit")
     if orphan_final.state != "matches_expected" or orphan_final.sha256 != plan.expected_sha256:
         raise RecoveryDonorMaterializationError("orphan donor changed before checkpoint commit")
+
+    try:
+        _attest_single_link_evidence(
+            destination,
+            expected_identity=orphan_identity,
+            expected_sha256=plan.expected_sha256,
+            expected_size=int(orphan_final.size_bytes or 0),
+            label="orphan donor materialization",
+        )
+        if manifest_identity is not None:
+            _attest_single_link_evidence(
+                manifest,
+                expected_identity=manifest_identity,
+                expected_sha256=manifest_sha,
+                label="orphan donor manifest",
+            )
+    except RecoveryPreservationError as exc:
+        raise RecoveryDonorMaterializationError(str(exc)) from exc
 
     result_evidence = {
         "plan_fingerprint": plan.evidence_fingerprint,
@@ -553,9 +619,8 @@ def _adopt_verified_donor_orphan_without_delete(
         ),
     )
     conn.commit()
-    _chmod_read_only(destination, orphan_identity)
-    if manifest_identity is not None:
-        _chmod_read_only(manifest, manifest_identity)
+    # Evidence finalisation ends at the immutable catalogue checkpoint.  No
+    # post-commit chmod or other filesystem metadata mutation is performed.
     return {
         "stage_id": plan.stage_id,
         "state": "orphan_artifact_adopted",
@@ -950,6 +1015,23 @@ def execute_donor_materialization(
         if target_final.size_bytes != row["target_size_bytes"] or target_final.mtime_ns != row["target_mtime_ns"]:
             raise RecoveryDonorMaterializationError("target changed before donor checkpoint commit")
 
+        try:
+            _attest_single_link_evidence(
+                destination,
+                expected_identity=destination_identity,
+                expected_sha256=rebuilt.expected_sha256,
+                expected_size=copied_size,
+                label="donor materialization",
+            )
+            _attest_single_link_evidence(
+                manifest,
+                expected_identity=manifest_identity,
+                expected_sha256=manifest_sha,
+                label="donor materialization manifest",
+            )
+        except RecoveryPreservationError as exc:
+            raise RecoveryDonorMaterializationError(str(exc)) from exc
+
         result_evidence = {
             "plan_fingerprint": rebuilt.evidence_fingerprint,
             "donor_materialized_sha256": rebuilt.expected_sha256,
@@ -994,8 +1076,7 @@ def execute_donor_materialization(
         )
         conn.commit()
         checkpoint_committed = True
-        _chmod_read_only(destination, destination_identity)
-        _chmod_read_only(manifest, manifest_identity)
+        # Phase 14.1.17.4: no post-commit evidence mutation.
         return RecoveryDonorMaterializationResult(
             schema=DONOR_RESULT_SCHEMA,
             materialization_id=rebuilt.materialization_id,

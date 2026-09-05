@@ -286,6 +286,46 @@ def _main(argv: list[str] | None = None) -> int:
     )
     recovery_orphan_parser.add_argument("stage_id", help="Committed Phase-14 preservation stage UUID")
 
+    recovery_readiness_parser = subparsers.add_parser(
+        "recovery-target-readiness",
+        help="Build or record Phase-14.2 target-replacement readiness; never writes or replaces the target",
+    )
+    recovery_readiness_parser.add_argument("materialization_id", help="Committed Phase-14.1 donor materialization UUID")
+    recovery_readiness_parser.add_argument(
+        "--record", action="store_true",
+        help="Append the planning-only readiness snapshot to the catalogue audit ledger",
+    )
+    recovery_readiness_parser.add_argument("--note", default=None, help="Optional note when --record is used")
+    recovery_readiness_parser.add_argument("--json", dest="json_path", default=None,
+                                           help="Write structured Phase-14.2 readiness JSON")
+
+    recovery_execution_parser = subparsers.add_parser(
+        "recovery-target-execution",
+        help="Preview or explicitly execute one Phase-14.3 target-replacement attempt from recorded readiness",
+    )
+    recovery_execution_parser.add_argument("readiness_id", help="Recorded Phase-14.2 target-readiness UUID")
+    recovery_execution_parser.add_argument(
+        "--execution-id", default=None,
+        help="Exact previewed execution UUID; required with --apply",
+    )
+    recovery_execution_parser.add_argument(
+        "--apply", action="store_true",
+        help="Consume the reviewed execution UUID after exact confirmation and perform one attempt",
+    )
+    recovery_execution_parser.add_argument(
+        "--confirm", default=None,
+        help="Exact confirmation phrase printed by the preview; required with --apply",
+    )
+    recovery_execution_parser.add_argument("--note", default=None, help="Optional immutable authorization note")
+    recovery_execution_parser.add_argument("--json", dest="json_path", default=None,
+                                           help="Write structured Phase-14.3 plan/result JSON")
+
+    recovery_execution_status_parser = subparsers.add_parser(
+        "recovery-target-execution-status",
+        help="Inspect one durable Phase-14.3 execution attempt without replaying or mutating it",
+    )
+    recovery_execution_status_parser.add_argument("execution_id", help="Phase-14.3 execution UUID")
+
     identity_health_parser = subparsers.add_parser(
         "identity-health", help="Build the read-only Phase-10 identity health and resolution queue")
     identity_health_parser.add_argument("library_id", type=int)
@@ -866,6 +906,87 @@ def _main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        return 0
+
+    if args.command == "recovery-target-readiness":
+        from ppa.recovery_target_readiness import (
+            build_target_replacement_readiness, concise_readiness_text,
+            record_target_replacement_readiness,
+        )
+        try:
+            readiness = build_target_replacement_readiness(
+                conn, materialization_id=args.materialization_id
+            )
+            print(concise_readiness_text(readiness))
+            if args.record:
+                recorded = record_target_replacement_readiness(conn, readiness, note=args.note)
+                print(
+                    f"\nRecorded planning-only readiness {recorded.readiness_id}; "
+                    "target replacement remains NOT authorised."
+                )
+            elif args.note:
+                print("--note is ignored unless --record is supplied", file=sys.stderr)
+            if args.json_path:
+                safe_export_text(args.json_path, readiness.to_json() + "\n", conn=conn, config=config)
+                print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "recovery-target-execution":
+        from ppa.recovery_target_execution import (
+            build_target_replacement_execution_plan, concise_execution_plan_text,
+            concise_execution_result_text, execute_target_replacement,
+        )
+        try:
+            if args.apply and not args.execution_id:
+                print("--apply requires the exact --execution-id printed by the preview", file=sys.stderr)
+                return 1
+            if args.apply and not args.confirm:
+                print("--apply requires the exact --confirm phrase printed by the preview", file=sys.stderr)
+                return 1
+            if not args.apply and args.confirm:
+                print("--confirm is ignored unless --apply is supplied", file=sys.stderr)
+            if not args.apply and args.note:
+                print("--note is ignored unless --apply is supplied", file=sys.stderr)
+
+            plan = build_target_replacement_execution_plan(
+                conn, readiness_id=args.readiness_id, execution_id=args.execution_id
+            )
+            if not args.apply:
+                print(concise_execution_plan_text(plan))
+                if args.json_path:
+                    safe_export_text(args.json_path, plan.to_json() + "\n", conn=conn, config=config)
+                    print(f"\nWrote {args.json_path}")
+                return 0
+
+            result = execute_target_replacement(
+                conn, plan, confirmation=args.confirm, note=args.note
+            )
+            print(concise_execution_result_text(result))
+            if args.json_path:
+                safe_export_text(args.json_path, result.to_json() + "\n", conn=conn, config=config)
+                print(f"\nWrote {args.json_path}")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "recovery-target-execution-status":
+        from ppa.recovery_target_execution import inspect_recovery_execution_status
+        try:
+            status = inspect_recovery_execution_status(conn, execution_id=args.execution_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Execution ID: {status.execution_id}")
+        print(f"Resolved: {'yes' if status.resolved else 'no'}")
+        print(f"Result: {status.result_state or 'unresolved'}")
+        print(f"Current target state: {status.target_state}")
+        if status.suspect_retained_path:
+            print(f"Retained suspect: {status.suspect_retained_path}")
+        print(status.detail)
         return 0
 
     if args.command == "identity-health":

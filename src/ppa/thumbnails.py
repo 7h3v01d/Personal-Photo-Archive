@@ -61,6 +61,10 @@ def _within(candidate: str, root: str) -> bool:
         return False
 
 
+class ThumbnailAuthorityUnavailable(ValueError):
+    """Thumbnail generation is disabled until source-tree authority is verified."""
+
+
 @dataclass(frozen=True)
 class ThumbnailAuthorityPolicy:
     """Catalogue-backed source-tree exclusion policy for thumbnail authority.
@@ -78,7 +82,7 @@ class ThumbnailAuthorityPolicy:
         try:
             policy = SourceTreeAuthorityPolicy.from_connection(conn)
         except SourceTreeAuthorityError as exc:
-            raise ValueError(str(exc)) from exc
+            raise ThumbnailAuthorityUnavailable(str(exc)) from exc
         return cls(policy.forbidden_directory_identities, policy.forbidden_roots)
 
     def validate_authority(self, authority) -> None:
