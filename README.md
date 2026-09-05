@@ -4,7 +4,7 @@ Local-first digital photography management and preservation platform.
 See `docs/ARCHIVE_SAFETY_CONTRACT.md` for the non-negotiable rules every
 feature is built against.
 
-Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12 adversarially ACCEPTED/FROZEN at 12.4.2; Phase 13 adversarially ACCEPTED/FROZEN at 13.0.1; Phase 14.1.17.1 exact destructive child authority Windows-gate correction active.**
+Status: **Archive Core ACCEPTED; Phase 6 FROZEN; Phases 7–10 delivered; Phase 11 navigation refactor complete; Phase 12 adversarially ACCEPTED/FROZEN at 12.4.2; Phase 13 adversarially ACCEPTED/FROZEN at 13.0.1; Phase 14.1.17.4.1 adversarially ACCEPTED/FROZEN; Phase 14.2 production FROZEN at 14.2.3 with native-Windows harness qualified through 14.2.3.2; Phase 14.3 target-replacement execution adversarially ACCEPTED/FROZEN at 14.3.5 after native Windows/NTFS gate 752 passed / 13 skipped; Phase 14.4 desktop recovery execution integration active.**
 
 The Library -> File -> FileRevision -> Observation model remains the archive-core
 provenance boundary. Later chronology, Event, organisation, identity, navigation,
@@ -756,7 +756,7 @@ Append order is now the authority for mismatch decision and Verify-observation r
 
 ## Phase 14.0.1 — Stage-Path & Rollback-Cleanup Hardening
 
-The Phase-14.0 review found that a caller-supplied `stage_id` could carry filesystem path authority and, on failure, generic recursive cleanup could therefore operate outside the intended preservation root. Phase 14.0.1 closes that boundary structurally: stage IDs are canonical UUIDs only; execution revalidates them before filesystem use; the created stage directory is bound to its filesystem identity; rollback removes only PPA-owned artifacts and never recursively traverses/chmods unexpected content; custom recorded preservation roots are protected by `ppa.safe_export`; the parent directory entry is fsynced when the stage directory is created; and post-commit read-only chmod is descriptor/identity-bound so a replaced alias cannot redirect the permission change to a source file.
+The Phase-14.0 review found that a caller-supplied `stage_id` could carry filesystem path authority and, on failure, generic recursive cleanup could therefore operate outside the intended preservation root. Phase 14.0.1 closes that boundary structurally: stage IDs are canonical UUIDs only; execution revalidates them before filesystem use; the created stage directory is bound to its filesystem identity; rollback removes only PPA-owned artifacts and never recursively traverses/chmods unexpected content; custom recorded preservation roots are protected by `ppa.safe_export`; the parent directory entry is fsynced when the stage directory is created; and evidence finalisation is now superseded by Phase 14.1.17.4: exact single-link topology is re-attested before commit and no post-commit evidence chmod is performed.
 
 The recovery authority remains unchanged: Phase 14.0.1 preserves suspect bytes only. It does not materialise donor bytes and does not replace, rename, move, delete, metadata-rewrite, timestamp-repair, or otherwise modify a source photograph.
 
@@ -865,3 +865,75 @@ Phase 14.1.16 closes the shared installer races found after 14.1.15. POSIX final
 Phase 14.1.17 applies the same exact-object rule to cleanup. POSIX recovery rollback no longer performs child-name unlink or stage-name rmdir after an earlier identity check; directory-child creation failure also retains debris rather than deleting a substituted replacement. Donor orphan reconciliation is non-destructive on every platform: verified final artifacts can be adopted forward, while temporary/invalid/ambiguous debris is retained for manual intervention. Windows may retain exact-handle deletion where the destructive operation is bound to the object itself. Schema remains **v39**. See `docs/PHASE14_1_17_EXACT_DESTRUCTIVE_CHILD_AUTHORITY.md`.
 
 **14.1.17.1 Windows gate correction:** the POSIX-only directory-child failure regression is now explicitly skipped on Windows, and native `ERROR_FILE_EXISTS` / `ERROR_ALREADY_EXISTS` from the final Windows no-replace rename is normalized into `SecureWriteError` so higher layers report the expected archive-safety refusal. The native no-replace behavior itself was already correct; this correction changes error-contract handling only. Schema remains **v39**.
+
+**14.1.17.2 source-object exclusion:** donor-orphan forward adoption now rejects any exact filesystem object whose current or historical storage identity is associated with a still-registered source File. The same exclusion applies to an existing filesystem donor manifest, whose validated identity is now carried through to checkpoint commit. Rejected source-associated objects are left untouched: no chmod, checkpoint, or adoption event is permitted. Schema remains **v39**.
+
+**14.1.17.3 UI authority-startup correction:** opening an older catalogue whose registered Library source-tree identity still requires a complete rescan no longer aborts desktop startup while constructing the thumbnail worker. Thumbnail authority remains fail-closed: the worker is disabled, no cache directory or derivative is created, and the status bar tells the user to rescan. A successful scan re-arms the main thumbnail worker. Cache-object validation failures remain fatal rather than being softened. Schema remains **v39**.
+
+**14.1.17.4 evidence link-topology finalization:** Phase-14.0 preservation evidence, normal Phase-14.1 donor materialization, donor manifests, and orphan-adopted donor evidence now undergo a final descriptor-bound identity/content/link-topology attestation immediately before the immutable catalogue checkpoint. The exact regular file must still be the previously observed filesystem object, hash to the reviewed bytes, and have `st_nlink == 1` both before and after descriptor-bound hashing. A hard link arriving after earlier verification therefore aborts the checkpoint and leaves the evidence untouched. Successful recovery checkpoints no longer perform advisory post-commit `chmod 0444`; catalogue evidence is the authority and no filesystem metadata mutation occurs after commit. Schema remains **v39**.
+
+**14.1.17.4.1 Windows binary-attestation correction:** the final descriptor-bound evidence hash now opens Windows CRT file descriptors with `O_BINARY`. Without that flag, `os.read()` could apply text-mode CRLF/CTRL-Z semantics and falsely report a size/content mismatch for valid binary recovery evidence. POSIX behavior and the 14.1.17.4 authority model are unchanged. A native Windows regression exercises CRLF and CTRL-Z bytes. Schema remains **v39**.
+
+## Phase 14.2 — Target-Replacement Readiness Protocol
+
+Phase 14.2 returns to the main recovery roadmap after the frozen Phase-14.1 hardening detour. It starts only from one committed preservation + verified donor-materialization chain and freshly re-attests the unchanged target state, current human recovery intent, the exact current target-parent source-tree directory identity, preservation evidence, staged expected donor bytes and donor manifest. Present targets with hard-link aliases are refused rather than silently interpreted.
+
+A positive result is explicitly **planning-only**: `target_replacement_authorized=false` and `recovery_execution_authorized=false`. Migration 040 adds an immutable optional readiness audit row; recording it writes SQLite only and revalidates the entire readiness snapshot under `BEGIN IMMEDIATE`. No source photograph is created, replaced, renamed, deleted, chmodded, metadata-written or timestamp-repaired. See `docs/PHASE14_2_TARGET_REPLACEMENT_READINESS.md`.
+
+### Phase 14.2.1 — Destination Final Attestation
+
+14.2.1 closes the destination-finalisation TOCTOU found in adversarial review. The target parent and the target are now observed twice: once before the potentially lengthy Phase-14 operational-evidence hashing and again immediately after that hashing, before the readiness fingerprint is constructed. The final parent pathname/identity and target state/SHA/size/mtime/device/object/link-count snapshot must exactly match the initial snapshot or readiness fails closed. The present-target link-count metadata observation is explicitly bound to the same filesystem identity, size and mtime as the accepted stable content observation. Recording inherits the same final attestation because it rebuilds readiness inside `BEGIN IMMEDIATE`. Schema remains v40 and the phase still grants zero target-write/execution authority. See `docs/PHASE14_2_1_DESTINATION_FINAL_ATTESTATION.md`.
+
+### Phase 14.2.2 — Library Root Topology Attestation
+
+14.2.2 closes the registered-Library-root substitution gap found after 14.2.1. Each destination topology proof now includes the persisted `libraries.root_fs_device_id/root_fs_object_id` and requires the current object at `root_canonical_path` to be the same safe, non-reparse directory object before the target-parent identity can count as valid. The root, immediate parent and target are all re-attested after Phase-14 evidence hashing, and the exact root identity is included in the readiness fingerprint. A fake replacement root cannot become ready merely by receiving a transplanted historically-known child directory. Recording inherits the same proof through its rebuild. Schema remains v40 and no target-write/execution authority is introduced. See `docs/PHASE14_2_2_LIBRARY_ROOT_TOPOLOGY_ATTESTATION.md`.
+
+### Phase 14.2.3 — Bound Destination Topology Finalization
+
+14.2.3 closes the intra-final-attestation race found after 14.2.2. The final readiness pass now binds the exact registered Library root and exact target-parent directory with the hardened Phase-14.1 directory-authority primitive, retains both read-only pins while the target receives its final stable-content hash/identity/link-count observation, and then calls `verify_pathname()` on both exact directory objects before the readiness fingerprint may be constructed. A root or parent renamed/replaced while the target is being hashed therefore invalidates readiness even when the genuine parent or exact target object is transplanted into the replacement namespace. Record-time rebuilds inherit the same bound finalization. Schema remains v40 and the authority objects are used only as identity/freshness pins; no mutation API or target-write/execution authority is introduced. See `docs/PHASE14_2_3_BOUND_DESTINATION_TOPOLOGY_FINALIZATION.md`.
+
+### Phase 14.3 — Target-Replacement Execution
+
+Phase 14.3 is the first explicitly source-mutating recovery boundary. It starts only from an immutable recorded Phase-14.2 readiness checkpoint, rebuilds the complete readiness chain again, and still presents a non-authoritative plan until the user repeats the previewed execution UUID and supplies the exact plan-derived confirmation phrase. Only then is an immutable one-attempt execution intent committed before any source namespace mutation. Missing-target restore uses bound-parent atomic no-replace installation on reviewed local filesystems. Existing-target replacement is initially native-Windows-only so PPA can rename the exact reviewed target object by its already-open handle rather than using a POSIX check-name-then-rename sequence; the exact displaced suspect object is retained under a deterministic hidden `.suspect` name and is never deleted by this phase. The placed expected target must pass descriptor-bound SHA/size/object/link-count verification, and Phase 14.3 deliberately leaves catalogue health at `hash_mismatch` until the ordinary Verify path independently reconciles it. Interrupted attempts are durable and may be reconciled read-only only when source state is unambiguous. Schema is **v41**. The desktop UI does not expose execution before adversarial acceptance. See `docs/PHASE14_3_TARGET_REPLACEMENT_EXECUTION.md`.
+
+### Phase 14.3.2 — Native Windows Parked-Suspect Mutation Harness Correction
+
+The second native Windows pre-review gate showed that the rollback regression's pathname-based attempt to overwrite the parked `.suspect` could itself be denied while PPA's exact-object handles were live. That meant the test sometimes exercised a failed external mutation followed by a truthful rollback rather than the intended changed-object case. Phase 14.3.2 corrects the adversarial harness: an independent Windows read/write handle is opened before execution with read/write/delete sharing, survives PPA's handle-relative parking rename, and then mutates the exact same filesystem object while parked. Production execution and rollback code are unchanged from 14.3.1; schema remains **v41**. See `docs/PHASE14_3_2_WINDOWS_PARKED_SUSPECT_MUTATION_HARNESS.md`.
+
+### Phase 14.3.3 — Target Transition Provenance
+
+Adversarial review found that POSIX `BoundTemporaryFile.install()` could raise after `RENAME_NOREPLACE` had already acquired the missing target name but before its bundled directory durability/verification work completed. Because the Phase-14.3 caller previously used “install returned” as its transition flag, that path could write an immutable `aborted_before_target_transition` result even though the expected target already existed. Phase 14.3.3 splits atomic acquisition from post-acquisition durability provenance, introduces `SecureWriteTransitionError`, and requires any post-acquisition failure to leave the durable execution attempt unresolved with no result row. Atomic no-replace refusal such as `EEXIST` remains a truthful resolved pre-transition abort. Schema remains **v41**. See `docs/PHASE14_3_3_TARGET_TRANSITION_PROVENANCE.md`.
+
+
+## Phase 14.3.4 — Native transition-provenance regression harness
+
+Phase 14.3.4 is a **test/documentation-only compatibility correction** to the
+Phase-14.3.3 provenance regression. The reviewer reproduction remains exact on
+POSIX (`RENAME_NOREPLACE` succeeds, then parent-directory `fsync()` fails).
+Native Windows now injects the equivalent install-internal fault through the
+actual handle-relative path: `WindowsDirectoryPin.rename_fd()` acquires the
+target name, then the next internal pathname/authority verification fails.
+Both paths must leave the durable execution attempt unresolved with no result
+row. **No production recovery, secure-write, schema, or migration code changes
+in 14.3.4.**
+
+
+## Phase 14.3.5 — Rollback Post-Transition Attestation
+
+Adversarial review of 14.3.4 found that the Windows existing-target rollback
+helper proved the parked suspect bytes twice *before* the reverse rename but,
+after renaming the exact handle back to the registered target, proved only
+filesystem identity. An already-open writer could therefore change the same
+inode in the pre-proof → reverse-rename window and PPA could falsely record
+`aborted_exact_target_restored`. Phase 14.3.5 makes rollback finalization
+transition-aware: after the reverse rename, both the original still-open handle
+and a freshly reopened target-path handle must again prove the reviewed SHA,
+size, mtime, identity and single-link topology. Any failure after the reverse
+transition leaves the durable attempt unresolved with no result row; no second
+automatic rename is attempted. Schema remains **v41**. See
+`docs/PHASE14_3_5_ROLLBACK_POST_TRANSITION_ATTESTATION.md`.
+
+
+## Phase 14.4 — Desktop Recovery Execution Integration
+
+Phase 14.4 exposes the already-frozen Phase-14.3.5 execution backend through the desktop without introducing any new filesystem or catalogue authority. The UI keeps every authority boundary explicit: Phase-14.2 readiness is first built read-only, then separately recorded as an immutable zero-authority checkpoint; only that recorded readiness may produce a fresh Phase-14.3.5 execution preview. The execution dialog displays the exact backend-generated execution UUID/fingerprint/confirmation phrase and keeps its source-mutating action disabled until the human retypes that phrase exactly. Execution still runs through `execute_target_replacement()` unchanged. If the backend raises after durable authorization, the UI inspects the attempt read-only and presents its resolved/unresolved state, current target SHA and retained-suspect path; it never offers automatic replay. Successful expected-byte placement still requires ordinary Verify before catalogue health can return to OK. Schema remains **v41** and no migration is added. See `docs/PHASE14_4_DESKTOP_RECOVERY_EXECUTION_INTEGRATION.md`.

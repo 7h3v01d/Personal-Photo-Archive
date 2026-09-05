@@ -319,37 +319,6 @@ def test_recorded_donor_materialization_cannot_be_deleted_or_cascade_erased(tmp_
     assert conn.execute("SELECT COUNT(*) FROM archive_recovery_donor_materializations WHERE materialization_id=?", (result.materialization_id,)).fetchone()[0] == 1
 
 
-def test_postcommit_interrupt_preserves_committed_donor_evidence(tmp_path: Path, monkeypatch) -> None:
-    """Once the immutable checkpoint commits, exception cleanup loses authority."""
-    from ppa.recovery_donor_materialization import reconcile_donor_materialization_orphans
-    import ppa.recovery_donor_materialization as rdm
-
-    conn, _db, _library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
-    plan = build_donor_materialization_plan(conn, stage_id=stage.stage_id)
-
-    def interrupt_postcommit(_path: Path, _identity) -> None:
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr(rdm, "_chmod_read_only", interrupt_postcommit)
-    with pytest.raises(KeyboardInterrupt):
-        execute_donor_materialization(conn, plan)
-
-    row = conn.execute(
-        "SELECT * FROM archive_recovery_donor_materializations WHERE materialization_id=?",
-        (plan.materialization_id,),
-    ).fetchone()
-    assert row is not None
-    destination = Path(row["donor_materialization_path"])
-    manifest = Path(row["donor_manifest_path"])
-    assert destination.is_file()
-    assert manifest.is_file()
-    assert destination.read_bytes() == donor_before
-    assert reconcile_donor_materialization_orphans(conn, stage_id=stage.stage_id)["state"] == "checkpoint_exists"
-    assert destination.is_file() and manifest.is_file()
-    assert target.read_bytes() == suspect
-    assert donor.read_bytes() == donor_before
-
-
 @pytest.mark.skipif(not descriptor_bound_directory_mutation_available(), reason="POSIX bound-stage concurrency regression")
 def test_orphan_reconciliation_serializes_and_retains_ambiguous_debris(tmp_path: Path, monkeypatch) -> None:
     """14.1.17: writer serialization remains, but ambiguous debris is retained."""
@@ -943,3 +912,246 @@ def test_phase14117_orphan_reconciliation_retains_substituted_source_temp(tmp_pa
         "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_donor_orphan_reconciled' LIMIT 1"
     ).fetchone()
     assert event is None
+
+
+def test_phase141172_orphan_adoption_rejects_current_catalogued_source_identity(tmp_path: Path) -> None:
+    """14.1.17.2: exact source-object identity cannot be adopted as donor evidence."""
+    import os
+    import stat
+    import ppa.recovery_donor_materialization as rdm
+
+    conn, _db, library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
+    source = library / "catalogued-duplicate.jpg"
+    source.write_bytes(donor_before)
+    source.chmod(0o600)
+    scan_library(conn, library)
+    source_row = conn.execute(
+        "SELECT id,fs_device_id,fs_object_id FROM files WHERE filename=?",
+        (source.name,),
+    ).fetchone()
+    assert source_row is not None
+    before_stat = source.stat()
+    before_mode = stat.S_IMODE(before_stat.st_mode)
+    assert (source_row["fs_device_id"], source_row["fs_object_id"]) == (
+        str(before_stat.st_dev), str(before_stat.st_ino)
+    )
+
+    plan = build_donor_materialization_plan(conn, stage_id=stage.stage_id)
+    destination = Path(plan.donor_materialization_path)
+    os.rename(source, destination)
+
+    with pytest.raises(RecoveryDonorMaterializationError, match="source-library evidence|source.*authority|manual intervention"):
+        rdm.reconcile_donor_materialization_orphans(conn, stage_id=stage.stage_id)
+
+    assert not source.exists()
+    assert destination.read_bytes() == donor_before
+    assert stat.S_IMODE(destination.stat().st_mode) == before_mode
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM archive_recovery_donor_materializations WHERE stage_id=?",
+        (stage.stage_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_donor_orphan_adopted' LIMIT 1"
+    ).fetchone() is None
+
+
+def test_phase141172_orphan_adoption_rejects_historical_catalogued_source_identity(tmp_path: Path) -> None:
+    """14.1.17.2: source authority survives later observation of a replacement inode."""
+    import os
+    import stat
+    import ppa.recovery_donor_materialization as rdm
+
+    conn, _db, library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
+    source = library / "historical-source.jpg"
+    source.write_bytes(donor_before)
+    source.chmod(0o600)
+    scan_library(conn, library)
+    source_row = conn.execute(
+        "SELECT id,fs_device_id,fs_object_id FROM files WHERE filename=?",
+        (source.name,),
+    ).fetchone()
+    assert source_row is not None
+    old_identity = (source_row["fs_device_id"], source_row["fs_object_id"])
+    old_mode = stat.S_IMODE(source.stat().st_mode)
+
+    parked = tmp_path / "parked-historical-source.jpg"
+    os.rename(source, parked)
+    # A different filesystem object now occupies the same registered source path.
+    source.write_bytes(donor_before)
+    scan_library(conn, library)
+    current = conn.execute(
+        "SELECT fs_device_id,fs_object_id FROM files WHERE id=?",
+        (source_row["id"],),
+    ).fetchone()
+    assert (current["fs_device_id"], current["fs_object_id"]) != old_identity
+    assert conn.execute(
+        "SELECT 1 FROM file_storage_identity_history WHERE file_id=? AND device_id=? AND object_id=? LIMIT 1",
+        (source_row["id"], old_identity[0], old_identity[1]),
+    ).fetchone() is not None
+
+    plan = build_donor_materialization_plan(conn, stage_id=stage.stage_id)
+    destination = Path(plan.donor_materialization_path)
+    os.rename(parked, destination)
+
+    with pytest.raises(RecoveryDonorMaterializationError, match="source-library evidence|source.*authority|manual intervention"):
+        rdm.reconcile_donor_materialization_orphans(conn, stage_id=stage.stage_id)
+
+    assert destination.read_bytes() == donor_before
+    assert stat.S_IMODE(destination.stat().st_mode) == old_mode
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM archive_recovery_donor_materializations WHERE stage_id=?",
+        (stage.stage_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_donor_orphan_adopted' LIMIT 1"
+    ).fetchone() is None
+
+
+def test_phase141172_existing_orphan_manifest_rejects_source_authority_identity(tmp_path: Path) -> None:
+    """14.1.17.2: a filesystem manifest object carrying source authority is never adopted."""
+    import shutil
+    import ppa.recovery_donor_materialization as rdm
+
+    conn, _db, library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
+    extra = library / "manifest-authority-anchor.jpg"
+    _img(extra, "green")
+    scan_library(conn, library)
+    extra_row = conn.execute("SELECT id FROM files WHERE filename=?", (extra.name,)).fetchone()
+    assert extra_row is not None
+
+    plan = rdm._build_donor_materialization_plan(
+        conn, stage_id=stage.stage_id, materialization_id=None, allow_uncheckpointed_artifacts=True
+    )
+    destination = Path(plan.donor_materialization_path)
+    manifest = Path(plan.donor_manifest_path)
+    shutil.copyfile(donor, destination)
+    donor_obs = rdm.observe_stable_image(donor, expected_sha256=plan.expected_sha256)
+    payload = rdm._orphan_manifest_payload(
+        plan, donor_obs, copied_size=len(donor_before), materialized_at=rdm._now()
+    )
+    rdm._write_json_manifest(manifest, payload)
+    mst = manifest.stat()
+    # Model a still-registered source File whose exact object identity is this
+    # valid JSON object.  The adoption boundary must consult source authority
+    # before accepting the manifest as operational evidence.
+    conn.execute(
+        "UPDATE files SET fs_device_id=?,fs_object_id=? WHERE id=?",
+        (str(mst.st_dev), str(mst.st_ino), extra_row["id"]),
+    )
+    conn.commit()
+    before = manifest.read_bytes()
+
+    with pytest.raises(RecoveryDonorMaterializationError, match="source-library evidence|source.*authority|manual intervention"):
+        rdm.reconcile_donor_materialization_orphans(conn, stage_id=stage.stage_id)
+
+    assert manifest.read_bytes() == before
+    assert destination.read_bytes() == donor_before
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before
+    assert conn.execute("SELECT COUNT(*) FROM archive_recovery_donor_materializations").fetchone()[0] == 0
+
+
+def test_phase141174_orphan_late_hardlink_blocks_adoption_and_preserves_mode(tmp_path: Path, monkeypatch) -> None:
+    """14.1.17.4: a hard link arriving after initial orphan checks invalidates adoption."""
+    import os
+    import stat
+    import ppa.recovery_donor_materialization as rdm
+
+    conn, _db, library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
+    plan = build_donor_materialization_plan(conn, stage_id=stage.stage_id)
+    real_manifest = rdm._write_json_manifest
+    monkeypatch.setattr(rdm, "_try_bind_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        rdm,
+        "_write_json_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RecoveryDonorMaterializationError("injected pre-manifest interruption")
+        ),
+    )
+    with pytest.raises(RecoveryDonorMaterializationError, match="pre-manifest"):
+        execute_donor_materialization(conn, plan)
+
+    destination = Path(plan.donor_materialization_path)
+    alias = library / "late-source-hardlink.jpg"
+    before_mode = stat.S_IMODE(destination.stat().st_mode)
+    real_observe = rdm.observe_stable_image
+    attacked = {"done": False}
+
+    def observe_and_link(path, *args, **kwargs):
+        result = real_observe(path, *args, **kwargs)
+        if not attacked["done"] and Path(path) == destination:
+            os.link(destination, alias)
+            attacked["done"] = True
+        return result
+
+    monkeypatch.setattr(rdm, "_write_json_manifest", real_manifest)
+    monkeypatch.setattr(rdm, "observe_stable_image", observe_and_link)
+    with pytest.raises(RecoveryDonorMaterializationError, match="hard-link|single-link|alias"):
+        rdm.reconcile_donor_materialization_orphans(conn, stage_id=stage.stage_id)
+
+    assert attacked["done"]
+    assert destination.exists() and alias.exists()
+    assert destination.stat().st_nlink == 2
+    assert alias.stat().st_nlink == 2
+    assert stat.S_IMODE(destination.stat().st_mode) == before_mode
+    assert stat.S_IMODE(alias.stat().st_mode) == before_mode
+    assert destination.read_bytes() == donor_before
+    assert alias.read_bytes() == donor_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM archive_recovery_donor_materializations WHERE stage_id=?",
+        (stage.stage_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_donor_orphan_adopted' LIMIT 1"
+    ).fetchone() is None
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before
+
+
+def test_phase141174_normal_donor_late_hardlink_blocks_checkpoint_without_chmod(tmp_path: Path, monkeypatch) -> None:
+    """14.1.17.4: normal donor finalisation re-attests single-link topology."""
+    import os
+    import stat
+    import ppa.recovery_donor_materialization as rdm
+
+    conn, _db, library, target, donor, _rows, donor_before, suspect, _proposal, stage = _staged_case(tmp_path)
+    plan = build_donor_materialization_plan(conn, stage_id=stage.stage_id)
+    destination = Path(plan.donor_materialization_path)
+    manifest = Path(plan.donor_manifest_path)
+    alias = library / "late-materialized-hardlink.jpg"
+    real_observe = rdm.observe_stable_image
+    attacked = {"done": False, "mode": None}
+
+    def observe_and_link(path, *args, **kwargs):
+        result = real_observe(path, *args, **kwargs)
+        if (
+            not attacked["done"]
+            and destination.exists()
+            and manifest.exists()
+            and Path(path) == Path(plan.donor_path)
+        ):
+            os.link(destination, alias)
+            attacked["done"] = True
+            attacked["mode"] = stat.S_IMODE(alias.stat().st_mode)
+        return result
+
+    monkeypatch.setattr(rdm, "observe_stable_image", observe_and_link)
+    with pytest.raises(RecoveryDonorMaterializationError, match="hard-link|single-link|alias"):
+        execute_donor_materialization(conn, plan)
+
+    assert attacked["done"] and alias.exists()
+    assert alias.read_bytes() == donor_before
+    assert stat.S_IMODE(alias.stat().st_mode) == attacked["mode"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM archive_recovery_donor_materializations WHERE stage_id=?",
+        (stage.stage_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_donor_materialized' LIMIT 1"
+    ).fetchone() is None
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before

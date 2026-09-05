@@ -566,3 +566,25 @@ def test_thumbnail_post_parking_race_preserves_source_child(tmp_path: Path, monk
     assert backups
     assert any(candidate.read_bytes() == old_thumb for candidate in backups)
     assert not att.exists()
+
+
+def test_unverified_library_authority_is_distinct_and_creates_no_cache(tmp_path: Path) -> None:
+    import pytest
+    from ppa.db import connect
+    from ppa.thumbnails import ThumbnailAuthorityUnavailable
+
+    library = tmp_path / "library"
+    library.mkdir()
+    conn = connect(tmp_path / "catalogue.sqlite3")
+    conn.execute(
+        "INSERT INTO libraries (root_display_path, root_canonical_path) VALUES (?, ?)",
+        (str(library), str(library.resolve())),
+    )
+    conn.commit()
+    cache_dir = tmp_path / "thumbnails"
+
+    with pytest.raises(ThumbnailAuthorityUnavailable, match="rescan"):
+        ThumbnailCache(cache_dir, size=64, conn=conn)
+
+    assert not cache_dir.exists()
+    conn.close()

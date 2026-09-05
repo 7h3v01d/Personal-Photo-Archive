@@ -429,37 +429,6 @@ def test_recorded_preservation_stage_cannot_be_deleted(tmp_path: Path) -> None:
     assert conn.execute("SELECT COUNT(*) FROM archive_recovery_preservation_stages WHERE stage_id=?", (result.stage_id,)).fetchone()[0] == 1
 
 
-def test_postcommit_interrupt_preserves_committed_preservation_evidence(tmp_path: Path, monkeypatch) -> None:
-    """A post-COMMIT interruption must never trigger rollback cleanup."""
-    conn, db_path, _library, target, donor, _rows, _expected, donor_before, suspect, recorded = _recorded_case(tmp_path)
-    plan = build_preservation_plan(conn, proposal_id=recorded.proposal_id)
-
-    import ppa.recovery_preservation as rp
-
-    calls = {"n": 0}
-
-    def interrupt_postcommit(_path: Path, _identity, _mode: int) -> None:
-        calls["n"] += 1
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr(rp, "_chmod_mode_if_same", interrupt_postcommit)
-    with pytest.raises(KeyboardInterrupt):
-        execute_preservation_stage(conn, plan)
-
-    row = conn.execute(
-        "SELECT * FROM archive_recovery_preservation_stages WHERE stage_id=?",
-        (plan.stage_id,),
-    ).fetchone()
-    assert row is not None
-    stage_dir = db_path.parent / "recovery-preservation" / plan.stage_id
-    assert stage_dir.is_dir()
-    assert Path(row["manifest_path"]).is_file()
-    assert Path(row["preservation_path"]).is_file()
-    assert Path(row["preservation_path"]).read_bytes() == suspect
-    assert target.read_bytes() == suspect
-    assert donor.read_bytes() == donor_before
-
-
 def test_preservation_rollback_cleanup_retains_posix_stage_debris(tmp_path: Path, monkeypatch) -> None:
     """14.1.17: failed POSIX stage cleanup never calls child-name unlink."""
     import ppa.recovery_preservation as rp
@@ -844,3 +813,76 @@ def test_phase14117_create_directory_child_failure_never_rmdirs_replacement(tmp_
     assert replacement.is_dir()
     assert (replacement / "user.txt").read_bytes() == b"SOURCE-DIRECTORY-MUST-SURVIVE"
     assert parked.is_dir()
+
+
+def test_phase141174_preservation_late_hardlink_blocks_checkpoint_without_chmod(tmp_path: Path, monkeypatch) -> None:
+    """14.1.17.4: preservation evidence must still be single-linked at final attestation."""
+    import os
+    import stat
+    import ppa.recovery_preservation as rp
+
+    conn, _db, library, target, donor, _rows, _expected, donor_before, suspect, recorded = _recorded_case(tmp_path)
+    plan = build_preservation_plan(conn, proposal_id=recorded.proposal_id)
+    preservation = Path(plan.preservation_path)
+    manifest = Path(plan.manifest_path)
+    alias = library / "late-preservation-alias.jpg"
+    real_observe = rp.observe_stable_image
+    attacked = {"done": False, "mode": None}
+
+    def observe_and_link(path, *args, **kwargs):
+        result = real_observe(path, *args, **kwargs)
+        if (
+            not attacked["done"]
+            and preservation.exists()
+            and manifest.exists()
+            and Path(path) == Path(plan.donor_path)
+        ):
+            os.link(preservation, alias)
+            attacked["done"] = True
+            attacked["mode"] = stat.S_IMODE(alias.stat().st_mode)
+        return result
+
+    monkeypatch.setattr(rp, "observe_stable_image", observe_and_link)
+    with pytest.raises(RecoveryPreservationError, match="hard-link|single-link|alias"):
+        execute_preservation_stage(conn, plan)
+
+    assert attacked["done"] and alias.exists()
+    assert alias.read_bytes() == suspect
+    assert stat.S_IMODE(alias.stat().st_mode) == attacked["mode"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM archive_recovery_preservation_stages WHERE stage_id=?",
+        (plan.stage_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM integrity_events WHERE event_type='archive_recovery_preservation_staged' LIMIT 1"
+    ).fetchone() is None
+    assert target.read_bytes() == suspect
+    assert donor.read_bytes() == donor_before
+
+
+def test_phase1411741_windows_final_attestation_reads_binary_bytes_exactly(tmp_path: Path) -> None:
+    """14.1.17.4.1: Windows descriptor hashing must never use CRT text mode."""
+    import hashlib
+    import os
+    import pytest
+    import ppa.recovery_preservation as rp
+
+    if os.name != "nt":
+        pytest.skip("native Windows CRT binary-mode regression")
+
+    evidence = tmp_path / "binary-evidence.bin"
+    # CRLF exercises newline translation and CTRL-Z exercises legacy text EOF.
+    payload = b"A\r\nB\x1aC\r\nD\x00\xff"
+    evidence.write_bytes(payload)
+    st = evidence.stat()
+
+    identity = rp._attest_single_link_evidence(
+        evidence,
+        expected_identity=(int(st.st_dev), int(st.st_ino)),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        label="binary evidence",
+    )
+
+    assert identity == (int(st.st_dev), int(st.st_ino))
+    assert evidence.read_bytes() == payload

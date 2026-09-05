@@ -44,9 +44,9 @@ def test_built_wheel_contains_migrations_and_bootstraps_fresh_catalogue(tmp_path
             name for name in zf.namelist()
             if name.startswith("ppa/db/migrations/") and name.endswith(".sql")
         )
-    assert len(migrations) >= 39
+    assert len(migrations) >= 41
     assert migrations[0].endswith("001_initial.sql")
-    assert migrations[-1].endswith("039_positive_operational_authority.sql")
+    assert migrations[-1].endswith("041_recovery_target_replacement_execution.sql")
 
     installed = tmp_path / "installed"
     subprocess.run(
@@ -93,8 +93,8 @@ print(json.dumps({
     )
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
     assert payload == {
-        "schema": 39,
-        "migration_count": 39,
+        "schema": 41,
+        "migration_count": 41,
         "integrity": "ok",
         "has_files": True,
     }

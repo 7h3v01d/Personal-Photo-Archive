@@ -1214,3 +1214,107 @@ def test_phase14_recovery_preservation_worker_smoke(app, tmp_path) -> None:
     assert worker._note == "reviewed"
     worker.deleteLater()
     app.processEvents()
+
+
+def test_window_opens_when_library_authority_awaits_rescan(app, tmp_path: Path) -> None:
+    """Legacy catalogues disable thumbnail writes instead of aborting GUI startup."""
+    from ppa.ui.main_window import MainWindow
+
+    library = tmp_path / "library"
+    library.mkdir()
+    db_path = tmp_path / "catalogue.sqlite3"
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO libraries (root_display_path, root_canonical_path) VALUES (?, ?)",
+        (str(library), str(library.resolve())),
+    )
+    conn.commit()
+    conn.close()
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        f'''\n[database]\npath = "{db_path.as_posix()}"\n[logging]\nlevel = "INFO"\npath = "{(tmp_path / 'ppa.log').as_posix()}"\n[library]\ndirectories = ["{library.as_posix()}"]\n''',
+        encoding="utf-8",
+    )
+    config = Config.load(cfg_path)
+
+    win = MainWindow(config)
+    try:
+        assert win._thumb_worker.authority_available is False
+        assert "rescan" in (win._thumb_worker.authority_error or "").lower()
+        assert "Thumbnails disabled" in win.statusBar().currentMessage()
+        assert not (tmp_path / "thumbnails").exists()
+    finally:
+        win._registry.shutdown()
+        win.close()
+
+
+def test_phase144_recovery_execution_dialog_requires_exact_phrase(app) -> None:
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QLineEdit, QPushButton
+    from ppa.ui.recovery_execution_dialog import RecoveryExecutionDialog
+
+    plan = SimpleNamespace(
+        execution_id="00000000-0000-0000-0000-000000000144",
+        readiness_id="00000000-0000-0000-0000-000000000142",
+        target_path="C:/photos/target.jpg",
+        target_initial_state="hash_mismatch",
+        replacement_mode="replace_existing_exact_target",
+        expected_sha256="e" * 64,
+        execution_plan_fingerprint="f" * 64,
+        confirmation_phrase="EXECUTE PPA RECOVERY 00000000-0000-0000-0000-000000000144 ffffffffffffffff",
+    )
+    dlg = RecoveryExecutionDialog(plan)
+    try:
+        confirm = dlg.findChild(QLineEdit, "recoveryConfirmationInput")
+        note = dlg.findChild(QLineEdit, "recoveryExecutionNote")
+        execute = dlg.findChild(QPushButton, "recoveryExecuteButton")
+        assert confirm is not None and note is not None and execute is not None
+        assert execute.isEnabled() is False
+
+        confirm.setText("wrong phrase")
+        app.processEvents()
+        assert execute.isEnabled() is False
+
+        captured = []
+        dlg.execution_requested.connect(lambda p, c, n: captured.append((p, c, n)))
+        note.setText("desktop reviewed")
+        confirm.setText(plan.confirmation_phrase)
+        app.processEvents()
+        assert execute.isEnabled() is True
+        execute.click()
+        app.processEvents()
+        assert captured == [(plan, plan.confirmation_phrase, "desktop reviewed")]
+    finally:
+        dlg.close()
+
+
+def test_phase144_recovery_workers_preserve_explicit_boundaries(app, tmp_path) -> None:
+    from types import SimpleNamespace
+    from ppa.ui.workers import (
+        RecoveryTargetReadinessRecordWorker,
+        RecoveryTargetExecutionPreviewWorker,
+        RecoveryTargetExecutionWorker,
+        RecoveryExecutionStatusWorker,
+    )
+
+    db = tmp_path / "catalogue.sqlite3"
+    readiness = SimpleNamespace(readiness_id="readiness-1")
+    plan = SimpleNamespace(execution_id="execution-1")
+
+    record = RecoveryTargetReadinessRecordWorker(db, readiness, "reviewed")
+    preview = RecoveryTargetExecutionPreviewWorker(db, "readiness-1")
+    execute = RecoveryTargetExecutionWorker(db, plan, "exact phrase", "note")
+    status = RecoveryExecutionStatusWorker(db, "execution-1")
+    try:
+        assert record._readiness is readiness
+        assert record._note == "reviewed"
+        assert preview._readiness_id == "readiness-1"
+        assert execute._plan is plan
+        assert execute._confirmation == "exact phrase"
+        assert execute._note == "note"
+        assert status._execution_id == "execution-1"
+    finally:
+        for worker in (record, preview, execute, status):
+            worker.deleteLater()
+        app.processEvents()
