@@ -70,6 +70,11 @@ from ppa.ui.workers import (
     RecoveryProposalWorker,
     RecoveryPreservationWorker,
     RecoveryDonorMaterializationWorker,
+    RecoveryTargetReadinessWorker,
+    RecoveryTargetReadinessRecordWorker,
+    RecoveryTargetExecutionPreviewWorker,
+    RecoveryTargetExecutionWorker,
+    RecoveryExecutionStatusWorker,
     OrganizationSuggestionsWorker,
     OrganizationActivityWorker,
     OrganizationReportWorker,
@@ -701,15 +706,30 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Ready.")
 
     def _start_thumbnail_worker(self) -> None:
+        previous = getattr(self, "_thumb_worker", None)
+        if previous is not None:
+            try:
+                self._model.request_thumbnail.disconnect(previous.request)
+            except (RuntimeError, TypeError):
+                pass
+
         self._thumb_worker = ThumbnailWorker(self._cache_dir, size=256, conn=self._conn)
         self._thumb_worker.ready.connect(self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
-        self._registry.start_persistent(self._thumb_worker)
+        if self._thumb_worker.authority_available:
+            self._registry.start_persistent(self._thumb_worker)
         # Genuine cross-thread dispatch: the model's request signal is
         # delivered to the worker's slot on the worker thread (queued), so the
-        # Pillow decode never runs on the GUI thread.
+        # Pillow decode never runs on the GUI thread.  When source-tree
+        # authority is awaiting a rescan the worker remains connected but is a
+        # deliberate no-op: no cache directory or derivative is written.
         self._model.request_thumbnail.connect(
             self._thumb_worker.request, Qt.ConnectionType.QueuedConnection
         )
+        if self._thumb_worker.authority_error:
+            log.warning(
+                "Thumbnail generation disabled until Library authority is verified: %s",
+                self._thumb_worker.authority_error,
+            )
 
     # --- data / refresh -----------------------------------------------------
     _DENSITY = {0: (120, 150), 1: (180, 210), 2: (250, 280)}  # icon, cell
@@ -767,7 +787,11 @@ class MainWindow(QMainWindow):
         if s.hash_mismatches:
             parts.append(f"{s.hash_mismatches} hash mismatches")
         lib = str(self._current_library) if self._current_library else "no library set"
-        self._status.showMessage("   |   ".join(parts) + f"   |   {lib}")
+        message = "   |   ".join(parts) + f"   |   {lib}"
+        thumb_worker = getattr(self, "_thumb_worker", None)
+        if thumb_worker is not None and thumb_worker.authority_error:
+            message += "   |   Thumbnails disabled — rescan Library to verify source-tree authority"
+        self._status.showMessage(message)
 
     # --- nav / selection ----------------------------------------------------
     def _on_nav_changed(self, row: int) -> None:
@@ -1647,6 +1671,13 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_scan_done(self, report) -> None:
         self._run_end("scan", "success", "Scan complete", {"new_files": report.new_files, "moved_files": report.moved_files, "duplicates": report.duplicate_files, "missing": report.missing_files})
+        # A legacy catalogue may have opened with thumbnail writes disabled
+        # because source-tree identity had not yet been verified.  A successful
+        # complete scan establishes that authority, so re-arm the thumbnail
+        # worker now.  The old persistent worker is disconnected and remains
+        # idle until normal registry shutdown.
+        if getattr(self, "_thumb_worker", None) is not None and self._thumb_worker.authority_error:
+            self._start_thumbnail_worker()
         self.refresh()
         self._status.showMessage(
             f"Scan complete — {report.new_files} new, {report.moved_files} moved, "
@@ -1901,6 +1932,229 @@ class MainWindow(QMainWindow):
             f"SHA-256: {result.donor_materialized_sha256}\n\n"
             "The original donor was not modified and the source target was not replaced.",
         )
+
+        answer = QMessageBox.question(
+            self,
+            "Assess target-replacement readiness?",
+            "Phase 14.2 can now re-attest the complete recovery evidence chain and the current "
+            "target destination topology.\n\n"
+            "This is READ-ONLY with respect to source photographs. It does NOT create, replace, "
+            "rename, move, delete, chmod, or otherwise modify the target, and it grants no recovery "
+            "execution authority.\n\n"
+            "Assess readiness now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._on_recovery_target_readiness_requested(result.materialization_id)
+
+    def _on_recovery_target_readiness_requested(self, materialization_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Re-attesting Phase-14 recovery evidence and target destination topology…")
+        worker = RecoveryTargetReadinessWorker(self._config.db_path, materialization_id)
+        worker.finished.connect(self._on_recovery_target_readiness_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_target_readiness_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_target_readiness_done(self, readiness) -> None:
+        self._set_busy(False)
+        self._status.showMessage(
+            f"Phase 14.2 readiness confirmed for {readiness.file_id}; execution remains NOT authorised."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Record target-replacement readiness?",
+            f"The committed preservation and donor evidence still re-attest cleanly.\n\n"
+            f"Target: {readiness.target_path}\n"
+            f"Target state: {readiness.target_state}\n"
+            f"Replacement mode: {readiness.replacement_mode}\n"
+            f"Expected SHA-256: {readiness.expected_sha256}\n\n"
+            "Record this immutable Phase-14.2 readiness checkpoint in the catalogue?\n\n"
+            "This writes AUDIT DATA ONLY. It does not modify the source target and grants no "
+            "target-replacement or recovery-execution authority.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._on_recovery_target_readiness_record_requested(readiness)
+
+    def _on_recovery_target_readiness_record_requested(self, readiness) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Revalidating and recording immutable Phase-14.2 readiness checkpoint…")
+        worker = RecoveryTargetReadinessRecordWorker(
+            self._config.db_path, readiness,
+            note="Recorded from desktop after explicit Phase-14.2 readiness review",
+        )
+        worker.finished.connect(self._on_recovery_target_readiness_recorded, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_target_readiness_record_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_target_readiness_recorded(self, recorded) -> None:
+        self._set_busy(False)
+        self._status.showMessage(
+            f"Phase 14.2 readiness {recorded.readiness_id} recorded; source execution remains unconfirmed."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Review source-target recovery execution?",
+            "The readiness checkpoint is now immutably recorded.\n\n"
+            "Phase 14.3.5 has been adversarially accepted and native-Windows qualified. The next screen "
+            "will build a FRESH ZERO-AUTHORITY execution preview and show an exact confirmation phrase.\n\n"
+            "No source mutation occurs merely by opening that preview. Review it now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._on_recovery_target_execution_preview_requested(recorded.readiness_id)
+
+    @Slot(str)
+    def _on_recovery_target_readiness_record_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Target-readiness checkpoint was not recorded: {message}")
+        self._status.showMessage("Phase 14.2 readiness recording failed closed; no source photograph was modified.")
+
+    def _on_recovery_target_execution_preview_requested(self, readiness_id: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage("Building fresh Phase-14.3.5 zero-authority execution preview…")
+        worker = RecoveryTargetExecutionPreviewWorker(self._config.db_path, readiness_id)
+        worker.finished.connect(self._on_recovery_target_execution_preview_ready, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_recovery_target_execution_preview_failed, Qt.ConnectionType.QueuedConnection)
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_target_execution_preview_ready(self, plan) -> None:
+        self._set_busy(False)
+        from ppa.ui.recovery_execution_dialog import RecoveryExecutionDialog
+        dialog = RecoveryExecutionDialog(plan, self)
+        dialog.execution_requested.connect(self._on_recovery_target_execution_requested)
+        dialog.show()
+        self._recovery_execution_dialog = dialog
+        self._status.showMessage(
+            f"Recovery execution preview {plan.execution_id} ready; exact confirmation is required."
+        )
+
+    @Slot(str)
+    def _on_recovery_target_execution_preview_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery execution preview failed closed: {message}")
+        self._status.showMessage("Recovery execution preview failed; no execution authority was created.")
+
+    @Slot(object, str, str)
+    def _on_recovery_target_execution_requested(self, plan, confirmation: str, note: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._status.showMessage(
+            f"Executing one confirmed recovery attempt {plan.execution_id}; do not interrupt the application…"
+        )
+        worker = RecoveryTargetExecutionWorker(
+            self._config.db_path, plan, confirmation, note or None
+        )
+        worker.finished.connect(self._on_recovery_target_execution_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(
+            lambda message, eid=plan.execution_id: self._on_recovery_target_execution_failed(eid, message),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._registry.start(worker)
+
+    @Slot(object)
+    def _on_recovery_target_execution_done(self, result) -> None:
+        self._set_busy(False)
+        if result.result_state == "expected_target_placed_verified":
+            self._status.showMessage(
+                f"Recovery attempt {result.execution_id} placed and verified expected bytes; Verify is still required."
+            )
+            QMessageBox.information(
+                self,
+                "Recovery target placed and verified",
+                f"Expected bytes were placed and descriptor-verified.\n\n"
+                f"Execution ID: {result.execution_id}\n"
+                f"Installed SHA-256: {result.installed_sha256}\n"
+                f"Retained suspect: {result.suspect_retained_path or 'none (missing-target restore)'}\n\n"
+                "Catalogue health has NOT been self-certified by recovery. Run ordinary Verify to independently "
+                "reconcile the recovered File.",
+            )
+        elif result.result_state == "aborted_exact_target_restored":
+            self._status.showMessage(
+                f"Recovery attempt {result.execution_id} aborted; exact reviewed target was restored and re-attested."
+            )
+            QMessageBox.warning(
+                self,
+                "Recovery attempt safely aborted",
+                f"The expected replacement was not completed. The exact reviewed source target was restored "
+                f"and post-transition re-attested.\n\nExecution ID: {result.execution_id}\n"
+                f"Detail: {result.detail or 'No additional detail.'}",
+            )
+        else:
+            self._status.showMessage(
+                f"Recovery attempt {result.execution_id} aborted before any target transition."
+            )
+            QMessageBox.information(
+                self,
+                "Recovery attempt did not transition the target",
+                f"The backend proved that no recovery target transition occurred.\n\n"
+                f"Execution ID: {result.execution_id}\nDetail: {result.detail or 'No additional detail.'}",
+            )
+        self._refresh()
+
+    def _on_recovery_target_execution_failed(self, execution_id: str, message: str) -> None:
+        self._set_busy(True)
+        self._status.showMessage(
+            f"Recovery attempt {execution_id} did not complete cleanly; inspecting durable attempt status…"
+        )
+        worker = RecoveryExecutionStatusWorker(self._config.db_path, execution_id)
+        worker.finished.connect(
+            lambda status, original=message: self._on_recovery_execution_status_ready(status, original),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.failed.connect(
+            lambda _status_error, original=message: self._on_recovery_execution_status_unavailable(original),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._registry.start(worker)
+
+    def _on_recovery_execution_status_ready(self, status, original_error: str) -> None:
+        self._set_busy(False)
+        if not status.resolved:
+            self._warn(
+                "Recovery attempt is UNRESOLVED. Automatic replay is blocked.\n\n"
+                f"Execution ID: {status.execution_id}\n"
+                f"Original error: {original_error}\n"
+                f"Current target state: {status.target_state}\n"
+                f"Current target SHA-256: {status.target_sha256 or 'unavailable'}\n"
+                f"Retained suspect: {status.suspect_retained_path or 'none detected'}\n\n"
+                "Do not manually retry this readiness checkpoint. Preserve the filesystem state for review."
+            )
+            self._status.showMessage(
+                f"Recovery attempt {status.execution_id} is UNRESOLVED; automatic replay is blocked."
+            )
+        else:
+            self._warn(
+                f"Recovery execution raised an error after a durable result was recorded.\n\n"
+                f"Execution ID: {status.execution_id}\nResult: {status.result_state}\n"
+                f"Original error: {original_error}"
+            )
+            self._status.showMessage(f"Recovery attempt {status.execution_id} has immutable result {status.result_state}.")
+        self._refresh()
+
+    def _on_recovery_execution_status_unavailable(self, original_error: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Recovery execution failed before a durable attempt could be inspected: {original_error}")
+        self._status.showMessage("Recovery execution failed closed before durable status could be inspected.")
+
+    @Slot(str)
+    def _on_recovery_target_readiness_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._warn(f"Target-replacement readiness failed closed: {message}")
+        self._status.showMessage("Phase 14.2 readiness failed closed; no source photograph was modified.")
 
     @Slot(str)
     def _on_recovery_donor_materialization_failed(self, message: str) -> None:

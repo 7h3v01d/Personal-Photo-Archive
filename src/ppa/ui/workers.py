@@ -31,7 +31,7 @@ from ppa.db import connect
 from ppa.integrity import verify_library
 from ppa.metadata import extract_stale
 from ppa.scanner import scan_library
-from ppa.thumbnails import ThumbnailCache
+from ppa.thumbnails import ThumbnailAuthorityUnavailable, ThumbnailCache
 
 
 class ScanWorker(QObject):
@@ -339,13 +339,31 @@ class ThumbnailWorker(QObject):
 
     def __init__(self, cache_dir: Path, size: int = 256, *, conn) -> None:
         super().__init__()
-        # Snapshot registered Library authority while still on the caller thread;
-        # ThumbnailCache stores no SQLite connection and remains thread-safe.
-        self._cache = ThumbnailCache(cache_dir, size=size, conn=conn)
+        # Source-tree authority can legitimately be unavailable when an older
+        # catalogue is first opened after the authority-hardening migrations.
+        # That state must disable derivative writes, not abort the whole GUI.
+        # Only the explicit authority-unavailable condition is softened here;
+        # cache-object validation failures still propagate and fail closed.
+        self._cache = None
+        self._authority_error: str | None = None
+        try:
+            self._cache = ThumbnailCache(cache_dir, size=size, conn=conn)
+        except ThumbnailAuthorityUnavailable as exc:
+            self._authority_error = str(exc)
+
+    @property
+    def authority_error(self) -> str | None:
+        return self._authority_error
+
+    @property
+    def authority_available(self) -> bool:
+        return self._cache is not None
 
     @Slot(str, str, str)
     @Slot(str, str, str, bool)
     def request(self, file_id: str, path: str, sha256: str, allow_generate: bool = True) -> None:
+        if self._cache is None:
+            return
         sha = sha256 or None
         # A verified hash mismatch must never create a new derivative under the
         # trusted catalogue SHA key. Existing legacy cache entries may still be
@@ -381,6 +399,139 @@ class RecoveryDonorMaterializationWorker(QObject):
             conn = connect(self._db_path)
             plan = build_donor_materialization_plan(conn, stage_id=self._stage_id)
             self.finished.emit(execute_donor_materialization(conn, plan, note=self._note))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryTargetReadinessWorker(QObject):
+    """Build one read-only Phase-14.2 target-replacement readiness snapshot off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, materialization_id: str) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._materialization_id = materialization_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_target_readiness import build_target_replacement_readiness
+            conn = connect(self._db_path)
+            self.finished.emit(build_target_replacement_readiness(
+                conn, materialization_id=self._materialization_id
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryTargetReadinessRecordWorker(QObject):
+    """Record one immutable Phase-14.2 readiness checkpoint off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, readiness, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._readiness = readiness
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_target_readiness import record_target_replacement_readiness
+            conn = connect(self._db_path)
+            self.finished.emit(record_target_replacement_readiness(
+                conn, self._readiness, note=self._note
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryTargetExecutionPreviewWorker(QObject):
+    """Build a zero-authority Phase-14.3.5 execution preview off-thread."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, readiness_id: str) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._readiness_id = readiness_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_target_execution import build_target_replacement_execution_plan
+            conn = connect(self._db_path)
+            self.finished.emit(build_target_replacement_execution_plan(
+                conn, readiness_id=self._readiness_id
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryTargetExecutionWorker(QObject):
+    """Execute one frozen Phase-14.3.5 plan after exact desktop confirmation."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, plan, confirmation: str, note: str | None = None) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._plan = plan
+        self._confirmation = confirmation
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_target_execution import execute_target_replacement
+            conn = connect(self._db_path)
+            self.finished.emit(execute_target_replacement(
+                conn, self._plan, confirmation=self._confirmation, note=self._note
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class RecoveryExecutionStatusWorker(QObject):
+    """Inspect one durable Phase-14.3 execution attempt without mutating it."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, execution_id: str) -> None:
+        super().__init__()
+        self._db_path = Path(db_path)
+        self._execution_id = execution_id
+
+    @Slot()
+    def run(self) -> None:
+        conn = None
+        try:
+            from ppa.recovery_target_execution import inspect_recovery_execution_status
+            conn = connect(self._db_path)
+            self.finished.emit(inspect_recovery_execution_status(
+                conn, execution_id=self._execution_id
+            ))
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
