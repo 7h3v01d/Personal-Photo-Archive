@@ -114,3 +114,53 @@ change the destructive-authority design:
 14.1.17.1 adds the platform guard and normalizes WinError 80/183 at the final
 no-replace install boundary. No overwrite fallback is introduced and the late
 destination remains untouched. Schema remains v39.
+
+
+## 14.1.17.2 — Source Object Exclusion for Orphan Adoption
+
+Adversarial review of 14.1.17.1 found that a byte-valid final donor orphan could
+still be the exact filesystem object previously catalogued as source evidence.
+Byte equality proves revision equivalence; it does not confer operational
+ownership.
+
+14.1.17.2 adds a single source-authority exclusion boundary. Before automatic
+orphan adoption, PPA compares the candidate `(device_id, object_id)` against both
+the current `files.fs_device_id/fs_object_id` values and
+`file_storage_identity_history`. History is joined back to the owning File, so
+explicit Library forgetting naturally retires that authority through existing
+cascade semantics.
+
+The same rule applies to a pre-existing `donor-materialization.json`. Its exact
+validated filesystem identity is retained and re-proved immediately before the
+checkpoint commit; a same-bytes object substitution cannot inherit the earlier
+manifest validation.
+
+A source-associated donor or manifest fails closed and remains untouched:
+
+- no operational adoption;
+- no donor-materialization checkpoint;
+- no `archive_recovery_donor_orphan_adopted` event;
+- no chmod/read-only mutation;
+- manual intervention required.
+
+Permanent regressions cover current source identity, historical source identity
+after a replacement inode is observed at the source pathname, and the existing
+filesystem-manifest equivalent. Schema remains v39.
+
+
+## 14.1.17.3 — UI Authority Startup Gate
+
+The source-tree authority gate is intentionally stricter than older catalogues:
+a registered Library with no verified root/source-tree identity must be rescanned
+before writable operational output is permitted.  That safety state is not,
+however, a reason for the read-mostly desktop UI itself to fail to start.
+
+Thumbnail worker construction now distinguishes **authority unavailable pending
+rescan** from an unsafe cache object.  Pending authority creates a disabled
+worker: it performs no cache creation or derivative write and exposes the rescan
+requirement to the UI.  The main window remains usable for scanning and ordinary
+catalogue navigation, and a successful complete scan re-arms thumbnail service.
+
+This does **not** weaken `SourceTreeAuthorityPolicy`, operational-directory
+ownership, or cache-object validation.  Any cache-path/object safety failure still
+fails closed.  Schema remains v39.

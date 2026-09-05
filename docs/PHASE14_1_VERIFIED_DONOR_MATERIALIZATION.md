@@ -73,7 +73,7 @@ Inside the existing stage directory, a successful Phase 14.1 materialization add
 - `expected-donor.<original-extension>` — exact expected bytes copied from the freshly re-attested donor;
 - `donor-materialization.json` — evidence manifest for this materialization.
 
-Both are independently hashed before commit and made read-only on a best-effort, identity-bound basis after commit. The complete preservation root remains protected by `ppa.safe_export`.
+As of Phase 14.1.17.4, both are independently descriptor-hashed and re-attested as exact single-link objects immediately before commit; no post-commit chmod is performed. The complete preservation root remains protected by `ppa.safe_export`.
 
 ## Database
 

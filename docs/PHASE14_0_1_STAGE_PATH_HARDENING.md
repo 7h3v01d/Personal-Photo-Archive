@@ -18,7 +18,7 @@ Successful custom preservation roots recorded in `archive_recovery_preservation_
 
 ## Durability and permission hardening
 
-The parent preservation root is fsynced after creation of the stage-directory entry on platforms where directory fsync is available. Preservation and manifest files remain byte-hashed before the catalogue checkpoint. Post-commit read-only permission changes are applied only through a file descriptor whose filesystem identity still equals the exact staged object observed before commit, preventing a swapped symlink/hardlink path from redirecting a chmod operation to a source photograph.
+The parent preservation root is fsynced after creation of the stage-directory entry on platforms where directory fsync is available. Preservation and manifest files remain byte-hashed before the catalogue checkpoint. Superseded by Phase 14.1.17.4: evidence is re-attested for exact identity, content, and single-link topology immediately before commit, and no post-commit chmod is performed.
 
 ## Authority boundary
 

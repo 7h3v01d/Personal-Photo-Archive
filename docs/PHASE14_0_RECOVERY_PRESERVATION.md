@@ -93,7 +93,7 @@ Each successful present-target stage contains:
 - `suspect-source.<original-extension>` — exact source bytes observed as suspect;
 - `manifest.json` — Phase-13/14 fingerprints, source/donor observations, preserved SHA/size and explicit non-authority flags.
 
-Both files are made read-only on a best-effort basis after the catalogue commit. Correctness depends on SHA-256 evidence and immutable catalogue rows, not filesystem permission bits.
+As of Phase 14.1.17.4, both evidence files are finally re-attested as exact single-link objects before the catalogue commit and are not chmodded afterward. Correctness depends on SHA-256 evidence and immutable catalogue rows, not filesystem permission bits.
 
 ## Missing target
 
